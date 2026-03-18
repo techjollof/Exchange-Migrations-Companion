@@ -81,6 +81,39 @@
     Microsoft default is 90 — the slowest 10% are excluded to prevent outliers
     skewing the batch averages. Use 100 to include all mailboxes. Default: 90
 
+.PARAMETER AlertEmailTo
+    Email address to send alert notifications to. Requires SmtpServer.
+
+.PARAMETER AlertEmailFrom
+    Email address to send alerts from. Requires SmtpServer.
+
+.PARAMETER SmtpServer
+    SMTP server hostname for sending email alerts.
+
+.PARAMETER SmtpPort
+    SMTP server port. Default: 25
+
+.PARAMETER SmtpCredential
+    PSCredential for SMTP authentication if required.
+
+.PARAMETER SmtpUseSsl
+    Use SSL/TLS for SMTP connection.
+
+.PARAMETER TeamsWebhookUrl
+    Microsoft Teams incoming webhook URL for sending alerts.
+
+.PARAMETER AlertOnFailure
+    Send alert when a migration fails.
+
+.PARAMETER AlertOnComplete
+    Send alert when a migration completes.
+
+.PARAMETER AlertOnStall
+    Send alert when a migration stalls (no progress for StallThresholdMinutes).
+
+.PARAMETER StallThresholdMinutes
+    Minutes of no progress before triggering a stall alert. Default: 30. Range: 5-1440.
+
 .EXAMPLE
     # Full live analysis with detail report exported for later use
     .\MigrationAnalysis.ps1 -IncludeDetailReport -ExportDetailXml -ReportPath "C:\Reports"
@@ -100,6 +133,16 @@
 .EXAMPLE
     # Offline replay from previously saved XML
     .\MigrationAnalysis.ps1 -ImportXmlPath "C:\Reports\Sprint1_RawStats.xml" -ReportPath "C:\Reports"
+
+.EXAMPLE
+    # Watch mode with Teams alerts for failures and stalls
+    .\MigrationAnalysis.ps1 -WatchMode -TeamsWebhookUrl "https://outlook.office.com/webhook/..." `
+        -AlertOnFailure -AlertOnStall -StallThresholdMinutes 45
+
+.EXAMPLE
+    # Watch mode with email alerts for all events
+    .\MigrationAnalysis.ps1 -WatchMode -AlertEmailTo "admin@contoso.com" -AlertEmailFrom "migration@contoso.com" `
+        -SmtpServer "smtp.contoso.com" -AlertOnFailure -AlertOnComplete -AlertOnStall
 #>
 
 [CmdletBinding(DefaultParameterSetName = "Live")]
@@ -178,7 +221,93 @@ param (
 
     [Parameter(ParameterSetName = "Live")]
     [Parameter(ParameterSetName = "FromXml")]
-    [switch]$SkipCsv
+    [switch]$SkipCsv,
+
+    # ── Alert notifications ───────────────────────────────────────────────────
+    # Send email alerts when migrations fail, stall, or complete
+    [Parameter(ParameterSetName = "Live")]
+    [string]$AlertEmailTo,
+
+    [Parameter(ParameterSetName = "Live")]
+    [string]$AlertEmailFrom,
+
+    [Parameter(ParameterSetName = "Live")]
+    [string]$SmtpServer,
+
+    [Parameter(ParameterSetName = "Live")]
+    [int]$SmtpPort = 25,
+
+    [Parameter(ParameterSetName = "Live")]
+    [System.Management.Automation.PSCredential]$SmtpCredential,
+
+    [Parameter(ParameterSetName = "Live")]
+    [switch]$SmtpUseSsl,
+
+    # Send Teams webhook alerts
+    [Parameter(ParameterSetName = "Live")]
+    [string]$TeamsWebhookUrl,
+
+    # Alert triggers - which events trigger notifications
+    [Parameter(ParameterSetName = "Live")]
+    [switch]$AlertOnFailure,
+
+    [Parameter(ParameterSetName = "Live")]
+    [switch]$AlertOnComplete,
+
+    [Parameter(ParameterSetName = "Live")]
+    [switch]$AlertOnStall,
+
+    # Stall threshold in minutes - alert if no progress for this long
+    [Parameter(ParameterSetName = "Live")]
+    [ValidateRange(5,1440)]
+    [int]$StallThresholdMinutes = 30,
+
+    # ── Auto-Retry Parameters ────────────────────────────────────────────────
+    # Enable automatic retry of failed migrations
+    [Parameter(ParameterSetName = "Live")]
+    [switch]$AutoRetryFailed,
+
+    # Maximum number of retry attempts per mailbox
+    [Parameter(ParameterSetName = "Live")]
+    [ValidateRange(1,10)]
+    [int]$MaxRetryAttempts = 3,
+
+    # Delay in minutes between retry attempts
+    [Parameter(ParameterSetName = "Live")]
+    [ValidateRange(1,60)]
+    [int]$RetryDelayMinutes = 5,
+
+    # Only retry failures matching these error patterns (regex)
+    [Parameter(ParameterSetName = "Live")]
+    [string[]]$RetryOnErrorPatterns = @('Transient', 'Timeout', 'ConnectionFailed', 'NetworkError', 'Throttl'),
+
+    # ── Scheduled Reports Parameters ─────────────────────────────────────────
+    # Enable scheduled report generation
+    [Parameter(ParameterSetName = "Live")]
+    [switch]$ScheduledReports,
+
+    # Schedule type: Daily, Weekly, or Hourly
+    [Parameter(ParameterSetName = "Live")]
+    [ValidateSet('Hourly', 'Daily', 'Weekly')]
+    [string]$ReportSchedule = 'Daily',
+
+    # Time of day to generate reports (24h format, e.g., "08:00")
+    [Parameter(ParameterSetName = "Live")]
+    [ValidatePattern('^\d{1,2}:\d{2}$')]
+    [string]$ReportTime = '08:00',
+
+    # Day of week for weekly reports (0=Sunday, 1=Monday, etc.)
+    [Parameter(ParameterSetName = "Live")]
+    [ValidateRange(0,6)]
+    [int]$ReportDayOfWeek = 1,
+
+    # Email recipients for scheduled reports (comma-separated)
+    [Parameter(ParameterSetName = "Live")]
+    [string]$ScheduledReportEmailTo,
+
+    # Include detailed mailbox list in scheduled reports
+    [Parameter(ParameterSetName = "Live")]
+    [switch]$IncludeDetailInScheduledReport
 )
 
 #region ── Helpers ──────────────────────────────────────────────────────────────
@@ -386,6 +515,753 @@ function Get-BottleneckAnalysis {
         )
     }
     return $result
+}
+
+# ── Alert Functions ───────────────────────────────────────────────────────────
+
+# Track previously alerted items to avoid duplicate alerts
+$script:AlertedFailures = @{}
+$script:AlertedCompletions = @{}
+$script:AlertedStalls = @{}
+$script:LastProgressSnapshot = @{}
+
+function Send-EmailAlert {
+    param(
+        [string]$Subject,
+        [string]$Body,
+        [string]$To,
+        [string]$From,
+        [string]$SmtpServer,
+        [int]$SmtpPort = 25,
+        [System.Management.Automation.PSCredential]$Credential,
+        [switch]$UseSsl
+    )
+
+    if (-not $To -or -not $From -or -not $SmtpServer) {
+        Write-Log "Email alert skipped - missing required parameters (To, From, or SmtpServer)" -Level WARN
+        return $false
+    }
+
+    try {
+        $mailParams = @{
+            To         = $To
+            From       = $From
+            Subject    = $Subject
+            Body       = $Body
+            SmtpServer = $SmtpServer
+            Port       = $SmtpPort
+            BodyAsHtml = $true
+        }
+
+        if ($Credential) { $mailParams.Credential = $Credential }
+        if ($UseSsl) { $mailParams.UseSsl = $true }
+
+        Send-MailMessage @mailParams -ErrorAction Stop
+        Write-Log "Email alert sent: $Subject" -Level SUCCESS
+        return $true
+    }
+    catch {
+        Write-Log "Failed to send email alert: $_" -Level ERROR
+        return $false
+    }
+}
+
+function Send-TeamsAlert {
+    param(
+        [string]$WebhookUrl,
+        [string]$Title,
+        [string]$Message,
+        [string]$Color = "0076D7",  # Blue default
+        [array]$Facts
+    )
+
+    if (-not $WebhookUrl) {
+        Write-Log "Teams alert skipped - no webhook URL configured" -Level WARN
+        return $false
+    }
+
+    try {
+        $factsJson = @()
+        if ($Facts) {
+            $factsJson = $Facts | ForEach-Object {
+                @{ name = $_.Name; value = $_.Value }
+            }
+        }
+
+        $card = @{
+            "@type"      = "MessageCard"
+            "@context"   = "http://schema.org/extensions"
+            "themeColor" = $Color
+            "summary"    = $Title
+            "sections"   = @(
+                @{
+                    "activityTitle" = $Title
+                    "facts"         = $factsJson
+                    "text"          = $Message
+                    "markdown"      = $true
+                }
+            )
+        }
+
+        $json = $card | ConvertTo-Json -Depth 10
+        $response = Invoke-RestMethod -Uri $WebhookUrl -Method Post -Body $json -ContentType "application/json" -ErrorAction Stop
+        Write-Log "Teams alert sent: $Title" -Level SUCCESS
+        return $true
+    }
+    catch {
+        Write-Log "Failed to send Teams alert: $_" -Level ERROR
+        return $false
+    }
+}
+
+function Send-MigrationAlert {
+    param(
+        [ValidateSet("Failure","Completion","Stall")]
+        [string]$AlertType,
+        [object]$Mailbox,
+        [object]$Summary,
+        [hashtable]$AlertConfig
+    )
+
+    $colors = @{
+        Failure    = "FF0000"  # Red
+        Completion = "00FF00"  # Green
+        Stall      = "FFA500"  # Orange
+    }
+
+    $icons = @{
+        Failure    = "❌"
+        Completion = "✅"
+        Stall      = "⚠️"
+    }
+
+    $batchName = if ($Summary.BatchName) { $Summary.BatchName } else { "Unknown Batch" }
+    $title = "$($icons[$AlertType]) Migration $AlertType Alert - $($Mailbox.DisplayName)"
+
+    $facts = @(
+        @{ Name = "Mailbox"; Value = $Mailbox.DisplayName }
+        @{ Name = "Alias"; Value = $Mailbox.Alias }
+        @{ Name = "Batch"; Value = $batchName }
+        @{ Name = "Status"; Value = $Mailbox.Status }
+        @{ Name = "% Complete"; Value = "$($Mailbox.PercentComplete)%" }
+        @{ Name = "Transferred"; Value = "$($Mailbox.TransferredGB) GB" }
+    )
+
+    if ($AlertType -eq "Failure" -and $Mailbox.LastFailure) {
+        $facts += @{ Name = "Last Failure"; Value = $Mailbox.LastFailure.Substring(0, [Math]::Min(200, $Mailbox.LastFailure.Length)) }
+    }
+
+    if ($AlertType -eq "Stall") {
+        $facts += @{ Name = "Stall Duration"; Value = "$($Mailbox.StallMinutes) minutes" }
+    }
+
+    $bodyHtml = @"
+<html>
+<body style="font-family: 'Segoe UI', Arial, sans-serif;">
+<h2 style="color: #$($colors[$AlertType]);">$($icons[$AlertType]) Migration $AlertType Alert</h2>
+<table style="border-collapse: collapse; margin: 20px 0;">
+$(foreach ($fact in $facts) {
+    "<tr><td style='padding: 8px; border: 1px solid #ddd; font-weight: bold;'>$($fact.Name)</td><td style='padding: 8px; border: 1px solid #ddd;'>$($fact.Value)</td></tr>"
+})
+</table>
+<p style="color: #666; font-size: 12px;">Generated by Migration Analyzer at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>
+</body>
+</html>
+"@
+
+    $messageText = ($facts | ForEach-Object { "**$($_.Name):** $($_.Value)" }) -join "`n`n"
+
+    # Send Email if configured
+    if ($AlertConfig.EmailTo) {
+        Send-EmailAlert -Subject $title -Body $bodyHtml `
+            -To $AlertConfig.EmailTo -From $AlertConfig.EmailFrom `
+            -SmtpServer $AlertConfig.SmtpServer -SmtpPort $AlertConfig.SmtpPort `
+            -Credential $AlertConfig.SmtpCredential -UseSsl:$AlertConfig.SmtpUseSsl
+    }
+
+    # Send Teams if configured
+    if ($AlertConfig.TeamsWebhookUrl) {
+        Send-TeamsAlert -WebhookUrl $AlertConfig.TeamsWebhookUrl `
+            -Title $title -Message $messageText `
+            -Color $colors[$AlertType] -Facts $facts
+    }
+}
+
+function Check-MigrationAlerts {
+    param(
+        [array]$Mailboxes,
+        [object]$Summary,
+        [hashtable]$AlertConfig
+    )
+
+    if (-not $AlertConfig.AlertOnFailure -and -not $AlertConfig.AlertOnComplete -and -not $AlertConfig.AlertOnStall) {
+        return
+    }
+
+    $now = Get-Date
+
+    foreach ($mbx in $Mailboxes) {
+        $key = $mbx.Alias
+
+        # Check for failures
+        if ($AlertConfig.AlertOnFailure -and $mbx.Status -eq "Failed") {
+            if (-not $script:AlertedFailures.ContainsKey($key)) {
+                Send-MigrationAlert -AlertType "Failure" -Mailbox $mbx -Summary $Summary -AlertConfig $AlertConfig
+                $script:AlertedFailures[$key] = $now
+            }
+        }
+
+        # Check for completions
+        if ($AlertConfig.AlertOnComplete -and $mbx.Status -eq "Completed") {
+            if (-not $script:AlertedCompletions.ContainsKey($key)) {
+                Send-MigrationAlert -AlertType "Completion" -Mailbox $mbx -Summary $Summary -AlertConfig $AlertConfig
+                $script:AlertedCompletions[$key] = $now
+            }
+        }
+
+        # Check for stalls (no progress for StallThresholdMinutes)
+        if ($AlertConfig.AlertOnStall -and $mbx.Status -eq "InProgress") {
+            $currentProgress = $mbx.PercentComplete
+            $lastProgress = $script:LastProgressSnapshot[$key]
+
+            if ($null -ne $lastProgress) {
+                if ($currentProgress -eq $lastProgress.Percent) {
+                    $stallMinutes = ($now - $lastProgress.Time).TotalMinutes
+                    if ($stallMinutes -ge $AlertConfig.StallThresholdMinutes) {
+                        if (-not $script:AlertedStalls.ContainsKey($key) -or
+                            ($now - $script:AlertedStalls[$key]).TotalMinutes -ge 60) {
+                            # Add stall info to mailbox object for alert
+                            $mbx | Add-Member -NotePropertyName StallMinutes -NotePropertyValue ([math]::Round($stallMinutes)) -Force
+                            Send-MigrationAlert -AlertType "Stall" -Mailbox $mbx -Summary $Summary -AlertConfig $AlertConfig
+                            $script:AlertedStalls[$key] = $now
+                        }
+                    }
+                }
+                else {
+                    # Progress made - update snapshot and clear stall alert
+                    $script:LastProgressSnapshot[$key] = @{ Percent = $currentProgress; Time = $now }
+                    $script:AlertedStalls.Remove($key)
+                }
+            }
+            else {
+                # First time seeing this mailbox
+                $script:LastProgressSnapshot[$key] = @{ Percent = $currentProgress; Time = $now }
+            }
+        }
+    }
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AUTO-RETRY FAILED MIGRATIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Track retry attempts per mailbox: @{ "mailbox@domain.com" = @{ Attempts=2; LastRetry=[datetime]; LastError="..." } }
+$script:RetryTracker = @{}
+$script:RetryQueue = [System.Collections.ArrayList]::new()
+$script:RetryLog = [System.Collections.ArrayList]::new()
+
+function Test-RetryableError {
+    <#
+    .SYNOPSIS
+        Check if an error message matches retryable patterns.
+    #>
+    param(
+        [string]$ErrorMessage,
+        [string[]]$Patterns
+    )
+
+    if (-not $ErrorMessage -or -not $Patterns) { return $false }
+
+    foreach ($pattern in $Patterns) {
+        if ($ErrorMessage -match $pattern) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Invoke-MigrationRetry {
+    <#
+    .SYNOPSIS
+        Attempt to resume a failed move request.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$Identity,
+        [string]$Mailbox
+    )
+
+    try {
+        Write-Log "Attempting to resume move request for: $Mailbox" -Level "INFO"
+
+        # Resume the move request
+        Resume-MoveRequest -Identity $Identity -Confirm:$false -ErrorAction Stop
+
+        $logEntry = @{
+            Timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+            Mailbox   = $Mailbox
+            Action    = 'Resumed'
+            Success   = $true
+            Message   = 'Move request resumed successfully'
+        }
+        [void]$script:RetryLog.Add($logEntry)
+
+        Write-Log "Successfully resumed move request for: $Mailbox" -Level "SUCCESS"
+        return $true
+    }
+    catch {
+        $errMsg = $_.Exception.Message
+        Write-Log "Failed to resume move request for $Mailbox : $errMsg" -Level "ERROR"
+
+        $logEntry = @{
+            Timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+            Mailbox   = $Mailbox
+            Action    = 'ResumeFailed'
+            Success   = $false
+            Message   = $errMsg
+        }
+        [void]$script:RetryLog.Add($logEntry)
+
+        return $false
+    }
+}
+
+function Process-FailedMigrations {
+    <#
+    .SYNOPSIS
+        Check for failed migrations and queue them for retry if eligible.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [array]$Mailboxes,
+        [Parameter(Mandatory)]
+        [hashtable]$RetryConfig
+    )
+
+    if (-not $RetryConfig.Enabled) { return }
+
+    $now = Get-Date
+    $failedMailboxes = @($Mailboxes | Where-Object {
+        $_.StatusDetail -eq 'Failed' -or $_.Status -eq 'Failed'
+    })
+
+    foreach ($mbx in $failedMailboxes) {
+        $key = $mbx.Alias
+        if (-not $key) { $key = $mbx.DisplayName }
+        if (-not $key) { continue }
+
+        $errorMsg = $mbx.Message
+        if (-not $errorMsg) { $errorMsg = $mbx.FailureMessage }
+
+        # Check if error is retryable
+        if (-not (Test-RetryableError -ErrorMessage $errorMsg -Patterns $RetryConfig.ErrorPatterns)) {
+            Write-Log "Skipping retry for $key - error not retryable: $errorMsg" -Level "DEBUG"
+            continue
+        }
+
+        # Check retry tracker
+        if ($script:RetryTracker.ContainsKey($key)) {
+            $tracker = $script:RetryTracker[$key]
+
+            # Check if max attempts reached
+            if ($tracker.Attempts -ge $RetryConfig.MaxAttempts) {
+                Write-Log "Max retry attempts ($($RetryConfig.MaxAttempts)) reached for: $key" -Level "WARN"
+                continue
+            }
+
+            # Check if enough time has passed since last retry
+            $minutesSinceLastRetry = ($now - $tracker.LastRetry).TotalMinutes
+            if ($minutesSinceLastRetry -lt $RetryConfig.DelayMinutes) {
+                Write-Log "Waiting for retry delay ($($RetryConfig.DelayMinutes) min) for: $key" -Level "DEBUG"
+                continue
+            }
+        }
+
+        # Queue for retry
+        $retryItem = @{
+            Identity  = $mbx.Identity
+            Mailbox   = $key
+            Error     = $errorMsg
+            QueuedAt  = $now
+        }
+
+        # Check if already in queue
+        $alreadyQueued = $script:RetryQueue | Where-Object { $_.Mailbox -eq $key }
+        if (-not $alreadyQueued) {
+            [void]$script:RetryQueue.Add($retryItem)
+            Write-Log "Queued for retry: $key" -Level "INFO"
+        }
+    }
+}
+
+function Invoke-QueuedRetries {
+    <#
+    .SYNOPSIS
+        Process the retry queue and attempt to resume failed migrations.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$RetryConfig
+    )
+
+    if (-not $RetryConfig.Enabled) { return @() }
+    if ($script:RetryQueue.Count -eq 0) { return @() }
+
+    $results = @()
+    $now = Get-Date
+    $toRemove = @()
+
+    foreach ($item in $script:RetryQueue) {
+        $key = $item.Mailbox
+
+        # Initialize tracker if needed
+        if (-not $script:RetryTracker.ContainsKey($key)) {
+            $script:RetryTracker[$key] = @{
+                Attempts  = 0
+                LastRetry = [datetime]::MinValue
+                LastError = $item.Error
+            }
+        }
+
+        $tracker = $script:RetryTracker[$key]
+
+        # Attempt retry
+        $success = Invoke-MigrationRetry -Identity $item.Identity -Mailbox $key
+
+        # Update tracker
+        $tracker.Attempts++
+        $tracker.LastRetry = $now
+        $tracker.LastError = $item.Error
+        $script:RetryTracker[$key] = $tracker
+
+        $results += @{
+            Mailbox  = $key
+            Attempt  = $tracker.Attempts
+            Success  = $success
+            Time     = $now
+        }
+
+        # Remove from queue after processing
+        $toRemove += $item
+    }
+
+    # Clean up processed items
+    foreach ($item in $toRemove) {
+        $script:RetryQueue.Remove($item)
+    }
+
+    return $results
+}
+
+function Get-RetryStatus {
+    <#
+    .SYNOPSIS
+        Get current retry status for all tracked mailboxes.
+    #>
+    param(
+        [int]$MaxAttempts = 3
+    )
+
+    $status = @()
+    foreach ($key in $script:RetryTracker.Keys) {
+        $tracker = $script:RetryTracker[$key]
+        $status += [PSCustomObject]@{
+            Mailbox       = $key
+            Attempts      = $tracker.Attempts
+            MaxAttempts   = $MaxAttempts
+            LastRetry     = $tracker.LastRetry
+            LastError     = $tracker.LastError
+            Exhausted     = $tracker.Attempts -ge $MaxAttempts
+        }
+    }
+    return $status
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SCHEDULED REPORTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+$script:LastScheduledReport = $null
+
+function Test-ScheduledReportDue {
+    <#
+    .SYNOPSIS
+        Check if a scheduled report is due based on schedule configuration.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$ScheduleConfig
+    )
+
+    if (-not $ScheduleConfig.Enabled) { return $false }
+
+    $now = Get-Date
+    $targetTime = [datetime]::ParseExact($ScheduleConfig.ReportTime, 'H:mm', $null)
+    $targetHour = $targetTime.Hour
+    $targetMinute = $targetTime.Minute
+
+    # Check if we already sent a report in this period
+    if ($script:LastScheduledReport) {
+        $timeSinceLast = ($now - $script:LastScheduledReport).TotalMinutes
+
+        switch ($ScheduleConfig.Schedule) {
+            'Hourly' {
+                if ($timeSinceLast -lt 55) { return $false }
+            }
+            'Daily' {
+                if ($timeSinceLast -lt 1380) { return $false }  # 23 hours
+            }
+            'Weekly' {
+                if ($timeSinceLast -lt 9900) { return $false }  # 6.5 days
+            }
+        }
+    }
+
+    switch ($ScheduleConfig.Schedule) {
+        'Hourly' {
+            # Report at the top of each hour (within 5 min window)
+            return ($now.Minute -ge 0 -and $now.Minute -le 5)
+        }
+        'Daily' {
+            # Report at specified time (within 5 min window)
+            return ($now.Hour -eq $targetHour -and $now.Minute -ge $targetMinute -and $now.Minute -le ($targetMinute + 5))
+        }
+        'Weekly' {
+            # Report on specified day at specified time
+            return ([int]$now.DayOfWeek -eq $ScheduleConfig.DayOfWeek -and
+                    $now.Hour -eq $targetHour -and
+                    $now.Minute -ge $targetMinute -and $now.Minute -le ($targetMinute + 5))
+        }
+    }
+
+    return $false
+}
+
+function New-ScheduledReportHtml {
+    <#
+    .SYNOPSIS
+        Generate HTML content for scheduled report email.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [object]$Summary,
+        [array]$Mailboxes,
+        [bool]$IncludeDetail = $false,
+        [string]$Schedule = 'Daily'
+    )
+
+    $periodLabel = switch ($Schedule) {
+        'Hourly' { 'Hourly' }
+        'Daily'  { 'Daily' }
+        'Weekly' { 'Weekly' }
+        default  { 'Scheduled' }
+    }
+
+    $completedCount = @($Mailboxes | Where-Object { $_.Status -eq 'Completed' }).Count
+    $inProgressCount = @($Mailboxes | Where-Object { $_.Status -eq 'InProgress' }).Count
+    $failedCount = @($Mailboxes | Where-Object { $_.Status -eq 'Failed' }).Count
+
+    $html = @"
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <style>
+        body { font-family: 'Segoe UI', Arial, sans-serif; background: #f8fafc; margin: 0; padding: 20px; }
+        .container { max-width: 800px; margin: 0 auto; background: white; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); overflow: hidden; }
+        .header { background: linear-gradient(135deg, #1e40af 0%, #3b82f6 100%); color: white; padding: 24px; }
+        .header h1 { margin: 0 0 8px 0; font-size: 1.5rem; }
+        .header p { margin: 0; opacity: 0.9; font-size: 0.9rem; }
+        .content { padding: 24px; }
+        .kpi-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }
+        .kpi { background: #f1f5f9; border-radius: 8px; padding: 16px; text-align: center; }
+        .kpi-value { font-size: 1.8rem; font-weight: 700; color: #1e293b; }
+        .kpi-label { font-size: 0.8rem; color: #64748b; margin-top: 4px; }
+        .kpi.success .kpi-value { color: #22c55e; }
+        .kpi.warning .kpi-value { color: #f59e0b; }
+        .kpi.danger .kpi-value { color: #ef4444; }
+        .section { margin-top: 24px; }
+        .section h2 { font-size: 1.1rem; color: #1e293b; margin: 0 0 12px 0; padding-bottom: 8px; border-bottom: 2px solid #e2e8f0; }
+        table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+        th { background: #f1f5f9; padding: 10px 12px; text-align: left; font-weight: 600; color: #475569; }
+        td { padding: 10px 12px; border-bottom: 1px solid #e2e8f0; }
+        tr:hover { background: #f8fafc; }
+        .status-completed { color: #22c55e; font-weight: 600; }
+        .status-inprogress { color: #3b82f6; font-weight: 600; }
+        .status-failed { color: #ef4444; font-weight: 600; }
+        .footer { background: #f8fafc; padding: 16px 24px; text-align: center; font-size: 0.8rem; color: #94a3b8; border-top: 1px solid #e2e8f0; }
+        .progress-bar { background: #e2e8f0; border-radius: 4px; height: 8px; overflow: hidden; }
+        .progress-fill { background: #3b82f6; height: 100%; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📊 $periodLabel Migration Report</h1>
+            <p>Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>
+        </div>
+        <div class="content">
+            <div class="kpi-grid">
+                <div class="kpi">
+                    <div class="kpi-value">$($Summary.MailboxCount)</div>
+                    <div class="kpi-label">Total Mailboxes</div>
+                </div>
+                <div class="kpi success">
+                    <div class="kpi-value">$completedCount</div>
+                    <div class="kpi-label">Completed</div>
+                </div>
+                <div class="kpi warning">
+                    <div class="kpi-value">$inProgressCount</div>
+                    <div class="kpi-label">In Progress</div>
+                </div>
+                <div class="kpi$(if($failedCount -gt 0){' danger'})">
+                    <div class="kpi-value">$failedCount</div>
+                    <div class="kpi-label">Failed</div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2>📈 Overall Progress</h2>
+                <div style="margin-bottom:8px;">
+                    <span style="font-weight:600;">$([math]::Round($Summary.OverallPercentComplete, 1))%</span> Complete
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" style="width:$([math]::Round($Summary.OverallPercentComplete, 1))%"></div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2>📊 Performance Metrics</h2>
+                <table>
+                    <tr><td style="width:50%"><strong>Total Data Size</strong></td><td>$([math]::Round($Summary.TotalSourceSizeGB, 2)) GB</td></tr>
+                    <tr><td><strong>Data Transferred</strong></td><td>$([math]::Round($Summary.TotalTransferredGB, 2)) GB</td></tr>
+                    <tr><td><strong>Throughput</strong></td><td>$([math]::Round($Summary.TotalThroughputGBPerHour, 2)) GB/hour</td></tr>
+                    <tr><td><strong>Avg Transfer Rate</strong></td><td>$([math]::Round($Summary.AverageTransferRateMBPerHour, 2)) MB/hour</td></tr>
+                    $(if($Summary.EstimatedCompletionTime){"<tr><td><strong>Est. Completion</strong></td><td>$($Summary.EstimatedCompletionTime.ToString('yyyy-MM-dd HH:mm'))</td></tr>"})
+                </table>
+            </div>
+"@
+
+    # Add failed mailboxes section if any
+    if ($failedCount -gt 0) {
+        $failedMailboxes = @($Mailboxes | Where-Object { $_.Status -eq 'Failed' })
+        $html += @"
+
+            <div class="section">
+                <h2>⚠️ Failed Migrations ($failedCount)</h2>
+                <table>
+                    <thead><tr><th>Mailbox</th><th>Error</th></tr></thead>
+                    <tbody>
+"@
+        foreach ($mbx in $failedMailboxes) {
+            $errorMsg = if ($mbx.Message) { $mbx.Message.Substring(0, [Math]::Min(100, $mbx.Message.Length)) } else { 'Unknown error' }
+            $html += "                        <tr><td>$($mbx.DisplayName)</td><td style='color:#ef4444;'>$errorMsg</td></tr>`n"
+        }
+        $html += @"
+                    </tbody>
+                </table>
+            </div>
+"@
+    }
+
+    # Add detailed mailbox list if requested
+    if ($IncludeDetail -and $Mailboxes.Count -gt 0) {
+        $html += @"
+
+            <div class="section">
+                <h2>📋 Mailbox Details</h2>
+                <table>
+                    <thead><tr><th>Mailbox</th><th>Status</th><th>% Complete</th><th>Size (GB)</th><th>Transferred</th></tr></thead>
+                    <tbody>
+"@
+        foreach ($mbx in ($Mailboxes | Sort-Object -Property PercentComplete -Descending | Select-Object -First 50)) {
+            $statusClass = switch ($mbx.Status) {
+                'Completed'  { 'status-completed' }
+                'InProgress' { 'status-inprogress' }
+                'Failed'     { 'status-failed' }
+                default      { '' }
+            }
+            $html += "                        <tr><td>$($mbx.DisplayName)</td><td class='$statusClass'>$($mbx.StatusDetail)</td><td>$([math]::Round($mbx.PercentComplete, 1))%</td><td>$([math]::Round($mbx.TotalMailboxSizeGB, 2))</td><td>$([math]::Round($mbx.BytesTransferredGB, 2)) GB</td></tr>`n"
+        }
+        if ($Mailboxes.Count -gt 50) {
+            $html += "                        <tr><td colspan='5' style='text-align:center;color:#94a3b8;'>... and $($Mailboxes.Count - 50) more mailboxes</td></tr>`n"
+        }
+        $html += @"
+                    </tbody>
+                </table>
+            </div>
+"@
+    }
+
+    $html += @"
+
+        </div>
+        <div class="footer">
+            Exchange Migration Analyzer - Scheduled Report<br>
+            Generated by MigrationAnalysisV3.ps1
+        </div>
+    </div>
+</body>
+</html>
+"@
+
+    return $html
+}
+
+function Send-ScheduledReport {
+    <#
+    .SYNOPSIS
+        Generate and send a scheduled migration report.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [object]$Summary,
+        [Parameter(Mandatory)]
+        [array]$Mailboxes,
+        [Parameter(Mandatory)]
+        [hashtable]$ScheduleConfig,
+        [Parameter(Mandatory)]
+        [hashtable]$AlertConfig
+    )
+
+    $periodLabel = switch ($ScheduleConfig.Schedule) {
+        'Hourly' { 'Hourly' }
+        'Daily'  { 'Daily' }
+        'Weekly' { 'Weekly' }
+        default  { 'Scheduled' }
+    }
+
+    Write-Log "Generating $periodLabel scheduled report..." -Level "INFO"
+
+    # Generate HTML report
+    $htmlBody = New-ScheduledReportHtml -Summary $Summary -Mailboxes $Mailboxes `
+        -IncludeDetail $ScheduleConfig.IncludeDetail -Schedule $ScheduleConfig.Schedule
+
+    $subject = "[$periodLabel] Migration Report - $([math]::Round($Summary.OverallPercentComplete, 1))% Complete - $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
+
+    # Determine recipients
+    $recipients = if ($ScheduleConfig.EmailTo) { $ScheduleConfig.EmailTo } else { $AlertConfig.EmailTo }
+
+    if (-not $recipients) {
+        Write-Log "No email recipients configured for scheduled reports" -Level "WARN"
+        return $false
+    }
+
+    # Send via email
+    try {
+        Send-EmailAlert -Subject $subject -Body $htmlBody `
+            -To $recipients -From $AlertConfig.EmailFrom `
+            -SmtpServer $AlertConfig.SmtpServer -SmtpPort $AlertConfig.SmtpPort `
+            -Credential $AlertConfig.SmtpCredential -UseSsl:$AlertConfig.SmtpUseSsl
+
+        $script:LastScheduledReport = Get-Date
+        Write-Log "$periodLabel report sent successfully to: $recipients" -Level "SUCCESS"
+        return $true
+    }
+    catch {
+        Write-Log "Failed to send scheduled report: $($_.Exception.Message)" -Level "ERROR"
+        return $false
+    }
 }
 
 #endregion
@@ -2232,6 +3108,8 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
   <div class="main-tab-bar">
     <button class="main-tab active" onclick="switchMain('perf',this)">📊 Migration Performance Analysis</button>
     <button class="main-tab"        onclick="switchMain('mbx', this)">📬 Mailbox Migration Detail</button>
+    <button class="main-tab"        onclick="switchMain('compare', this)" id="tab-compare" style="display:none">📋 Batch Comparison</button>
+    <button class="main-tab"        onclick="switchMain('retry', this)" id="tab-retry" style="display:none">🔄 Auto-Retry</button>
   </div>
 
   <!-- Panel 1: Performance Analysis -->
@@ -2305,6 +3183,32 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
       <div class="sub">Across all mailboxes</div>
     </div>
 
+  </div>
+
+  <!-- Historical Trend Charts (Watch Mode Only) -->
+  <div class="card" id="trend-charts-card" style="display:none;max-height:520px;overflow:hidden;">
+    <h2>📈 Historical Trends</h2>
+    <p class="section-note">Real-time tracking of migration progress over time. Data collected every refresh cycle in watch mode.</p>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px;">
+      <div style="height:180px;">
+        <div style="font-size:.8rem;font-weight:600;color:#64748b;margin-bottom:8px;">Transfer Rate (GB/h)</div>
+        <div style="height:150px;"><canvas id="chart-rate"></canvas></div>
+      </div>
+      <div style="height:180px;">
+        <div style="font-size:.8rem;font-weight:600;color:#64748b;margin-bottom:8px;">Completion Progress (%)</div>
+        <div style="height:150px;"><canvas id="chart-progress"></canvas></div>
+      </div>
+    </div>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px; margin-top:16px;">
+      <div style="height:180px;">
+        <div style="font-size:.8rem;font-weight:600;color:#64748b;margin-bottom:8px;">Data Transferred (GB)</div>
+        <div style="height:150px;"><canvas id="chart-transferred"></canvas></div>
+      </div>
+      <div style="height:180px;">
+        <div style="font-size:.8rem;font-weight:600;color:#64748b;margin-bottom:8px;">Mailbox Status Counts</div>
+        <div style="height:150px;"><canvas id="chart-status"></canvas></div>
+      </div>
+    </div>
   </div>
 
   <!-- Health Check Cards — 8 cards, 4 columns × 2 rows -->
@@ -2485,6 +3389,7 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
       <button class="ent-btn" id="btn-filters" onclick="togglePanel('adv-filter-panel','btn-filters')">&#x2699; Filters</button>
       <button class="ent-btn" id="btn-cols"    onclick="togglePanel('col-panel','btn-cols')">&#x25A6; Columns</button>
       <button class="ent-btn" onclick="showKeyboardHelp()" title="Keyboard Shortcuts (?)">&#x2328; Keys</button>
+      <button class="ent-btn" onclick="clearAllPins()" title="Clear all pinned mailboxes">&#x1F4CC; Clear Pins</button>
     </div>
     <div class="tb-sep"></div>
     <input class="tb-search" id="ent-search" type="text" placeholder="Search mailboxes..." oninput="applyFilters()">
@@ -2550,6 +3455,103 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
 
 
   </div><!-- /panel-mbx -->
+
+  <!-- Panel 3: Batch Comparison (Watch Mode Only) -->
+  <div id="panel-compare" class="main-panel" style="display:none">
+    <div class="card">
+      <h2>📋 Batch Comparison</h2>
+      <p class="section-note">Compare performance metrics across multiple migration batches. Select batches to compare side-by-side. Only available in watch mode.</p>
+
+      <div style="margin-bottom:20px;">
+        <label style="font-weight:600;font-size:.85rem;color:#475569;">Select batches to compare:</label>
+        <div id="batch-selector" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;"></div>
+        <button class="ent-btn" onclick="loadBatchComparison()" style="margin-top:12px;">🔄 Load Comparison</button>
+      </div>
+
+      <div id="comparison-loading" style="display:none;text-align:center;padding:40px;color:#64748b;">
+        <div style="font-size:2rem;margin-bottom:10px;">⏳</div>
+        Loading batch data...
+      </div>
+
+      <div id="comparison-results" style="display:none;">
+        <!-- Comparison Chart -->
+        <div style="margin-bottom:24px;">
+          <div style="font-size:.85rem;font-weight:600;color:#64748b;margin-bottom:12px;">Performance Comparison</div>
+          <canvas id="chart-batch-compare" height="300"></canvas>
+        </div>
+
+        <!-- Comparison Table -->
+        <div class="tbl-wrap">
+          <table id="comparison-table">
+            <thead>
+              <tr>
+                <th>Metric</th>
+              </tr>
+            </thead>
+            <tbody id="comparison-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div id="comparison-empty" style="text-align:center;padding:40px;color:#94a3b8;">
+        <div style="font-size:3rem;margin-bottom:10px;">📊</div>
+        <div>Select at least 2 batches above and click "Load Comparison" to compare their performance.</div>
+      </div>
+    </div>
+  </div><!-- /panel-compare -->
+
+  <!-- Panel 4: Auto-Retry Status (Watch Mode Only) -->
+  <div id="panel-retry" class="main-panel" style="display:none">
+    <div class="card">
+      <h2>🔄 Auto-Retry Status</h2>
+      <p class="section-note">Monitor automatic retry attempts for failed migrations. Shows retry queue and history of retry actions.</p>
+
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:24px;">
+        <div class="kpi-card" style="text-align:center;">
+          <div class="kpi-label">Queued for Retry</div>
+          <div class="kpi-value" id="retry-queue-count">0</div>
+        </div>
+        <div class="kpi-card" style="text-align:center;">
+          <div class="kpi-label">Successful Retries</div>
+          <div class="kpi-value" id="retry-success-count" style="color:#22c55e;">0</div>
+        </div>
+        <div class="kpi-card" style="text-align:center;">
+          <div class="kpi-label">Failed Retries</div>
+          <div class="kpi-value" id="retry-failed-count" style="color:#ef4444;">0</div>
+        </div>
+      </div>
+
+      <div style="margin-bottom:16px;">
+        <button class="wbtn wbtn-p" onclick="refreshRetryStatus()">🔄 Refresh Status</button>
+      </div>
+
+      <h3 style="margin-top:24px;margin-bottom:12px;">Retry Activity Log</h3>
+      <div id="retry-log-container" style="max-height:400px;overflow-y:auto;border:1px solid #e2e8f0;border-radius:8px;">
+        <table class="detail-table" style="margin:0;">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Mailbox</th>
+              <th>Action</th>
+              <th>Result</th>
+              <th>Message</th>
+            </tr>
+          </thead>
+          <tbody id="retry-log-tbody">
+            <tr><td colspan="5" style="text-align:center;padding:30px;color:#94a3b8;">No retry activity yet. Enable auto-retry with -AutoRetryFailed parameter.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div id="retry-disabled-notice" style="display:none;text-align:center;padding:40px;color:#94a3b8;">
+        <div style="font-size:3rem;margin-bottom:10px;">⚙️</div>
+        <div>Auto-Retry is not enabled. Start watch mode with <code>-AutoRetryFailed</code> parameter to enable automatic retry of failed migrations.</div>
+        <div style="margin-top:16px;font-size:.85rem;">
+          Example: <code style="background:#f1f5f9;padding:4px 8px;border-radius:4px;">Invoke-MigrationReport -WatchMode -AutoRetryFailed -MaxRetryAttempts 3</code>
+        </div>
+      </div>
+    </div>
+  </div><!-- /panel-retry -->
 
   <div class="footer">
     Exchange Migration Analyzer &nbsp;•&nbsp; Generated $($Summary.GeneratedAt.ToString("R"))
@@ -3200,6 +4202,21 @@ function initPinnedMailboxes() {
   sortPinnedToTop();
 }
 
+function clearAllPins() {
+  pinnedMailboxes = [];
+  localStorage.setItem('migrationPinnedMailboxes', '[]');
+
+  var tbody = document.getElementById('mbx-tbody');
+  if (!tbody) return;
+
+  var rows = Array.from(tbody.querySelectorAll('tr'));
+  rows.forEach(function(row) {
+    row.classList.remove('pinned-row');
+    var btn = row.querySelector('.pin-btn');
+    if (btn) btn.classList.remove('pinned');
+  });
+}
+
 // ── Export CSV ────────────────────────────────────────────────────
 function getVisibleRows() {
   var activeBody = (typeof inSlowestTab !== 'undefined' && inSlowestTab) ?
@@ -3468,6 +4485,7 @@ function showKeyboardHelp() {
       '<h3>⌨️ Keyboard Shortcuts</h3>' +
       '<div class="kb-row"><span class="kb-key">D</span><span class="kb-desc">Toggle dark mode</span></div>' +
       '<div class="kb-row"><span class="kb-key">S</span><span class="kb-desc">Toggle sound alerts</span></div>' +
+      '<div class="kb-row"><span class="kb-key">B</span><span class="kb-desc">Bookmark/pin selected row</span></div>' +
       '<div class="kb-row"><span class="kb-key">J</span><span class="kb-desc">Next row</span></div>' +
       '<div class="kb-row"><span class="kb-key">K</span><span class="kb-desc">Previous row</span></div>' +
       '<div class="kb-row"><span class="kb-key">Enter</span><span class="kb-desc">Open mailbox detail</span></div>' +
@@ -3568,6 +4586,436 @@ function exportPDF() {
   }, 1000);
 }
 
+// ══════════════════════════════════════════════════════════════════
+// HISTORICAL TREND CHARTS
+// ══════════════════════════════════════════════════════════════════
+var trendCharts = {};
+var chartJsLoaded = false;
+
+function loadChartJs(callback) {
+  if (chartJsLoaded) { callback(); return; }
+  var script = document.createElement('script');
+  script.src = 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js';
+  script.onload = function() {
+    chartJsLoaded = true;
+    callback();
+  };
+  script.onerror = function() {
+    console.error('Failed to load Chart.js');
+  };
+  document.head.appendChild(script);
+}
+
+function initTrendCharts() {
+  var card = document.getElementById('trend-charts-card');
+  if (!card) return;
+
+  // Only show in watch mode (when API is available)
+  var apiBase = window.WATCH_API_BASE;
+  if (!apiBase) return;
+
+  card.style.display = 'block';
+
+  loadChartJs(function() {
+    var isDark = document.body.classList.contains('dark-mode');
+    var gridColor = isDark ? 'rgba(148,163,184,0.2)' : 'rgba(0,0,0,0.1)';
+    var textColor = isDark ? '#94a3b8' : '#64748b';
+
+    var commonOptions = {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: { duration: 300 },
+      plugins: {
+        legend: { display: false }
+      },
+      scales: {
+        x: {
+          grid: { color: gridColor },
+          ticks: { color: textColor, maxTicksLimit: 10 }
+        },
+        y: {
+          grid: { color: gridColor },
+          ticks: { color: textColor },
+          beginAtZero: true
+        }
+      }
+    };
+
+    // Transfer Rate Chart
+    trendCharts.rate = new Chart(document.getElementById('chart-rate'), {
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: [{
+          label: 'GB/h',
+          data: [],
+          borderColor: '#3b82f6',
+          backgroundColor: 'rgba(59,130,246,0.1)',
+          fill: true,
+          tension: 0.3,
+          pointRadius: 2
+        }]
+      },
+      options: commonOptions
+    });
+
+    // Progress Chart
+    trendCharts.progress = new Chart(document.getElementById('chart-progress'), {
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: [{
+          label: '% Complete',
+          data: [],
+          borderColor: '#22c55e',
+          backgroundColor: 'rgba(34,197,94,0.1)',
+          fill: true,
+          tension: 0.3,
+          pointRadius: 2
+        }]
+      },
+      options: { ...commonOptions, scales: { ...commonOptions.scales, y: { ...commonOptions.scales.y, max: 100 } } }
+    });
+
+    // Transferred GB Chart
+    trendCharts.transferred = new Chart(document.getElementById('chart-transferred'), {
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: [{
+          label: 'GB',
+          data: [],
+          borderColor: '#f59e0b',
+          backgroundColor: 'rgba(245,158,11,0.1)',
+          fill: true,
+          tension: 0.3,
+          pointRadius: 2
+        }]
+      },
+      options: commonOptions
+    });
+
+    // Status Counts Chart
+    trendCharts.status = new Chart(document.getElementById('chart-status'), {
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: [
+          { label: 'Completed', data: [], borderColor: '#22c55e', tension: 0.3, pointRadius: 2 },
+          { label: 'In Progress', data: [], borderColor: '#3b82f6', tension: 0.3, pointRadius: 2 },
+          { label: 'Failed', data: [], borderColor: '#ef4444', tension: 0.3, pointRadius: 2 }
+        ]
+      },
+      options: { ...commonOptions, plugins: { legend: { display: true, position: 'bottom', labels: { color: textColor, boxWidth: 12 } } } }
+    });
+
+    // Start fetching trend data
+    fetchTrendData();
+    setInterval(fetchTrendData, 30000); // Update every 30 seconds
+  });
+}
+
+function fetchTrendData() {
+  var apiBase = window.WATCH_API_BASE;
+  if (!apiBase || !chartJsLoaded) return;
+
+  fetch(apiBase + '/api/trends')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (!data || !Array.isArray(data) || data.length === 0) return;
+      updateTrendCharts(data);
+    })
+    .catch(function(e) { console.log('Trend fetch error:', e); });
+}
+
+function updateTrendCharts(data) {
+  var labels = data.map(function(d) { return d.TimeLabel; });
+
+  if (trendCharts.rate) {
+    trendCharts.rate.data.labels = labels;
+    trendCharts.rate.data.datasets[0].data = data.map(function(d) { return d.TransferRateGBh || 0; });
+    trendCharts.rate.update('none');
+  }
+
+  if (trendCharts.progress) {
+    trendCharts.progress.data.labels = labels;
+    trendCharts.progress.data.datasets[0].data = data.map(function(d) { return d.PercentComplete || 0; });
+    trendCharts.progress.update('none');
+  }
+
+  if (trendCharts.transferred) {
+    trendCharts.transferred.data.labels = labels;
+    trendCharts.transferred.data.datasets[0].data = data.map(function(d) { return d.TransferredGB || 0; });
+    trendCharts.transferred.update('none');
+  }
+
+  if (trendCharts.status) {
+    trendCharts.status.data.labels = labels;
+    trendCharts.status.data.datasets[0].data = data.map(function(d) { return d.CompletedCount || 0; });
+    trendCharts.status.data.datasets[1].data = data.map(function(d) { return d.InProgressCount || 0; });
+    trendCharts.status.data.datasets[2].data = data.map(function(d) { return d.FailedCount || 0; });
+    trendCharts.status.update('none');
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════
+// BATCH COMPARISON
+// ══════════════════════════════════════════════════════════════════
+var batchCompareChart = null;
+var selectedBatches = [];
+var batchDataCache = {};
+
+function initBatchComparison() {
+  var apiBase = window.WATCH_API_BASE;
+  if (!apiBase) return;
+
+  // Show the comparison tab
+  var tab = document.getElementById('tab-compare');
+  if (tab) tab.style.display = '';
+
+  // Load batch list
+  fetch(apiBase + '/api/batches')
+    .then(function(r) { return r.json(); })
+    .then(function(batches) {
+      var selector = document.getElementById('batch-selector');
+      if (!selector || !batches || batches.length === 0) return;
+
+      selector.innerHTML = batches.map(function(b) {
+        return '<label style="display:flex;align-items:center;gap:6px;padding:6px 12px;background:#f1f5f9;border-radius:6px;cursor:pointer;font-size:.85rem;">' +
+          '<input type="checkbox" class="batch-checkbox" value="' + b.Name + '" onchange="updateSelectedBatches()">' +
+          '<span>' + b.Name + '</span>' +
+          '<span style="color:#94a3b8;font-size:.75rem;">(' + b.Count + ')</span>' +
+        '</label>';
+      }).join('');
+    })
+    .catch(function(e) { console.log('Failed to load batches:', e); });
+}
+
+function updateSelectedBatches() {
+  var checkboxes = document.querySelectorAll('.batch-checkbox:checked');
+  selectedBatches = Array.from(checkboxes).map(function(cb) { return cb.value; });
+}
+
+function loadBatchComparison() {
+  if (selectedBatches.length < 2) {
+    alert('Please select at least 2 batches to compare.');
+    return;
+  }
+
+  var apiBase = window.WATCH_API_BASE;
+  if (!apiBase) return;
+
+  document.getElementById('comparison-empty').style.display = 'none';
+  document.getElementById('comparison-results').style.display = 'none';
+  document.getElementById('comparison-loading').style.display = 'block';
+
+  // Fetch data for each selected batch
+  var promises = selectedBatches.map(function(batchName) {
+    return fetch(apiBase + '/api/batch-stats?batch=' + encodeURIComponent(batchName))
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        data.BatchName = batchName;
+        return data;
+      })
+      .catch(function() {
+        return { BatchName: batchName, error: true };
+      });
+  });
+
+  Promise.all(promises).then(function(results) {
+    document.getElementById('comparison-loading').style.display = 'none';
+    document.getElementById('comparison-results').style.display = 'block';
+    renderBatchComparison(results.filter(function(r) { return !r.error; }));
+  });
+}
+
+function renderBatchComparison(batches) {
+  if (batches.length === 0) {
+    document.getElementById('comparison-results').style.display = 'none';
+    document.getElementById('comparison-empty').style.display = 'block';
+    return;
+  }
+
+  // Update table headers
+  var thead = document.querySelector('#comparison-table thead tr');
+  thead.innerHTML = '<th>Metric</th>' + batches.map(function(b) {
+    return '<th>' + b.BatchName + '</th>';
+  }).join('');
+
+  // Metrics to compare
+  var metrics = [
+    { key: 'MailboxCount', label: 'Mailboxes', format: function(v) { return v || 0; } },
+    { key: 'PercentComplete', label: '% Complete', format: function(v) { return (v || 0) + '%'; } },
+    { key: 'TotalSourceSizeGB', label: 'Total Size (GB)', format: function(v) { return (v || 0).toFixed(2); } },
+    { key: 'TotalTransferredGB', label: 'Transferred (GB)', format: function(v) { return (v || 0).toFixed(2); } },
+    { key: 'TotalThroughputGBPerHour', label: 'Throughput (GB/h)', format: function(v) { return (v || 0).toFixed(2); } },
+    { key: 'AvgTransferRateMBPerHour', label: 'Avg Rate (MB/h)', format: function(v) { return (v || 0).toFixed(2); } },
+    { key: 'MoveEfficiency', label: 'Move Efficiency', format: function(v) { return (v || 0) + '%'; } },
+    { key: 'CompletedCount', label: 'Completed', format: function(v) { return v || 0; } },
+    { key: 'InProgressCount', label: 'In Progress', format: function(v) { return v || 0; } },
+    { key: 'FailedCount', label: 'Failed', format: function(v) { return v || 0; }, highlight: true }
+  ];
+
+  var tbody = document.getElementById('comparison-tbody');
+  tbody.innerHTML = metrics.map(function(m) {
+    var cells = batches.map(function(b) {
+      var val = b[m.key];
+      var style = '';
+      if (m.highlight && val > 0) style = 'color:#ef4444;font-weight:600;';
+      return '<td style="' + style + '">' + m.format(val) + '</td>';
+    }).join('');
+    return '<tr><td style="font-weight:600;">' + m.label + '</td>' + cells + '</tr>';
+  }).join('');
+
+  // Render comparison chart
+  renderBatchCompareChart(batches);
+}
+
+function renderBatchCompareChart(batches) {
+  loadChartJs(function() {
+    var ctx = document.getElementById('chart-batch-compare');
+    if (!ctx) return;
+
+    if (batchCompareChart) {
+      batchCompareChart.destroy();
+    }
+
+    var isDark = document.body.classList.contains('dark-mode');
+    var colors = ['#3b82f6', '#22c55e', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16'];
+
+    batchCompareChart = new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels: ['Throughput (GB/h)', 'Avg Rate (MB/h)', '% Complete', 'Efficiency %'],
+        datasets: batches.map(function(b, i) {
+          return {
+            label: b.BatchName,
+            data: [
+              b.TotalThroughputGBPerHour || 0,
+              (b.AvgTransferRateMBPerHour || 0) / 1000,
+              b.PercentComplete || 0,
+              b.MoveEfficiency || 0
+            ],
+            backgroundColor: colors[i % colors.length] + 'cc',
+            borderColor: colors[i % colors.length],
+            borderWidth: 1
+          };
+        })
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: {
+            position: 'bottom',
+            labels: { color: isDark ? '#94a3b8' : '#64748b', boxWidth: 12 }
+          }
+        },
+        scales: {
+          x: {
+            grid: { color: isDark ? 'rgba(148,163,184,0.2)' : 'rgba(0,0,0,0.1)' },
+            ticks: { color: isDark ? '#94a3b8' : '#64748b' }
+          },
+          y: {
+            grid: { color: isDark ? 'rgba(148,163,184,0.2)' : 'rgba(0,0,0,0.1)' },
+            ticks: { color: isDark ? '#94a3b8' : '#64748b' },
+            beginAtZero: true
+          }
+        }
+      }
+    });
+  });
+}
+
+// ══════════════════════════════════════════════════════════════════
+// AUTO-RETRY STATUS
+// ══════════════════════════════════════════════════════════════════
+var retryRefreshInterval = null;
+
+function initRetryPanel() {
+  var apiBase = window.WATCH_API_BASE;
+  if (!apiBase) return;
+
+  // Show the retry tab
+  var tab = document.getElementById('tab-retry');
+  if (tab) tab.style.display = '';
+
+  // Initial load
+  refreshRetryStatus();
+
+  // Auto-refresh every 30 seconds when on retry panel
+  retryRefreshInterval = setInterval(function() {
+    var panel = document.getElementById('panel-retry');
+    if (panel && panel.style.display !== 'none') {
+      refreshRetryStatus();
+    }
+  }, 30000);
+}
+
+function refreshRetryStatus() {
+  var apiBase = window.WATCH_API_BASE;
+  if (!apiBase) return;
+
+  fetch(apiBase + '/api/retry-status')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      updateRetryDisplay(data);
+    })
+    .catch(function(e) {
+      console.log('Failed to fetch retry status:', e);
+    });
+}
+
+function updateRetryDisplay(data) {
+  // Update queue count
+  var queueEl = document.getElementById('retry-queue-count');
+  if (queueEl) queueEl.textContent = data.QueueCount || 0;
+
+  // Calculate success/fail counts from log
+  var successCount = 0;
+  var failCount = 0;
+  var log = data.Log || [];
+
+  log.forEach(function(entry) {
+    if (entry.Success) successCount++;
+    else failCount++;
+  });
+
+  var successEl = document.getElementById('retry-success-count');
+  if (successEl) successEl.textContent = successCount;
+
+  var failEl = document.getElementById('retry-failed-count');
+  if (failEl) failEl.textContent = failCount;
+
+  // Update log table
+  var tbody = document.getElementById('retry-log-tbody');
+  if (!tbody) return;
+
+  if (log.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:30px;color:#94a3b8;">No retry activity yet.</td></tr>';
+    return;
+  }
+
+  // Sort by timestamp descending (most recent first)
+  log.sort(function(a, b) {
+    return new Date(b.Timestamp) - new Date(a.Timestamp);
+  });
+
+  tbody.innerHTML = log.map(function(entry) {
+    var resultClass = entry.Success ? 'color:#22c55e;' : 'color:#ef4444;';
+    var resultText = entry.Success ? '✓ Success' : '✗ Failed';
+    var actionIcon = entry.Action === 'Resumed' ? '▶️' : '⚠️';
+
+    return '<tr>' +
+      '<td style="white-space:nowrap;font-size:.85rem;">' + (entry.Timestamp || '-') + '</td>' +
+      '<td style="font-weight:500;">' + (entry.Mailbox || '-') + '</td>' +
+      '<td>' + actionIcon + ' ' + (entry.Action || '-') + '</td>' +
+      '<td style="' + resultClass + 'font-weight:600;">' + resultText + '</td>' +
+      '<td style="font-size:.85rem;max-width:300px;overflow:hidden;text-overflow:ellipsis;" title="' + (entry.Message || '').replace(/"/g, '&quot;') + '">' + (entry.Message || '-') + '</td>' +
+    '</tr>';
+  }).join('');
+}
+
 // ── Init on load ──────────────────────────────────────────────────
 window.addEventListener('load', function() {
   initColumns();
@@ -3576,6 +5024,9 @@ window.addEventListener('load', function() {
   initSoundButton();
   initKeyboardShortcuts();
   initPinnedMailboxes();
+  initTrendCharts();
+  initBatchComparison();
+  initRetryPanel();
   checkForAlerts();
   updateSummaryBar(
     document.querySelectorAll('#mbx-tbody tr').length, 0
@@ -3667,6 +5118,8 @@ $(if($ListenerPort -gt 0){
 
   if (!API_BASE) return;
 
+  // Expose API base for trend charts
+  window.WATCH_API_BASE = API_BASE;
 
   // When served via HTTP listener, use relative URLs (same origin, no CORS/ad-blocker issues)
 
@@ -4059,6 +5512,113 @@ function Start-WatchListener {
                             $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"Invalid request"}')
                         }
                     }
+                    elseif ($path -eq '/api/trends') {
+                        $contentType = 'application/json; charset=utf-8'
+                        $trends = $State['TrendHistory']
+                        $json = if ($trends -and $trends.Count -gt 0) {
+                            $trends | ConvertTo-Json -Compress
+                        } else {
+                            '[]'
+                        }
+                        $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+                    }
+                    elseif ($path -eq '/api/batch-stats') {
+                        $contentType = 'application/json; charset=utf-8'
+                        try {
+                            # Parse batch name from query string
+                            $batchName = $null
+                            if ($req.Url.Query) {
+                                $queryParams = [System.Web.HttpUtility]::ParseQueryString($req.Url.Query)
+                                $batchName = $queryParams['batch']
+                            }
+
+                            if (-not $batchName) {
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"Missing batch parameter"}')
+                            } else {
+                                # Get batch statistics from cached data
+                                $cachedMailboxes = $State['CachedMailboxes']
+                                if ($cachedMailboxes -and $cachedMailboxes.Count -gt 0) {
+                                    $batchMailboxes = $cachedMailboxes | Where-Object { $_.BatchName -eq $batchName }
+
+                                    if ($batchMailboxes -and @($batchMailboxes).Count -gt 0) {
+                                        $batchArray = @($batchMailboxes)
+                                        $completedCount = @($batchArray | Where-Object { $_.StatusDetail -eq 'Completed' -or $_.Status -eq 'Completed' }).Count
+                                        $inProgressCount = @($batchArray | Where-Object { $_.StatusDetail -like '*Progress*' -or $_.Status -eq 'InProgress' }).Count
+                                        $failedCount = @($batchArray | Where-Object { $_.StatusDetail -eq 'Failed' -or $_.Status -eq 'Failed' }).Count
+
+                                        $totalSourceGB = ($batchArray | Measure-Object -Property TotalMailboxSizeGB -Sum).Sum
+                                        $totalTransferredGB = ($batchArray | Measure-Object -Property BytesTransferredGB -Sum).Sum
+                                        $avgPercent = ($batchArray | Measure-Object -Property PercentComplete -Average).Average
+                                        $avgTransferRate = ($batchArray | Where-Object { $_.TransferRateMBPerHour -gt 0 } | Measure-Object -Property TransferRateMBPerHour -Average).Average
+
+                                        # Calculate throughput
+                                        $totalThroughput = 0
+                                        if ($totalSourceGB -gt 0 -and $avgPercent -gt 0) {
+                                            $avgDuration = ($batchArray | Where-Object { $_.TotalInProgressDurationHours -gt 0 } | Measure-Object -Property TotalInProgressDurationHours -Average).Average
+                                            if ($avgDuration -gt 0) {
+                                                $totalThroughput = [math]::Round($totalTransferredGB / $avgDuration, 2)
+                                            }
+                                        }
+
+                                        $moveEfficiency = if ($totalSourceGB -gt 0) { [math]::Round(($totalTransferredGB / $totalSourceGB) * 100, 1) } else { 0 }
+
+                                        $batchStats = @{
+                                            ok = $true
+                                            BatchName = $batchName
+                                            MailboxCount = $batchArray.Count
+                                            PercentComplete = [math]::Round($avgPercent, 1)
+                                            TotalSourceSizeGB = [math]::Round($totalSourceGB, 2)
+                                            TotalTransferredGB = [math]::Round($totalTransferredGB, 2)
+                                            TotalThroughputGBPerHour = $totalThroughput
+                                            AvgTransferRateMBPerHour = [math]::Round($avgTransferRate, 2)
+                                            MoveEfficiency = $moveEfficiency
+                                            CompletedCount = $completedCount
+                                            InProgressCount = $inProgressCount
+                                            FailedCount = $failedCount
+                                        }
+                                        $responseBytes = [System.Text.Encoding]::UTF8.GetBytes(($batchStats | ConvertTo-Json -Compress))
+                                    } else {
+                                        $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"Batch not found"}')
+                                    }
+                                } else {
+                                    $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"No cached data available"}')
+                                }
+                            }
+                        } catch {
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"Failed to get batch stats"}')
+                        }
+                    }
+                    elseif ($path -eq '/api/batches') {
+                        # Return list of all batch names with counts for the comparison selector
+                        $contentType = 'application/json; charset=utf-8'
+                        try {
+                            $cachedMailboxes = $State['CachedMailboxes']
+                            if ($cachedMailboxes -and $cachedMailboxes.Count -gt 0) {
+                                $batchGroups = $cachedMailboxes | Group-Object -Property BatchName | Where-Object { $_.Name } | Sort-Object Name
+                                $batchList = @($batchGroups | ForEach-Object {
+                                    @{ Name = $_.Name; Count = $_.Count }
+                                })
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes(($batchList | ConvertTo-Json -Compress))
+                            } else {
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('[]')
+                            }
+                        } catch {
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('[]')
+                        }
+                    }
+                    elseif ($path -eq '/api/retry-status') {
+                        # Return auto-retry status and log
+                        $contentType = 'application/json; charset=utf-8'
+                        try {
+                            $retryData = @{
+                                QueueCount = $State['RetryQueue']
+                                Log        = @($State['RetryLog'] | Select-Object -Last 50)
+                            }
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes(($retryData | ConvertTo-Json -Compress -Depth 3))
+                        } catch {
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"QueueCount":0,"Log":[]}')
+                        }
+                    }
                     else {
                         $contentType = 'application/json; charset=utf-8'
                         $resp.StatusCode = 404
@@ -4391,7 +5951,68 @@ if ($MyInvocation.InvocationName -ne '.') {
         $invokeParams.ReportName = $watchName
         $reportFile = Join-Path $ReportPath "${watchName}_Report.html"
 
+        # ── Alert configuration ─────────────────────────────────────────────────
+        $alertConfig = @{
+            AlertOnFailure       = $AlertOnFailure.IsPresent
+            AlertOnComplete      = $AlertOnComplete.IsPresent
+            AlertOnStall         = $AlertOnStall.IsPresent
+            StallThresholdMinutes= $StallThresholdMinutes
+            EmailTo              = $AlertEmailTo
+            EmailFrom            = $AlertEmailFrom
+            SmtpServer           = $SmtpServer
+            SmtpPort             = $SmtpPort
+            SmtpCredential       = $SmtpCredential
+            SmtpUseSsl           = $SmtpUseSsl.IsPresent
+            TeamsWebhookUrl      = $TeamsWebhookUrl
+        }
+        $alertsEnabled = $alertConfig.AlertOnFailure -or $alertConfig.AlertOnComplete -or $alertConfig.AlertOnStall
+        if ($alertsEnabled) {
+            Write-Host "  Alerts enabled:" -ForegroundColor Cyan -NoNewline
+            if ($alertConfig.AlertOnFailure) { Write-Host " [Failure]" -ForegroundColor Red -NoNewline }
+            if ($alertConfig.AlertOnComplete) { Write-Host " [Complete]" -ForegroundColor Green -NoNewline }
+            if ($alertConfig.AlertOnStall) { Write-Host " [Stall>${StallThresholdMinutes}m]" -ForegroundColor Yellow -NoNewline }
+            Write-Host ""
+            if ($alertConfig.EmailTo) { Write-Host "  Email: $AlertEmailTo" -ForegroundColor DarkCyan }
+            if ($alertConfig.TeamsWebhookUrl) { Write-Host "  Teams: Webhook configured" -ForegroundColor DarkCyan }
+        }
 
+        # ── Auto-Retry configuration ─────────────────────────────────────────────
+        $retryConfig = @{
+            Enabled       = $AutoRetryFailed.IsPresent
+            MaxAttempts   = $MaxRetryAttempts
+            DelayMinutes  = $RetryDelayMinutes
+            ErrorPatterns = $RetryOnErrorPatterns
+        }
+        if ($retryConfig.Enabled) {
+            Write-Host "  Auto-Retry enabled:" -ForegroundColor Cyan
+            Write-Host "    Max attempts: $MaxRetryAttempts" -ForegroundColor DarkCyan
+            Write-Host "    Retry delay: $RetryDelayMinutes minutes" -ForegroundColor DarkCyan
+            Write-Host "    Error patterns: $($RetryOnErrorPatterns -join ', ')" -ForegroundColor DarkCyan
+        }
+
+        # ── Scheduled Reports configuration ──────────────────────────────────────
+        $scheduleConfig = @{
+            Enabled       = $ScheduledReports.IsPresent
+            Schedule      = $ReportSchedule
+            ReportTime    = $ReportTime
+            DayOfWeek     = $ReportDayOfWeek
+            EmailTo       = $ScheduledReportEmailTo
+            IncludeDetail = $IncludeDetailInScheduledReport.IsPresent
+        }
+        if ($scheduleConfig.Enabled) {
+            $dayNames = @('Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday')
+            Write-Host "  Scheduled Reports enabled:" -ForegroundColor Cyan
+            Write-Host "    Schedule: $ReportSchedule" -ForegroundColor DarkCyan
+            Write-Host "    Time: $ReportTime" -ForegroundColor DarkCyan
+            if ($ReportSchedule -eq 'Weekly') {
+                Write-Host "    Day: $($dayNames[$ReportDayOfWeek])" -ForegroundColor DarkCyan
+            }
+            $schedRecipient = if ($ScheduledReportEmailTo) { $ScheduledReportEmailTo } else { $AlertEmailTo }
+            if ($schedRecipient) { Write-Host "    Recipients: $schedRecipient" -ForegroundColor DarkCyan }
+        }
+
+        # ── Historical trend data collection ────────────────────────────────────
+        $script:TrendHistory = [System.Collections.ArrayList]@()
 
 
         # ── Shared state for listener <-> main loop communication ─────────────
@@ -4481,6 +6102,65 @@ if ($MyInvocation.InvocationName -ne '.') {
                 $watchState['LastRefresh']  = Get-Date
                 $watchState['IsRefreshing'] = $false
                 if ($result) { $watchState['MailboxCount'] = $result.MailboxCount }
+
+                # ── Check for alert conditions ──────────────────────────────────────
+                if ($alertsEnabled -and $result -and $result.PerMailboxDetail) {
+                    Check-MigrationAlerts -Mailboxes $result.PerMailboxDetail -Summary $result -AlertConfig $alertConfig
+                }
+
+                # ── Auto-Retry failed migrations ────────────────────────────────────────
+                if ($retryConfig.Enabled -and $result -and $result.PerMailboxDetail) {
+                    # Queue eligible failed migrations for retry
+                    Process-FailedMigrations -Mailboxes $result.PerMailboxDetail -RetryConfig $retryConfig
+
+                    # Process retry queue
+                    $retryResults = Invoke-QueuedRetries -RetryConfig $retryConfig
+                    if ($retryResults -and $retryResults.Count -gt 0) {
+                        foreach ($rr in $retryResults) {
+                            $statusColor = if ($rr.Success) { 'Green' } else { 'Red' }
+                            $statusText = if ($rr.Success) { 'RESUMED' } else { 'RETRY FAILED' }
+                            Write-Host "  [Auto-Retry] $($rr.Mailbox) - Attempt $($rr.Attempt): $statusText" -ForegroundColor $statusColor
+                        }
+                    }
+
+                    # Update shared state with retry info
+                    $watchState['RetryQueue'] = $script:RetryQueue.Count
+                    $watchState['RetryLog'] = $script:RetryLog
+                }
+
+                # ── Collect trend data ──────────────────────────────────────────────────
+                if ($result) {
+                    $trendPoint = @{
+                        Timestamp       = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss')
+                        TimeLabel       = (Get-Date).ToString('HH:mm')
+                        PercentComplete = $result.OverallPercentComplete
+                        TransferRateGBh = $result.TotalThroughputGBPerHour
+                        TransferredGB   = $result.TotalTransferredGB
+                        CompletedCount  = ($result.PerMailboxDetail | Where-Object { $_.Status -eq 'Completed' }).Count
+                        InProgressCount = ($result.PerMailboxDetail | Where-Object { $_.Status -eq 'InProgress' }).Count
+                        FailedCount     = ($result.PerMailboxDetail | Where-Object { $_.Status -eq 'Failed' }).Count
+                        TotalCount      = $result.MailboxCount
+                    }
+                    [void]$script:TrendHistory.Add($trendPoint)
+                    # Keep last 100 data points (approx 100 minutes at 60s refresh)
+                    while ($script:TrendHistory.Count -gt 100) { $script:TrendHistory.RemoveAt(0) }
+                    # Store in watch state for API access
+                    $watchState['TrendHistory'] = $script:TrendHistory
+                }
+
+                # ── Check for scheduled report ───────────────────────────────────────────
+                if ($scheduleConfig.Enabled -and $result -and $result.PerMailboxDetail) {
+                    if (Test-ScheduledReportDue -ScheduleConfig $scheduleConfig) {
+                        Write-Host "  [Scheduled Report] Generating $($scheduleConfig.Schedule) report..." -ForegroundColor Magenta
+                        $reportSent = Send-ScheduledReport -Summary $result -Mailboxes $result.PerMailboxDetail `
+                            -ScheduleConfig $scheduleConfig -AlertConfig $alertConfig
+                        if ($reportSent) {
+                            Write-Host "  [Scheduled Report] Report sent successfully!" -ForegroundColor Green
+                        } else {
+                            Write-Host "  [Scheduled Report] Failed to send report." -ForegroundColor Red
+                        }
+                    }
+                }
 
                 # Open in browser on first run.
                 # Prefer opening the generated HTML file directly for reliable rendering.
