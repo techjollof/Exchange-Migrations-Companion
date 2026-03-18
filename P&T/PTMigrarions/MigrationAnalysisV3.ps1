@@ -3393,6 +3393,12 @@ function initKeyboardShortcuts() {
       case 's': // Toggle sound
         toggleSound();
         break;
+      case 'b': // Bookmark/pin current row
+        if (currentRowIndex >= 0 && tableRows[currentRowIndex]) {
+          var btn = tableRows[currentRowIndex].querySelector('.pin-btn');
+          if (btn) togglePin(btn);
+        }
+        break;
       case 'j': // Next row
         navigateRow(1);
         break;
@@ -3569,6 +3575,7 @@ window.addEventListener('load', function() {
   initDarkMode();
   initSoundButton();
   initKeyboardShortcuts();
+  initPinnedMailboxes();
   checkForAlerts();
   updateSummaryBar(
     document.querySelectorAll('#mbx-tbody tr').length, 0
