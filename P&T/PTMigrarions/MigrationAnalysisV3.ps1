@@ -902,6 +902,156 @@ function Invoke-MigrationRetry {
     }
 }
 
+function Get-MigrationTrend {
+    <#
+    .SYNOPSIS
+        Extracts migration trend data from Report.Entries for charting progress over time.
+    .DESCRIPTION
+        Parses the Report.Entries collection to extract progress points, transfer points,
+        and anchor points (start/complete) for visualizing migration progress.
+    .PARAMETER InputObject
+        A MoveRequestStatistics object (with Report), a MoveReport object, or Report.Entries collection.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [object]$InputObject
+    )
+
+    function ConvertTo-Bytes ([object]$bqs) {
+        if ($null -eq $bqs) { return 0 }
+        $str = $bqs.ToString()
+        $m   = [regex]::Match($str, '\(([0-9,]+)\s*bytes\)')
+        if ($m.Success) { return [int64]($m.Groups[1].Value -replace ',') }
+        $n = 0
+        if ([int64]::TryParse($str, [ref]$n)) { return $n }
+        return 0
+    }
+
+    function Get-FirstItem ([object]$obj) {
+        if ($obj -is [System.Collections.IEnumerable] -and $obj -isnot [string]) {
+            return @($obj)[0]
+        }
+        return $obj
+    }
+
+    # Timezone-safe elapsed minutes — always compare in UTC
+    function Get-ElapsedMin ([datetime]$eventTime, [datetime]$start) {
+        [math]::Round(($eventTime.ToUniversalTime() - $start.ToUniversalTime()).TotalMinutes, 2)
+    }
+
+    $entries   = $null
+    $startTime = $null
+
+    if ($InputObject.PSObject.Properties['StartTimestamp'] -and
+        $InputObject.PSObject.Properties['Report']) {
+        # Full stats object
+        $entries   = $InputObject.Report.Entries
+        $startTime = $InputObject.StartTimestamp
+
+    } elseif ($InputObject.PSObject.Properties['Entries']) {
+        # Report object
+        $entries   = $InputObject.Entries
+        $startTime = $null
+
+    } elseif ((Get-FirstItem $InputObject).PSObject.Properties['CreationTime']) {
+        # Entry collection
+        $entries   = $InputObject
+        $startTime = $null
+
+    } else {
+        Write-Console "InputObject must be a MoveRequestStatistics, MoveReport, or Report.Entries collection" -Level Warn
+        return @()
+    }
+
+    if (-not $entries -or $entries.Count -eq 0) {
+        return @()
+    }
+
+    # Fall back to first entry's CreationTime when no StartTimestamp available
+    if ($null -eq $startTime) {
+        $startTime = ($entries | Sort-Object CreationTime | Select-Object -First 1).CreationTime
+    }
+
+    # Progress points — Stage + PercentComplete from log messages
+    $progressPoints = $entries |
+        Where-Object { $_.Message.ToString() -like '*Percent complete*' } |
+        ForEach-Object {
+            $msg = $_.Message.ToString()
+            [PSCustomObject]@{
+                Type             = 'Progress'
+                Timestamp        = $_.CreationTime
+                ElapsedMin       = Get-ElapsedMin $_.CreationTime $startTime
+                Stage            = [regex]::Match($msg, 'Stage:\s*(\w+)').Groups[1].Value
+                PercentComplete  = [int][regex]::Match($msg, 'Percent complete:\s*(\d+)').Groups[1].Value
+                BytesTransferred = $null
+                ItemsTransferred = $null
+            }
+        }
+
+    # Transfer points — parse bytes directly from seeding/sync completion messages
+    $transferPoints = $entries |
+        Where-Object {
+            $msg = $_.Message.ToString()
+            $msg -like '*items copied, total size*' -or
+            $msg -like '*seeding completed*'        -or
+            $msg -like '*content changes applied*'
+        } |
+        ForEach-Object {
+            $msg   = $_.Message.ToString()
+            $bytes = 0
+            $items = 0
+
+            # "Initial seeding completed, 21 items copied, total size 54.54 KB (55,846 bytes)"
+            $mBytes = [regex]::Match($msg, '\(([0-9,]+)\s*bytes\)')
+            if ($mBytes.Success) {
+                $bytes = [int64]($mBytes.Groups[1].Value -replace ',')
+            }
+
+            $mItems = [regex]::Match($msg, '(\d+)\s+items copied')
+            if ($mItems.Success) {
+                $items = [int]$mItems.Groups[1].Value
+            }
+
+            [PSCustomObject]@{
+                Type             = 'Transfer'
+                Timestamp        = $_.CreationTime
+                ElapsedMin       = Get-ElapsedMin $_.CreationTime $startTime
+                Stage            = $null
+                PercentComplete  = $null
+                BytesTransferred = $bytes
+                ItemsTransferred = $items
+            }
+        }
+
+    # Anchors — only when we have the full stats object
+    $anchors = @()
+    if ($InputObject.PSObject.Properties['StartTimestamp'] -and $InputObject.StartTimestamp) {
+        $anchors += [PSCustomObject]@{
+            Type             = 'Anchor'
+            Timestamp        = $InputObject.StartTimestamp
+            ElapsedMin       = 0
+            Stage            = 'Start'
+            PercentComplete  = 0
+            BytesTransferred = 0
+            ItemsTransferred = 0
+        }
+    }
+    if ($InputObject.PSObject.Properties['CompletionTimestamp'] -and $InputObject.CompletionTimestamp) {
+        $anchors += [PSCustomObject]@{
+            Type             = 'Anchor'
+            Timestamp        = $InputObject.CompletionTimestamp
+            ElapsedMin       = Get-ElapsedMin $InputObject.CompletionTimestamp $startTime
+            Stage            = 'Complete'
+            PercentComplete  = $InputObject.PercentComplete
+            BytesTransferred = ConvertTo-Bytes $InputObject.BytesTransferred
+            ItemsTransferred = $InputObject.ItemsTransferred
+        }
+    }
+
+    @($anchors) + @($progressPoints) + @($transferPoints) | Sort-Object Timestamp
+}
+
 function Process-FailedMigrations {
     <#
     .SYNOPSIS
@@ -3863,6 +4013,12 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     font-size:1.3rem; color:#94a3b8; line-height:1; border-radius:6px;
   }
   .mbx-modal-close:hover { background:#f1f5f9; color:#475569; }
+  .mbx-nav-btn {
+    background:#f1f5f9; border:1px solid #e2e8f0; cursor:pointer; padding:8px 12px;
+    font-size:1rem; color:#64748b; line-height:1; border-radius:8px; transition:all .15s;
+  }
+  .mbx-nav-btn:hover { background:#e2e8f0; color:#1e293b; }
+  .mbx-nav-btn:disabled { opacity:.4; cursor:not-allowed; }
   .mbx-modal-body   { padding:20px 28px 28px; }
   .mbx-section      { margin-bottom:12px; }
   .mbx-section-title{
@@ -3893,9 +4049,13 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
 <div class="mbx-modal-overlay" id="mbxModal" onclick="if(event.target===this)closeMbxModal()">
   <div class="mbx-modal" id="mbxModalContent">
     <div class="mbx-modal-header">
-      <div>
-        <div class="mbx-modal-title" id="mdTitle"></div>
-        <div class="mbx-modal-sub"  id="mdSub"></div>
+      <div style="display:flex;align-items:center;gap:12px;">
+        <button class="mbx-nav-btn" id="mdPrevBtn" onclick="navigateMailbox(-1)" title="Previous mailbox (←)">&#x25C0;</button>
+        <div>
+          <div class="mbx-modal-title" id="mdTitle"></div>
+          <div class="mbx-modal-sub" id="mdSub"></div>
+        </div>
+        <button class="mbx-nav-btn" id="mdNextBtn" onclick="navigateMailbox(1)" title="Next mailbox (→)">&#x25B6;</button>
       </div>
       <div style="display:flex;gap:8px;align-items:center;">
         <button class="ent-btn" onclick="saveModalAsImage()" title="Save as Image">&#x1F4F7; Save Image</button>
@@ -4099,23 +4259,219 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
       body += "</div>";
     }
 
+    // ── Performance Trend Section (populated via API) ─────────────────
+    body += "<div id='mdTrendSection' class='mbx-section' style='background:#f0f9ff;border-radius:10px;padding:14px 16px;'>";
+    body += "<div class='mbx-section-title'>📈 Performance Trend</div>";
+    body += "<div style='color:#64748b;font-size:.85rem;text-align:center;padding:20px;'>Loading...</div>";
+    body += "</div>";
+
     document.getElementById('mdBody').innerHTML = body;
     document.getElementById('mbxModal').classList.add('open');
+    updateNavButtons();
+    // Fetch and render trend data
+    fetchMailboxTrend(d.dn || d.alias);
+  }
+
+  // ── Mailbox Navigation ──────────────────────────────────────────────
+  var currentMailboxIndex = -1;
+  var visibleMailboxRows = [];
+
+  function getVisibleMailboxRows() {
+    var table = document.getElementById('mbxTable');
+    if (!table) return [];
+    var rows = table.querySelectorAll('tbody tr[data-status]');
+    return Array.prototype.filter.call(rows, function(r) {
+      return r.style.display !== 'none' && r.offsetParent !== null;
+    });
+  }
+
+  function updateNavButtons() {
+    visibleMailboxRows = getVisibleMailboxRows();
+    var prevBtn = document.getElementById('mdPrevBtn');
+    var nextBtn = document.getElementById('mdNextBtn');
+    if (prevBtn) prevBtn.disabled = currentMailboxIndex <= 0;
+    if (nextBtn) nextBtn.disabled = currentMailboxIndex >= visibleMailboxRows.length - 1;
+  }
+
+  window.navigateMailbox = function(direction) {
+    visibleMailboxRows = getVisibleMailboxRows();
+    var newIndex = currentMailboxIndex + direction;
+    if (newIndex >= 0 && newIndex < visibleMailboxRows.length) {
+      currentMailboxIndex = newIndex;
+      openMbxModal(visibleMailboxRows[newIndex]);
+    }
+  };
+
+  // ── Mailbox Trend Chart ─────────────────────────────────────────────
+  var mbxTrendChart = null;
+
+  function fetchMailboxTrend(mailboxName) {
+    var trendContainer = document.getElementById('mdTrendSection');
+    if (!trendContainer) return;
+
+    var apiBase = window.WATCH_API_BASE;
+    if (!apiBase) {
+      trendContainer.innerHTML = "<div style='color:#64748b;font-size:.85rem;text-align:center;padding:20px;'>Trend data only available in Watch Mode</div>";
+      return;
+    }
+
+    trendContainer.innerHTML = "<div style='color:#64748b;font-size:.85rem;text-align:center;padding:20px;'>Loading trend data...</div>";
+
+    fetch(apiBase + '/api/mailbox-trend?name=' + encodeURIComponent(mailboxName))
+      .then(function(r) { return r.json(); })
+      .then(function(res) {
+        if (res.needsDetailReport) {
+          trendContainer.innerHTML = "<div style='background:#fef3c7;border:1px solid #fcd34d;border-radius:8px;padding:12px 16px;color:#92400e;font-size:.85rem;'>" +
+            "<strong>&#x26A0; Include Detail Report Required</strong><br>" +
+            "Enable 'Include Detail Report' in the control panel to track per-mailbox trends over time.</div>";
+          return;
+        }
+        if (!res.ok || !res.data || res.data.length === 0) {
+          trendContainer.innerHTML = "<div style='color:#64748b;font-size:.85rem;text-align:center;padding:20px;'>No trend data available yet. Data will appear after multiple refresh cycles.</div>";
+          return;
+        }
+        renderMailboxTrend(res.data);
+      })
+      .catch(function(e) {
+        trendContainer.innerHTML = "<div style='color:#ef4444;font-size:.85rem;text-align:center;padding:20px;'>Failed to load trend data</div>";
+      });
+  }
+
+  function renderMailboxTrend(data) {
+    var trendContainer = document.getElementById('mdTrendSection');
+    if (!trendContainer) return;
+
+    // Separate data by type
+    var progressPoints = data.filter(function(d) { return d.Type === 'Progress' || d.Type === 'Anchor'; });
+    var transferPoints = data.filter(function(d) { return d.Type === 'Transfer' || d.Type === 'Anchor'; });
+
+    // Build metrics table - show all events
+    var tableHtml = "<div class='mbx-section-title'>Migration Timeline</div>";
+    tableHtml += "<div style='overflow-x:auto;margin-bottom:16px;max-height:200px;overflow-y:auto;'><table style='width:100%;font-size:.8rem;border-collapse:collapse;'>";
+    tableHtml += "<thead><tr style='background:#f8fafc;position:sticky;top:0;'>";
+    tableHtml += "<th style='padding:8px;text-align:left;border-bottom:2px solid #e2e8f0;'>Time</th>";
+    tableHtml += "<th style='padding:8px;text-align:left;border-bottom:2px solid #e2e8f0;'>Type</th>";
+    tableHtml += "<th style='padding:8px;text-align:left;border-bottom:2px solid #e2e8f0;'>Stage</th>";
+    tableHtml += "<th style='padding:8px;text-align:right;border-bottom:2px solid #e2e8f0;'>Elapsed (min)</th>";
+    tableHtml += "<th style='padding:8px;text-align:right;border-bottom:2px solid #e2e8f0;'>% Complete</th>";
+    tableHtml += "<th style='padding:8px;text-align:right;border-bottom:2px solid #e2e8f0;'>Transferred</th>";
+    tableHtml += "<th style='padding:8px;text-align:right;border-bottom:2px solid #e2e8f0;'>Items</th>";
+    tableHtml += "</tr></thead><tbody>";
+
+    // Show all entries (newest first for readability)
+    var sortedData = data.slice().reverse();
+    sortedData.forEach(function(d) {
+      var typeColor = d.Type === 'Anchor' ? '#22c55e' : d.Type === 'Progress' ? '#3b82f6' : '#f59e0b';
+      var typeBadge = "<span style='display:inline-block;padding:2px 6px;border-radius:4px;font-size:.7rem;font-weight:600;background:" + typeColor + "20;color:" + typeColor + ";'>" + d.Type + "</span>";
+      var transferred = d.TransferredGB ? d.TransferredGB.toFixed(3) + ' GB' : (d.BytesTransferred ? (d.BytesTransferred / 1024 / 1024).toFixed(2) + ' MB' : '—');
+      tableHtml += "<tr style='border-bottom:1px solid #f1f5f9;'>";
+      tableHtml += "<td style='padding:6px 8px;font-family:monospace;font-size:.75rem;'>" + (d.TimeLabel || '—') + "</td>";
+      tableHtml += "<td style='padding:6px 8px;'>" + typeBadge + "</td>";
+      tableHtml += "<td style='padding:6px 8px;'>" + (d.Stage || '—') + "</td>";
+      tableHtml += "<td style='padding:6px 8px;text-align:right;font-family:monospace;'>" + (d.ElapsedMin != null ? d.ElapsedMin.toFixed(1) : '—') + "</td>";
+      tableHtml += "<td style='padding:6px 8px;text-align:right;font-weight:600;color:" + (d.PercentComplete >= 95 ? '#22c55e' : d.PercentComplete >= 50 ? '#3b82f6' : '#64748b') + ";'>" + (d.PercentComplete != null ? d.PercentComplete + '%' : '—') + "</td>";
+      tableHtml += "<td style='padding:6px 8px;text-align:right;'>" + transferred + "</td>";
+      tableHtml += "<td style='padding:6px 8px;text-align:right;'>" + (d.ItemsTransferred || '—') + "</td>";
+      tableHtml += "</tr>";
+    });
+    tableHtml += "</tbody></table></div>";
+
+    // Chart container
+    tableHtml += "<div class='mbx-section-title'>Progress Over Time</div>";
+    tableHtml += "<div style='display:grid;grid-template-columns:1fr 1fr;gap:16px;'>";
+    tableHtml += "<div style='height:150px;'><canvas id='mbxTrendChart1'></canvas></div>";
+    tableHtml += "<div style='height:150px;'><canvas id='mbxTrendChart2'></canvas></div>";
+    tableHtml += "</div>";
+
+    trendContainer.innerHTML = tableHtml;
+
+    // Render charts if Chart.js is available
+    if (typeof Chart !== 'undefined') {
+      var ctx1 = document.getElementById('mbxTrendChart1');
+      var ctx2 = document.getElementById('mbxTrendChart2');
+
+      // Chart 1: % Complete over elapsed time (Progress + Anchor points)
+      if (ctx1 && progressPoints.length > 0) {
+        var pctLabels = progressPoints.map(function(d) { return d.ElapsedMin != null ? d.ElapsedMin.toFixed(0) + 'm' : d.TimeLabel; });
+        var pctData = progressPoints.map(function(d) { return d.PercentComplete; });
+
+        new Chart(ctx1.getContext('2d'), {
+          type: 'line',
+          data: {
+            labels: pctLabels,
+            datasets: [
+              { label: '% Complete', data: pctData, borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.1)', fill: true, tension: 0.3, pointRadius: 3 }
+            ]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { display: true, position: 'bottom', labels: { boxWidth: 12, font: { size: 10 } } } },
+            scales: {
+              x: { title: { display: true, text: 'Elapsed Time', font: { size: 10 } } },
+              y: { beginAtZero: true, max: 100, title: { display: true, text: '%', font: { size: 10 } } }
+            }
+          }
+        });
+      }
+
+      // Chart 2: Data transferred over elapsed time (Transfer + Anchor points)
+      if (ctx2 && transferPoints.length > 0) {
+        var xferLabels = transferPoints.map(function(d) { return d.ElapsedMin != null ? d.ElapsedMin.toFixed(0) + 'm' : d.TimeLabel; });
+        var xferData = transferPoints.map(function(d) {
+          if (d.TransferredGB) return d.TransferredGB;
+          if (d.BytesTransferred) return d.BytesTransferred / 1024 / 1024 / 1024;
+          return null;
+        });
+        var itemsData = transferPoints.map(function(d) { return d.ItemsTransferred; });
+
+        new Chart(ctx2.getContext('2d'), {
+          type: 'line',
+          data: {
+            labels: xferLabels,
+            datasets: [
+              { label: 'Transferred (GB)', data: xferData, borderColor: '#8b5cf6', tension: 0.3, pointRadius: 3, yAxisID: 'y' },
+              { label: 'Items', data: itemsData, borderColor: '#f59e0b', tension: 0.3, pointRadius: 3, yAxisID: 'y1' }
+            ]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { display: true, position: 'bottom', labels: { boxWidth: 12, font: { size: 10 } } } },
+            scales: {
+              x: { title: { display: true, text: 'Elapsed Time', font: { size: 10 } } },
+              y: { type: 'linear', position: 'left', beginAtZero: true, title: { display: true, text: 'GB', font: { size: 10 } } },
+              y1: { type: 'linear', position: 'right', beginAtZero: true, grid: { drawOnChartArea: false }, title: { display: true, text: 'Items', font: { size: 10 } } }
+            }
+          }
+        });
+      }
+    }
   }
 
   window.closeMbxModal = function(){
     document.getElementById('mbxModal').classList.remove('open');
+    currentMailboxIndex = -1;
   };
 
-  // Keyboard close
+  // Keyboard navigation
   document.addEventListener('keydown', function(e){
     if(e.key==='Escape') closeMbxModal();
+    if(document.getElementById('mbxModal').classList.contains('open')) {
+      if(e.key==='ArrowLeft') navigateMailbox(-1);
+      if(e.key==='ArrowRight') navigateMailbox(1);
+    }
   });
 
   // Wire up click on all current and future rows via event delegation
   document.addEventListener('click', function(e){
     var row = e.target.closest('tr[data-status]');
-    if(row && !e.target.closest('button')) openMbxModal(row);
+    if(row && !e.target.closest('button')) {
+      // Find index of clicked row in visible rows
+      visibleMailboxRows = getVisibleMailboxRows();
+      currentMailboxIndex = visibleMailboxRows.indexOf(row);
+      openMbxModal(row);
+    }
   });
 })();
 </script>
@@ -6176,6 +6532,36 @@ function Start-WatchListener {
                         }
                         $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
                     }
+                    elseif ($path -eq '/api/mailbox-trend') {
+                        $contentType = 'application/json; charset=utf-8'
+                        try {
+                            $mailboxName = $null
+                            if ($req.Url.Query) {
+                                $queryParams = [System.Web.HttpUtility]::ParseQueryString($req.Url.Query)
+                                $mailboxName = $queryParams['name']
+                            }
+                            if (-not $mailboxName) {
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"Missing name parameter"}')
+                            } else {
+                                $includeDetail = $State['IncludeDetailReport']
+                                $trendCache = $State['MailboxTrendCache']
+                                if (-not $includeDetail) {
+                                    $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"IncludeDetailReport not enabled","needsDetailReport":true}')
+                                } elseif (-not $trendCache) {
+                                    $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true,"data":[],"message":"No trend data cached yet. Wait for next refresh."}')
+                                } elseif ($trendCache.ContainsKey($mailboxName)) {
+                                    $data = $trendCache[$mailboxName]
+                                    $json = @{ ok = $true; data = $data } | ConvertTo-Json -Depth 5 -Compress
+                                    $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+                                } else {
+                                    $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true,"data":[],"message":"No trend data for this mailbox"}')
+                                }
+                            }
+                        } catch {
+                            $errMsg = $_.Exception.Message -replace '"', "'"
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"ok`":false,`"error`":`"Failed to get mailbox trend: $errMsg`"}")
+                        }
+                    }
                     elseif ($path -eq '/api/batch-stats') {
                         $contentType = 'application/json; charset=utf-8'
                         try {
@@ -6609,6 +6995,11 @@ function Invoke-MigrationReport {
     Write-Console "All reports generated successfully." -Level SUCCESS
     Write-Console "Output directory: $ReportPath"       -Level SUCCESS
 
+    # Attach raw stats for trend extraction (only when IncludeDetailReport was used)
+    if ($detectedDetailReport -and $goodStats) {
+        $summary | Add-Member -NotePropertyName RawStats -NotePropertyValue $goodStats -Force
+    }
+
     return $summary
 }
 #endregion
@@ -6720,6 +7111,7 @@ if ($MyInvocation.InvocationName -ne '.') {
 
         # ── Historical trend data collection ────────────────────────────────────
         $script:TrendHistory = [System.Collections.ArrayList]@()
+        $script:MailboxTrendHistory = @{}  # Per-mailbox trend data keyed by DisplayName
 
 
         # ── Shared state for listener <-> main loop communication ─────────────
@@ -6882,6 +7274,35 @@ if ($MyInvocation.InvocationName -ne '.') {
                     $watchState['MailboxCount'] = $result.MailboxCount
                     $watchState['Throughput'] = $result.TotalThroughputGBPerHour
                     $watchState['CachedMailboxes'] = $result.PerMailboxDetail
+                    # Cache raw stats for trend extraction (when IncludeDetailReport is enabled)
+                    if ($result.RawStats) {
+                        $watchState['CachedRawStats'] = $result.RawStats
+                        # Pre-process trend data for each mailbox (since Get-MigrationTrend isn't available in runspace)
+                        $trendCache = @{}
+                        foreach ($mbxStat in $result.RawStats) {
+                            if ($mbxStat.DisplayName -and $mbxStat.Report -and $mbxStat.Report.Entries) {
+                                $trendData = Get-MigrationTrend -InputObject $mbxStat
+                                if ($trendData -and $trendData.Count -gt 0) {
+                                    # Convert to JSON-friendly format
+                                    $jsonData = $trendData | ForEach-Object {
+                                        @{
+                                            Type             = $_.Type
+                                            Timestamp        = if ($_.Timestamp) { $_.Timestamp.ToString('yyyy-MM-ddTHH:mm:ss') } else { $null }
+                                            TimeLabel        = if ($_.Timestamp) { $_.Timestamp.ToString('HH:mm') } else { $null }
+                                            ElapsedMin       = $_.ElapsedMin
+                                            Stage            = $_.Stage
+                                            PercentComplete  = $_.PercentComplete
+                                            BytesTransferred = $_.BytesTransferred
+                                            TransferredGB    = if ($_.BytesTransferred) { [math]::Round($_.BytesTransferred / 1GB, 3) } else { $null }
+                                            ItemsTransferred = $_.ItemsTransferred
+                                        }
+                                    }
+                                    $trendCache[$mbxStat.DisplayName] = @($jsonData)
+                                }
+                            }
+                        }
+                        $watchState['MailboxTrendCache'] = $trendCache
+                    }
                 }
 
                 # ── Update next scheduled report time ────────────────────────────────────
@@ -6950,6 +7371,36 @@ if ($MyInvocation.InvocationName -ne '.') {
                     while ($script:TrendHistory.Count -gt 100) { $script:TrendHistory.RemoveAt(0) }
                     # Store in watch state for API access
                     $watchState['TrendHistory'] = $script:TrendHistory
+
+                    # ── Collect per-mailbox trend data (only when IncludeDetailReport is enabled) ──
+                    if ($watchState['IncludeDetailReport'] -and $result.PerMailboxDetail) {
+                        $timestamp = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss')
+                        $timeLabel = (Get-Date).ToString('HH:mm')
+                        foreach ($mbx in $result.PerMailboxDetail) {
+                            $mbxKey = $mbx.DisplayName
+                            if (-not $script:MailboxTrendHistory.ContainsKey($mbxKey)) {
+                                $script:MailboxTrendHistory[$mbxKey] = [System.Collections.ArrayList]@()
+                            }
+                            $mbxPoint = @{
+                                Timestamp       = $timestamp
+                                TimeLabel       = $timeLabel
+                                PercentComplete = $mbx.PercentComplete
+                                TransferredGB   = $mbx.TransferredGB
+                                TransferRateGBh = $mbx.TransferRateGBph
+                                SourceLatencyMs = $mbx.SourceLatencyMs
+                                DestLatencyMs   = $mbx.DestLatencyMs
+                                ItemsTransferred = $mbx.ItemsTransferred
+                                EfficiencyPct   = $mbx.EfficiencyPct
+                                Status          = $mbx.Status
+                            }
+                            [void]$script:MailboxTrendHistory[$mbxKey].Add($mbxPoint)
+                            # Keep last 50 data points per mailbox
+                            while ($script:MailboxTrendHistory[$mbxKey].Count -gt 50) {
+                                $script:MailboxTrendHistory[$mbxKey].RemoveAt(0)
+                            }
+                        }
+                        $watchState['MailboxTrendHistory'] = $script:MailboxTrendHistory
+                    }
                 }
 
                 # ── Check for scheduled report ───────────────────────────────────────────
