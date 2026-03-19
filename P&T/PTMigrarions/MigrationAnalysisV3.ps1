@@ -312,10 +312,79 @@ param (
 
 #region ── Helpers ──────────────────────────────────────────────────────────────
 
-function Write-Log {
-    param([string]$Message, [ValidateSet("INFO","WARN","ERROR","SUCCESS")]$Level = "INFO")
-    $color = @{ INFO="Cyan"; WARN="Yellow"; ERROR="Red"; SUCCESS="Green" }[$Level]
-    Write-Host "[$Level] $(Get-Date -Format 'HH:mm:ss')  $Message" -ForegroundColor $color
+function Write-Console {
+    <#
+    .SYNOPSIS
+        Centralized console output with consistent formatting and colors.
+    .PARAMETER Message
+        The message to display.
+    .PARAMETER Level
+        The type of message: Info, Warn, Error, Success, API, Settings, Status, Iteration, Paused.
+    .PARAMETER NoTimestamp
+        Skip the timestamp prefix.
+    .PARAMETER NoNewline
+        Don't add newline at end.
+    #>
+    param(
+        [string]$Message,
+        [ValidateSet('Info','Warn','Error','Success','API','Settings','Status','Iteration','Paused')]
+        [string]$Level = 'Info',
+        [switch]$NoTimestamp,
+        [switch]$NoNewline
+    )
+
+    $config = @{
+        Info      = @{ Prefix = '[INFO]';      Color = 'Cyan';      Indent = '' }
+        Warn      = @{ Prefix = '[WARN]';      Color = 'Yellow';    Indent = '' }
+        Error     = @{ Prefix = '[ERROR]';     Color = 'Red';       Indent = '' }
+        Success   = @{ Prefix = '[SUCCESS]';   Color = 'Green';     Indent = '' }
+        API       = @{ Prefix = '[API]';       Color = 'Magenta';   Indent = '  ' }
+        Settings  = @{ Prefix = '[Settings]';  Color = 'DarkGray';  Indent = '  ' }
+        Status    = @{ Prefix = '';            Color = 'DarkCyan';  Indent = '' }
+        Iteration = @{ Prefix = '';            Color = 'DarkCyan';  Indent = '' }
+        Paused    = @{ Prefix = '';            Color = 'Yellow';    Indent = '' }
+    }
+
+    $cfg = $config[$Level]
+    $timestamp = if (-not $NoTimestamp) { "[$(Get-Date -Format 'HH:mm:ss')] " } else { "" }
+    $prefix = if ($cfg.Prefix) { "$($cfg.Prefix) " } else { "" }
+    $output = "$($cfg.Indent)$timestamp$prefix$Message"
+
+    $params = @{ Object = $output; ForegroundColor = $cfg.Color }
+    if ($NoNewline) { $params['NoNewline'] = $true }
+
+    Write-Host @params
+}
+
+function Write-Banner {
+    <#
+    .SYNOPSIS
+        Display a formatted banner box with consistent styling.
+    .PARAMETER Lines
+        Array of lines to display inside the banner.
+    .PARAMETER Color
+        The color for the banner (default: Cyan).
+    .PARAMETER Width
+        The width of the banner border (default: 77).
+    .PARAMETER Char
+        The character used for the border (default: #).
+    #>
+    param(
+        [string[]]$Lines,
+        [string]$Color = 'Cyan',
+        [int]$Width = 77,
+        [string]$Char = '#'
+    )
+
+    $border = "  " + ($Char * $Width)
+
+    Write-Host ""
+    Write-Host $border -ForegroundColor $Color
+    foreach ($line in $Lines) {
+        Write-Host "  $line" -ForegroundColor $Color
+    }
+    Write-Host $border -ForegroundColor $Color
+    Write-Host ""
 }
 
 # ── Byte / size helpers (ported from Microsoft's official MRS perf script) ───────
@@ -538,7 +607,7 @@ function Send-EmailAlert {
     )
 
     if (-not $To -or -not $From -or -not $SmtpServer) {
-        Write-Log "Email alert skipped - missing required parameters (To, From, or SmtpServer)" -Level WARN
+        Write-Console "Email alert skipped - missing required parameters (To, From, or SmtpServer)" -Level Warn
         return $false
     }
 
@@ -557,11 +626,11 @@ function Send-EmailAlert {
         if ($UseSsl) { $mailParams.UseSsl = $true }
 
         Send-MailMessage @mailParams -ErrorAction Stop
-        Write-Log "Email alert sent: $Subject" -Level SUCCESS
+        Write-Console "Email alert sent: $Subject" -Level Success
         return $true
     }
     catch {
-        Write-Log "Failed to send email alert: $_" -Level ERROR
+        Write-Console "Failed to send email alert: $_" -Level Error
         return $false
     }
 }
@@ -576,7 +645,7 @@ function Send-TeamsAlert {
     )
 
     if (-not $WebhookUrl) {
-        Write-Log "Teams alert skipped - no webhook URL configured" -Level WARN
+        Write-Console "Teams alert skipped - no webhook URL configured" -Level Warn
         return $false
     }
 
@@ -605,11 +674,11 @@ function Send-TeamsAlert {
 
         $json = $card | ConvertTo-Json -Depth 10
         $response = Invoke-RestMethod -Uri $WebhookUrl -Method Post -Body $json -ContentType "application/json" -ErrorAction Stop
-        Write-Log "Teams alert sent: $Title" -Level SUCCESS
+        Write-Console "Teams alert sent: $Title" -Level Success
         return $true
     }
     catch {
-        Write-Log "Failed to send Teams alert: $_" -Level ERROR
+        Write-Console "Failed to send Teams alert: $_" -Level Error
         return $false
     }
 }
@@ -799,7 +868,7 @@ function Invoke-MigrationRetry {
     )
 
     try {
-        Write-Log "Attempting to resume move request for: $Mailbox" -Level "INFO"
+        Write-Console "Attempting to resume move request for: $Mailbox" -Level Info
 
         # Resume the move request
         Resume-MoveRequest -Identity $Identity -Confirm:$false -ErrorAction Stop
@@ -813,12 +882,12 @@ function Invoke-MigrationRetry {
         }
         [void]$script:RetryLog.Add($logEntry)
 
-        Write-Log "Successfully resumed move request for: $Mailbox" -Level "SUCCESS"
+        Write-Console "Successfully resumed move request for: $Mailbox" -Level Success
         return $true
     }
     catch {
         $errMsg = $_.Exception.Message
-        Write-Log "Failed to resume move request for $Mailbox : $errMsg" -Level "ERROR"
+        Write-Console "Failed to resume move request for $Mailbox : $errMsg" -Level Error
 
         $logEntry = @{
             Timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
@@ -862,7 +931,7 @@ function Process-FailedMigrations {
 
         # Check if error is retryable
         if (-not (Test-RetryableError -ErrorMessage $errorMsg -Patterns $RetryConfig.ErrorPatterns)) {
-            Write-Log "Skipping retry for $key - error not retryable: $errorMsg" -Level "DEBUG"
+            Write-Console "Skipping retry for $key - error not retryable: $errorMsg" -Level Info
             continue
         }
 
@@ -872,14 +941,14 @@ function Process-FailedMigrations {
 
             # Check if max attempts reached
             if ($tracker.Attempts -ge $RetryConfig.MaxAttempts) {
-                Write-Log "Max retry attempts ($($RetryConfig.MaxAttempts)) reached for: $key" -Level "WARN"
+                Write-Console "Max retry attempts ($($RetryConfig.MaxAttempts)) reached for: $key" -Level Warn
                 continue
             }
 
             # Check if enough time has passed since last retry
             $minutesSinceLastRetry = ($now - $tracker.LastRetry).TotalMinutes
             if ($minutesSinceLastRetry -lt $RetryConfig.DelayMinutes) {
-                Write-Log "Waiting for retry delay ($($RetryConfig.DelayMinutes) min) for: $key" -Level "DEBUG"
+                Write-Console "Waiting for retry delay ($($RetryConfig.DelayMinutes) min) for: $key" -Level Info
                 continue
             }
         }
@@ -896,7 +965,7 @@ function Process-FailedMigrations {
         $alreadyQueued = $script:RetryQueue | Where-Object { $_.Mailbox -eq $key }
         if (-not $alreadyQueued) {
             [void]$script:RetryQueue.Add($retryItem)
-            Write-Log "Queued for retry: $key" -Level "INFO"
+            Write-Console "Queued for retry: $key" -Level Info
         }
     }
 }
@@ -1238,7 +1307,7 @@ function Send-ScheduledReport {
         default  { 'Scheduled' }
     }
 
-    Write-Log "Generating $periodLabel scheduled report..." -Level "INFO"
+    Write-Console "Generating $periodLabel scheduled report..." -Level Info
 
     # Generate HTML report
     $htmlBody = New-ScheduledReportHtml -Summary $Summary -Mailboxes $Mailboxes `
@@ -1250,7 +1319,7 @@ function Send-ScheduledReport {
     $recipients = if ($ScheduleConfig.EmailTo) { $ScheduleConfig.EmailTo } else { $AlertConfig.EmailTo }
 
     if (-not $recipients) {
-        Write-Log "No email recipients configured for scheduled reports" -Level "WARN"
+        Write-Console "No email recipients configured for scheduled reports" -Level Warn
         return $false
     }
 
@@ -1262,11 +1331,11 @@ function Send-ScheduledReport {
             -Credential $AlertConfig.SmtpCredential -UseSsl:$AlertConfig.SmtpUseSsl
 
         $script:LastScheduledReport = Get-Date
-        Write-Log "$periodLabel report sent successfully to: $recipients" -Level "SUCCESS"
+        Write-Console "$periodLabel report sent successfully to: $recipients" -Level Success
         return $true
     }
     catch {
-        Write-Log "Failed to send scheduled report: $($_.Exception.Message)" -Level "ERROR"
+        Write-Console "Failed to send scheduled report: $($_.Exception.Message)" -Level Error
         return $false
     }
 }
@@ -1288,7 +1357,7 @@ function Get-MoveRequests {
     if ($Mailbox)             { $filterDesc += ", Mailbox=$($Mailbox -join ',')" }
     if ($MigrationBatchName)  { $filterDesc += ", Batch=$MigrationBatchName" }
     if ($SinceDate)           { $filterDesc += ", Since=$($SinceDate.ToString('yyyy-MM-dd'))" }
-    Write-Log "Retrieving move requests ($filterDesc)..."
+    Write-Console "Retrieving move requests ($filterDesc)..."
 
     try {
         $all = Get-MoveRequest -ErrorAction Stop
@@ -1353,14 +1422,14 @@ function Get-MoveRequests {
             # If property match found nothing, try fetching each filter directly
             # via Get-MoveRequest -Identity — EXO resolves email addresses natively
             if (@($propMatched).Count -eq 0) {
-                Write-Log "  Property match found nothing — trying direct EXO identity lookup..." -Level INFO
+                Write-Console "  Property match found nothing — trying direct EXO identity lookup..." -Level INFO
                 $directMatched = [System.Collections.Generic.List[object]]::new()
                 foreach ($filter in $Mailbox) {
                     try {
                         $direct = Get-MoveRequest -Identity $filter -ErrorAction Stop
                         if ($direct) {
                             @($direct) | ForEach-Object { $directMatched.Add($_) }
-                            Write-Log "  Direct lookup '$filter' — found $(@($direct).Count) move(s)." -Level INFO
+                            Write-Console "  Direct lookup '$filter' — found $(@($direct).Count) move(s)." -Level INFO
                         }
                     } catch {}
                 }
@@ -1372,14 +1441,14 @@ function Get-MoveRequests {
 
         $count = @($moves).Count
         if ($count -eq 0) {
-            Write-Log "No move requests matched the specified filters." -Level WARN
+            Write-Console "No move requests matched the specified filters." -Level WARN
         } else {
-            Write-Log "Found $count move request(s)." -Level SUCCESS
+            Write-Console "Found $count move request(s)." -Level SUCCESS
         }
         return $moves
     }
     catch {
-        Write-Log "Failed to retrieve move requests: $_" -Level ERROR
+        Write-Console "Failed to retrieve move requests: $_" -Level ERROR
         throw
     }
 }
@@ -1462,7 +1531,7 @@ function Get-MoveStats {
     $resolvedMoves = foreach ($move in $moveArr) {
         $guid = Resolve-MoveGuid $move
         if ($guid -eq "$($move.Identity)") {
-            Write-Log "  [WARN] No GUID for '$($move.DisplayName)' — using Identity string." -Level WARN
+            Write-Console "  [WARN] No GUID for '$($move.DisplayName)' — using Identity string." -Level WARN
         }
         $statusStr = "$($move.Status)"
         # Normalise status integer (deserialized) to string if needed
@@ -1484,7 +1553,7 @@ function Get-MoveStats {
     $activeCount   = @($resolvedMoves | Where-Object { $_.IsActive }).Count
     $inactiveCount = $total - $activeCount
 
-    Write-Log "Two-pass fetch: $total mailboxes ($activeCount active, $inactiveCount static)." -Level INFO
+    Write-Console "Two-pass fetch: $total mailboxes ($activeCount active, $inactiveCount static)." -Level INFO
 
     # ════════════════════════════════════════════════════════════════════
     # DIRECT MODE — when specific identities are supplied (e.g. -Mailbox email)
@@ -1494,7 +1563,7 @@ function Get-MoveStats {
 
     if ($DirectIdentities.Count -gt 0) {
         $includeReport = $IncludeDetailReport
-        Write-Log "  Direct fetch ($($DirectIdentities.Count) identity/identities, IncludeReport=$includeReport)..." -Level INFO
+        Write-Console "  Direct fetch ($($DirectIdentities.Count) identity/identities, IncludeReport=$includeReport)..." -Level INFO
         foreach ($identity in $DirectIdentities) {
             try {
                 $fs = if ($includeReport) {
@@ -1505,11 +1574,11 @@ function Get-MoveStats {
                 if ($fs) {
                     $key = "$($fs.ExchangeGuid)"
                     $fastStatMap[$key] = $fs
-                    Write-Log "    OK [$($fs.DisplayName)] via '$identity'" -Level INFO
+                    Write-Console "    OK [$($fs.DisplayName)] via '$identity'" -Level INFO
                 }
             } catch {
                 $itemErr = $_.Exception.Message -replace "`r`n"," "
-                Write-Log "    FAILED [$identity]: $itemErr" -Level WARN
+                Write-Console "    FAILED [$identity]: $itemErr" -Level WARN
                 $failed.Add([PSCustomObject]@{
                     DisplayName = $identity
                     Alias       = $identity
@@ -1519,7 +1588,7 @@ function Get-MoveStats {
                 })
             }
         }
-        Write-Log "  Direct fetch complete — $($fastStatMap.Count) stats retrieved." -Level INFO
+        Write-Console "  Direct fetch complete — $($fastStatMap.Count) stats retrieved." -Level INFO
 
         # Skip both Pass 1 and Pass 2 — jump straight to results
         $results.AddRange([object[]]($fastStatMap.Values))
@@ -1533,7 +1602,7 @@ function Get-MoveStats {
     # PASS 1 — Fast: all mailboxes, NO -IncludeReport
     # Builds a lookup by GUID for merging with Pass 2 results
     # ════════════════════════════════════════════════════════════════════
-    Write-Log "  Pass 1 — Fast stats (all $total mailboxes, no report)..." -Level INFO
+    Write-Console "  Pass 1 — Fast stats (all $total mailboxes, no report)..." -Level INFO
 
     $batchCount = [math]::Ceiling($total / $BatchSize)
     for ($b = 0; $b -lt $batchCount; $b++) {
@@ -1553,10 +1622,10 @@ function Get-MoveStats {
                 foreach ($fs in @($fastStats)) {
                     if ($fs) { $fastStatMap["$($fs.ExchangeGuid)"] = $fs }
                 }
-                Write-Log "    Batch $($b+1)/$batchCount — $(@($fastStats).Count) returned." -Level INFO
+                Write-Console "    Batch $($b+1)/$batchCount — $(@($fastStats).Count) returned." -Level INFO
             }
             catch {
-                Write-Log "    Batch $($b+1)/$batchCount failed: $($_.Exception.Message -replace '`r`n',' ') — retrying per-mailbox..." -Level WARN
+                Write-Console "    Batch $($b+1)/$batchCount failed: $($_.Exception.Message -replace '`r`n',' ') — retrying per-mailbox..." -Level WARN
                 foreach ($item in $guidItems) {
                     try {
                         $fs = Get-MoveRequestStatistics -Identity $item.Guid -ErrorAction Stop
@@ -1572,7 +1641,7 @@ function Get-MoveStats {
                 -not ($fastStatMap.Keys | Where-Object { $_ -eq $g })
             })
             foreach ($item in $missedItems) {
-                Write-Log "    Retrying by alias: $($item.Alias) (GUID batch returned nothing)" -Level INFO
+                Write-Console "    Retrying by alias: $($item.Alias) (GUID batch returned nothing)" -Level INFO
                 try {
                     $fs = Get-MoveRequestStatistics -Identity $item.Alias -ErrorAction Stop
                     if ($fs) {
@@ -1583,7 +1652,7 @@ function Get-MoveStats {
                     }
                 }
                 catch {
-                    Write-Log "    Retrying by Identity: $($item.Guid)" -Level INFO
+                    Write-Console "    Retrying by Identity: $($item.Guid)" -Level INFO
                     try {
                         $fs = Get-MoveRequestStatistics -Identity $item.Guid -ErrorAction Stop
                         if ($fs) { $fastStatMap["$($fs.ExchangeGuid)"] = $fs }
@@ -1594,7 +1663,7 @@ function Get-MoveStats {
 
         # Per-mailbox call for name/alias-identified mailboxes (no GUID available)
         foreach ($item in $nameItems) {
-            Write-Log "    Fetching by alias: $($item.Alias) (no GUID available)" -Level INFO
+            Write-Console "    Fetching by alias: $($item.Alias) (no GUID available)" -Level INFO
             try {
                 $fs = Get-MoveRequestStatistics -Identity $item.Guid -ErrorAction Stop
                 if ($fs) {
@@ -1607,7 +1676,7 @@ function Get-MoveStats {
             }
             catch {
                 $itemErr = $_.Exception.Message -replace "`r`n"," "
-                Write-Log "    FAILED [$($item.DisplayName)]: $itemErr" -Level WARN
+                Write-Console "    FAILED [$($item.DisplayName)]: $itemErr" -Level WARN
             }
         }
     }
@@ -1620,7 +1689,7 @@ function Get-MoveStats {
         -not ($fastStatMap.Keys | Where-Object { $_ -eq $g })
     })
     if ($stillMissing.Count -gt 0) {
-        Write-Log "  Fetching $($stillMissing.Count) missing mailbox(es) individually..." -Level INFO
+        Write-Console "  Fetching $($stillMissing.Count) missing mailbox(es) individually..." -Level INFO
         foreach ($item in $stillMissing) {
             $fetched = $false
             # Try alias first — most reliable across all statuses in EXO
@@ -1632,19 +1701,19 @@ function Get-MoveStats {
                         if (-not $key -or $key -eq [System.Guid]::Empty.ToString()) { $key = $item.Guid }
                         $fastStatMap[$key] = $fs
                         $item.Guid = $key
-                        Write-Log "    OK [$($item.DisplayName)] via '$identity'" -Level INFO
+                        Write-Console "    OK [$($item.DisplayName)] via '$identity'" -Level INFO
                         $fetched = $true
                         break
                     }
                 } catch {}
             }
             if (-not $fetched) {
-                Write-Log "    FAILED [$($item.DisplayName)] — could not retrieve via alias, GUID, or display name." -Level WARN
+                Write-Console "    FAILED [$($item.DisplayName)] — could not retrieve via alias, GUID, or display name." -Level WARN
             }
         }
     }
 
-    Write-Log "  Pass 1 complete — $($fastStatMap.Count) stats retrieved." -Level INFO
+    Write-Console "  Pass 1 complete — $($fastStatMap.Count) stats retrieved." -Level INFO
 
     # ════════════════════════════════════════════════════════════════════
     # PASS 2 — Slow: active mailboxes only, WITH -IncludeReport
@@ -1664,9 +1733,9 @@ function Get-MoveStats {
     } else { @() }
 
     if (-not $IncludeDetailReport) {
-        Write-Log "  Pass 2 SKIPPED (-IncludeDetailReport not set) — SourceSideDuration%, DestSideDuration%, Latency and LastFailure will be N/A." -Level WARN
+        Write-Console "  Pass 2 SKIPPED (-IncludeDetailReport not set) — SourceSideDuration%, DestSideDuration%, Latency and LastFailure will be N/A." -Level WARN
     } elseif ($reportGuids.Count -gt 0) {
-        Write-Log "  Pass 2 — Full report ($($reportGuids.Count) mailbox(es) including completed)..." -Level INFO
+        Write-Console "  Pass 2 — Full report ($($reportGuids.Count) mailbox(es) including completed)..." -Level INFO
 
         $reportBatchCount = [math]::Ceiling($reportGuids.Count / $BatchSize)
         for ($b = 0; $b -lt $reportBatchCount; $b++) {
@@ -1690,11 +1759,11 @@ function Get-MoveStats {
                         }
                     }
                 }
-                Write-Log "    Report batch $($b+1)/$reportBatchCount — $(@($reportStats).Count) returned." -Level INFO
+                Write-Console "    Report batch $($b+1)/$reportBatchCount — $(@($reportStats).Count) returned." -Level INFO
             }
             catch {
                 $errMsg = $_.Exception.Message -replace "`r`n"," "
-                Write-Log "    Report batch $($b+1)/$reportBatchCount failed ($errMsg) — retrying per-mailbox..." -Level WARN
+                Write-Console "    Report batch $($b+1)/$reportBatchCount failed ($errMsg) — retrying per-mailbox..." -Level WARN
                 foreach ($guid in $slice) {
                     try {
                         $rs = if ($IncludeDetailReport) {
@@ -1716,7 +1785,7 @@ function Get-MoveStats {
                     catch {
                         $itemErr = $_.Exception.Message -replace "`r`n"," "
                         $item = $resolvedMoves | Where-Object { $_.Guid -eq $guid } | Select-Object -First 1
-                        Write-Log "    FAILED [$($item.DisplayName)] ($guid): $itemErr" -Level WARN
+                        Write-Console "    FAILED [$($item.DisplayName)] ($guid): $itemErr" -Level WARN
                         $failed.Add([PSCustomObject]@{
                             DisplayName = $item.DisplayName
                             Alias       = $item.Alias
@@ -1728,9 +1797,9 @@ function Get-MoveStats {
                 }
             }
         }
-        Write-Log "  Pass 2 complete." -Level INFO
+        Write-Console "  Pass 2 complete." -Level INFO
     } else {
-        Write-Log "  Pass 2 skipped — no mailboxes to report on." -Level INFO
+        Write-Console "  Pass 2 skipped — no mailboxes to report on." -Level INFO
     }
 
     # Collect final results
@@ -1738,11 +1807,11 @@ function Get-MoveStats {
         $results.Add($entry)
     }
 
-    Write-Log "Statistics retrieved: $($results.Count) succeeded, $($failed.Count) failed." -Level SUCCESS
+    Write-Console "Statistics retrieved: $($results.Count) succeeded, $($failed.Count) failed." -Level SUCCESS
 
     if ($failed.Count -gt 0) {
         $failed | ForEach-Object {
-            Write-Log "  • $($_.DisplayName) | $($_.GuidUsed) | $($_.Error)" -Level WARN
+            Write-Console "  • $($_.DisplayName) | $($_.GuidUsed) | $($_.Error)" -Level WARN
         }
     }
 
@@ -1770,7 +1839,7 @@ function Invoke-ProcessStats {
 
     )
 
-    Write-Log "Processing statistics for batch: $Name (percentile filter: top $Percentile%)"
+    Write-Console "Processing statistics for batch: $Name (percentile filter: top $Percentile%)"
 
     #── Time boundaries — linear scan, no Sort-Object allocation ────────────────
     $startTime = $null
@@ -1999,7 +2068,7 @@ function Invoke-ProcessStats {
         $sorted | Select-Object -Skip $topN | Sort-Object TransferRateGBph
     } else { @() }
 
-    Write-Log "  Using top $topN of $($sorted.Count) mailboxes ($Percentile% percentile) — $($slowest.Count) slowest excluded" -Level INFO
+    Write-Console "  Using top $topN of $($sorted.Count) mailboxes ($Percentile% percentile) — $($slowest.Count) slowest excluded" -Level INFO
 
     #── Tick-based aggregates — single foreach loop, one pass over $filtered ────
     # Replaces 12 separate SumTicks pipeline calls (each a full enumeration).
@@ -2337,7 +2406,7 @@ function Export-CsvReport {
     $summaryData | Export-Csv -Path $csvSummary -NoTypeInformation -Force
     $Summary.PerMailboxDetail | Export-Csv -Path $csvMailbox -NoTypeInformation -Force
 
-    Write-Log "CSV reports saved: $csvSummary, $csvMailbox" -Level SUCCESS
+    Write-Console "CSV reports saved: $csvSummary, $csvMailbox" -Level SUCCESS
     return @($csvSummary, $csvMailbox)
 }
 
@@ -5773,7 +5842,7 @@ $(if($ListenerPort -gt 0){
 
     $htmlPath = Join-Path $Path "$($Summary.BatchName)_Report.html"
     $html | Out-File -FilePath $htmlPath -Encoding UTF8 -Force
-    Write-Log "HTML report saved: $htmlPath" -Level SUCCESS
+    Write-Console "HTML report saved: $htmlPath" -Level SUCCESS
     return $htmlPath
 }
 
@@ -6397,7 +6466,7 @@ function Invoke-MigrationReport {
     # Ensure output directory exists
     if (-not (Test-Path $ReportPath)) {
         New-Item -ItemType Directory -Path $ReportPath | Out-Null
-        Write-Log "Created report directory: $ReportPath"
+        Write-Console "Created report directory: $ReportPath"
     }
 
     # ── Determine mode ───────────────────────────────────────────────────────
@@ -6406,13 +6475,13 @@ function Invoke-MigrationReport {
 
     if ($PSCmdlet.ParameterSetName -eq "FromXml") {
         # ── OFFLINE MODE — load raw stats from XML ───────────────────────────
-        Write-Log "Offline mode — loading stats from: $ImportXmlPath" -Level INFO
+        Write-Console "Offline mode — loading stats from: $ImportXmlPath" -Level INFO
         try {
             $goodStats = @(Import-Clixml -Path $ImportXmlPath -ErrorAction Stop)
-            Write-Log "Loaded $($goodStats.Count) mailbox record(s) from XML." -Level SUCCESS
+            Write-Console "Loaded $($goodStats.Count) mailbox record(s) from XML." -Level SUCCESS
         }
         catch {
-            Write-Log "Failed to load XML: $_" -Level ERROR
+            Write-Console "Failed to load XML: $_" -Level ERROR
             return
         }
     }
@@ -6421,14 +6490,14 @@ function Invoke-MigrationReport {
 
         # Validate ExportDetailXml dependency
         if ($ExportDetailXml -and -not $IncludeDetailReport) {
-            Write-Log "-ExportDetailXml requires -IncludeDetailReport. ExportDetailXml will be skipped." -Level WARN
+            Write-Console "-ExportDetailXml requires -IncludeDetailReport. ExportDetailXml will be skipped." -Level WARN
             $ExportDetailXml = $false
         }
 
         # Step 1 – Retrieve move requests
         # -Mailbox and -MigrationBatchName are mutually exclusive
         if ($Mailbox -and $MigrationBatchName) {
-            Write-Log "-Mailbox and -MigrationBatchName cannot be used together. Use one or the other." -Level ERROR
+            Write-Console "-Mailbox and -MigrationBatchName cannot be used together. Use one or the other." -Level ERROR
             return
         }
 
@@ -6442,7 +6511,7 @@ function Invoke-MigrationReport {
 
         $moves = Get-MoveRequests @getMoveParams
         if (-not $moves -or @($moves).Count -eq 0) {
-            Write-Log "No move requests found matching the specified filters." -Level WARN
+            Write-Console "No move requests found matching the specified filters." -Level WARN
             return
         }
 
@@ -6471,7 +6540,7 @@ function Invoke-MigrationReport {
         $failedMbx   = $statsResult.Failed
 
         if (-not $goodStats -or $goodStats.Count -eq 0) {
-            Write-Log "No statistics could be retrieved. Check move request GUIDs and permissions." -Level ERROR
+            Write-Console "No statistics could be retrieved. Check move request GUIDs and permissions." -Level ERROR
             return
         }
 
@@ -6480,10 +6549,10 @@ function Invoke-MigrationReport {
             $xmlPath = Join-Path $ReportPath "$($ReportName)_RawStats.xml"
             try {
                 $goodStats | Export-Clixml -Path $xmlPath -Force
-                Write-Log "Raw stats exported to XML: $xmlPath" -Level SUCCESS
+                Write-Console "Raw stats exported to XML: $xmlPath" -Level SUCCESS
             }
             catch {
-                Write-Log "Failed to export XML: $_" -Level WARN
+                Write-Console "Failed to export XML: $_" -Level WARN
             }
         }
     }
@@ -6527,7 +6596,7 @@ function Invoke-MigrationReport {
         }
         $skippedCsv = Join-Path $ReportPath "$($ReportName)_SkippedMailboxes.csv"
         $failedMbx | Export-Csv -Path $skippedCsv -NoTypeInformation -Force
-        Write-Log "Skipped mailboxes exported: $skippedCsv" -Level WARN
+        Write-Console "Skipped mailboxes exported: $skippedCsv" -Level WARN
     }
 
     # Step 6 – Export reports
@@ -6536,8 +6605,8 @@ function Invoke-MigrationReport {
     }
     if (-not $SkipCsv)  { Export-CsvReport  -Summary $summary -Path $ReportPath | Out-Null }
 
-    Write-Log "All reports generated successfully." -Level SUCCESS
-    Write-Log "Output directory: $ReportPath"       -Level SUCCESS
+    Write-Console "All reports generated successfully." -Level SUCCESS
+    Write-Console "Output directory: $ReportPath"       -Level SUCCESS
 
     return $summary
 }
@@ -6612,13 +6681,11 @@ if ($MyInvocation.InvocationName -ne '.') {
         }
         $alertsEnabled = $alertConfig.AlertOnFailure -or $alertConfig.AlertOnComplete -or $alertConfig.AlertOnStall
         if ($alertsEnabled) {
-            Write-Host "  Alerts enabled:" -ForegroundColor Cyan -NoNewline
-            if ($alertConfig.AlertOnFailure) { Write-Host " [Failure]" -ForegroundColor Red -NoNewline }
-            if ($alertConfig.AlertOnComplete) { Write-Host " [Complete]" -ForegroundColor Green -NoNewline }
-            if ($alertConfig.AlertOnStall) { Write-Host " [Stall>${StallThresholdMinutes}m]" -ForegroundColor Yellow -NoNewline }
-            Write-Host ""
-            if ($alertConfig.EmailTo) { Write-Host "  Email: $AlertEmailTo" -ForegroundColor DarkCyan }
-            if ($alertConfig.TeamsWebhookUrl) { Write-Host "  Teams: Webhook configured" -ForegroundColor DarkCyan }
+            $alertTypes = @()
+            if ($alertConfig.AlertOnFailure) { $alertTypes += 'Failure' }
+            if ($alertConfig.AlertOnComplete) { $alertTypes += 'Complete' }
+            if ($alertConfig.AlertOnStall) { $alertTypes += "Stall>${StallThresholdMinutes}m" }
+            Write-Console "Alerts enabled: [$($alertTypes -join '] [')] | Email: $(if($alertConfig.EmailTo){$AlertEmailTo}else{'N/A'}) | Teams: $(if($alertConfig.TeamsWebhookUrl){'Configured'}else{'N/A'})" -Level Info -NoTimestamp
         }
 
         # ── Auto-Retry configuration ─────────────────────────────────────────────
@@ -6629,10 +6696,7 @@ if ($MyInvocation.InvocationName -ne '.') {
             ErrorPatterns = $RetryOnErrorPatterns
         }
         if ($retryConfig.Enabled) {
-            Write-Host "  Auto-Retry enabled:" -ForegroundColor Cyan
-            Write-Host "    Max attempts: $MaxRetryAttempts" -ForegroundColor DarkCyan
-            Write-Host "    Retry delay: $RetryDelayMinutes minutes" -ForegroundColor DarkCyan
-            Write-Host "    Error patterns: $($RetryOnErrorPatterns -join ', ')" -ForegroundColor DarkCyan
+            Write-Console "Auto-Retry enabled: Max $MaxRetryAttempts attempts, ${RetryDelayMinutes}m delay" -Level Info -NoTimestamp
         }
 
         # ── Scheduled Reports configuration ──────────────────────────────────────
@@ -6646,14 +6710,11 @@ if ($MyInvocation.InvocationName -ne '.') {
         }
         if ($scheduleConfig.Enabled) {
             $dayNames = @('Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday')
-            Write-Host "  Scheduled Reports enabled:" -ForegroundColor Cyan
-            Write-Host "    Schedule: $ReportSchedule" -ForegroundColor DarkCyan
-            Write-Host "    Time: $ReportTime" -ForegroundColor DarkCyan
-            if ($ReportSchedule -eq 'Weekly') {
-                Write-Host "    Day: $($dayNames[$ReportDayOfWeek])" -ForegroundColor DarkCyan
-            }
             $schedRecipient = if ($ScheduledReportEmailTo) { $ScheduledReportEmailTo } else { $AlertEmailTo }
-            if ($schedRecipient) { Write-Host "    Recipients: $schedRecipient" -ForegroundColor DarkCyan }
+            $schedInfo = "$ReportSchedule at $ReportTime"
+            if ($ReportSchedule -eq 'Weekly') { $schedInfo += " ($($dayNames[$ReportDayOfWeek]))" }
+            if ($schedRecipient) { $schedInfo += " to $schedRecipient" }
+            Write-Console "Scheduled Reports enabled: $schedInfo" -Level Info -NoTimestamp
         }
 
         # ── Historical trend data collection ────────────────────────────────────
@@ -6712,13 +6773,13 @@ if ($MyInvocation.InvocationName -ne '.') {
             }
             if ($watchState['ListenerReady']) {
                 if ($watchState['ListenerUrl']) { $apiUrl = "$($watchState['ListenerUrl'])" }
-                Write-Host "  API listener ready: $apiUrl" -ForegroundColor Green
+                Write-Console "API listener ready: $apiUrl" -Level Success -NoTimestamp
             } else {
-                Write-Host "  API listener failed to start (port $ListenerPort may be in use). Watch mode will still work without browser API." -ForegroundColor Yellow
-                if ($watchState['ListenerError']) { Write-Host "  Error: $($watchState['ListenerError'])" -ForegroundColor DarkYellow }
+                Write-Console "API listener failed to start (port $ListenerPort may be in use). Watch mode will still work without browser API." -Level Warn -NoTimestamp
+                if ($watchState['ListenerError']) { Write-Console "Error: $($watchState['ListenerError'])" -Level Warn -NoTimestamp }
             }
         } catch {
-            Write-Host "  Could not start API listener: $_" -ForegroundColor Yellow
+            Write-Console "Could not start API listener: $_" -Level Warn -NoTimestamp
         }
 
         # Pass API endpoint into HTML for the control panel JS when listener is available.
@@ -6730,14 +6791,12 @@ if ($MyInvocation.InvocationName -ne '.') {
             if ($invokeParams.ContainsKey('ListenerBaseUrl')) { [void]$invokeParams.Remove('ListenerBaseUrl') }
         }
 
-        Write-Host ""
-        Write-Host "  #############################################################################" -ForegroundColor Cyan
-        Write-Host "  WATCH MODE  —  refreshing every $RefreshIntervalSeconds seconds" -ForegroundColor Cyan
-        Write-Host "  Report : $reportFile" -ForegroundColor Cyan
-        Write-Host "  API    : $apiUrl" -ForegroundColor Cyan
-        Write-Host "  Ctrl+C : stop" -ForegroundColor Cyan
-        Write-Host "  #############################################################################" -ForegroundColor Cyan
-        Write-Host ""
+        Write-Banner -Lines @(
+            "WATCH MODE  —  refreshing every $RefreshIntervalSeconds seconds"
+            "Report : $reportFile"
+            "API    : $apiUrl"
+            "Ctrl+C : stop"
+        )
 
         # ── Pre-fetch batch list from EXO for the control panel ───────────────
         try {
@@ -6748,9 +6807,9 @@ if ($MyInvocation.InvocationName -ne '.') {
                     Sort-Object Name |
                     ForEach-Object { @{ Name=$_.Name; Count=$_.Count } }
             )
-            Write-Host "  Loaded $($watchState['Batches'].Count) batch(es) for browser control panel." -ForegroundColor DarkCyan
+            Write-Console "Loaded $($watchState['Batches'].Count) batch(es) for browser control panel." -Level Info -NoTimestamp
         } catch {
-            Write-Host "  Could not pre-load batch list: $_" -ForegroundColor DarkYellow
+            Write-Console "Could not pre-load batch list: $_" -Level Warn -NoTimestamp
         }
 
         $iteration = 0
@@ -6759,7 +6818,7 @@ if ($MyInvocation.InvocationName -ne '.') {
             while ($true) {
                 # Check if paused - skip refresh but still process commands
                 if ($watchState['IsPaused']) {
-                    Write-Host "[$(Get-Date -Format 'HH:mm:ss')] PAUSED - waiting for resume..." -ForegroundColor Yellow
+                    Write-Console "PAUSED - waiting for resume..." -Level Paused
 
                     # Wait loop while paused - still process commands
                     while ($watchState['IsPaused']) {
@@ -6770,16 +6829,16 @@ if ($MyInvocation.InvocationName -ne '.') {
                             $cmd = $watchState['PendingCommands'][0]
                             $watchState['PendingCommands'].RemoveAt(0)
 
-                            Write-Host "  [API] Command received: $($cmd.Action)" -ForegroundColor Magenta
+                            Write-Console "Command received: $($cmd.Action)" -Level API
 
                             if ($cmd.Action -eq 'UpdatePaused' -and -not $cmd.Paused) {
                                 $watchState['IsPaused'] = $false
-                                Write-Host "  [API] Auto-refresh RESUMED" -ForegroundColor Green
+                                Write-Console "Auto-refresh RESUMED" -Level Success
                                 break
                             }
                             elseif ($cmd.Action -eq 'refresh') {
                                 # Allow manual refresh even when paused
-                                Write-Host "  [API] Manual refresh requested (overriding pause)" -ForegroundColor Cyan
+                                Write-Console "Manual refresh requested (overriding pause)" -Level API
                                 $watchState['IsPaused'] = $false
                                 break
                             }
@@ -6792,14 +6851,14 @@ if ($MyInvocation.InvocationName -ne '.') {
                             }
                         }
                     }
-                    Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Resuming auto-refresh..." -ForegroundColor Green
+                    Write-Console "Resuming auto-refresh..." -Level Success
                 }
 
                 $iteration++
                 $watchState['Iteration']    = $iteration
                 $watchState['IsRefreshing'] = $true
 
-                Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Iteration $iteration — $($watchState['CurrentScope'])..." -ForegroundColor DarkCyan
+                Write-Console "Iteration $iteration — $($watchState['CurrentScope'])..." -Level Iteration
 
                 # Show current applied settings before refresh
                 $settingsList = @()
@@ -6811,7 +6870,7 @@ if ($MyInvocation.InvocationName -ne '.') {
                 if ($scheduleConfig.Enabled) { $settingsList += "SchedReport:$($scheduleConfig.Schedule)" }
                 if ($scheduleConfig.IncludeDetail) { $settingsList += 'SchedDetail' }
                 if ($settingsList.Count -gt 0) {
-                    Write-Host "  [Settings] $($settingsList -join ' | ')" -ForegroundColor DarkGray
+                    Write-Console "$($settingsList -join ' | ')" -Level Settings -NoTimestamp
                 }
 
                 $result = Invoke-MigrationReport @invokeParams
@@ -6861,9 +6920,9 @@ if ($MyInvocation.InvocationName -ne '.') {
                     $retryResults = Invoke-QueuedRetries -RetryConfig $retryConfig
                     if ($retryResults -and $retryResults.Count -gt 0) {
                         foreach ($rr in $retryResults) {
-                            $statusColor = if ($rr.Success) { 'Green' } else { 'Red' }
                             $statusText = if ($rr.Success) { 'RESUMED' } else { 'RETRY FAILED' }
-                            Write-Host "  [Auto-Retry] $($rr.Mailbox) - Attempt $($rr.Attempt): $statusText" -ForegroundColor $statusColor
+                            $level = if ($rr.Success) { 'Success' } else { 'Error' }
+                            Write-Console "[Auto-Retry] $($rr.Mailbox) - Attempt $($rr.Attempt): $statusText" -Level $level -NoTimestamp
                         }
                     }
 
@@ -6895,13 +6954,13 @@ if ($MyInvocation.InvocationName -ne '.') {
                 # ── Check for scheduled report ───────────────────────────────────────────
                 if ($scheduleConfig.Enabled -and $result -and $result.PerMailboxDetail) {
                     if (Test-ScheduledReportDue -ScheduleConfig $scheduleConfig) {
-                        Write-Host "  [Scheduled Report] Generating $($scheduleConfig.Schedule) report..." -ForegroundColor Magenta
+                        Write-Console "[Scheduled Report] Generating $($scheduleConfig.Schedule) report..." -Level API -NoTimestamp
                         $reportSent = Send-ScheduledReport -Summary $result -Mailboxes $result.PerMailboxDetail `
                             -ScheduleConfig $scheduleConfig -AlertConfig $alertConfig
                         if ($reportSent) {
-                            Write-Host "  [Scheduled Report] Report sent successfully!" -ForegroundColor Green
+                            Write-Console "[Scheduled Report] Report sent successfully!" -Level Success -NoTimestamp
                         } else {
-                            Write-Host "  [Scheduled Report] Failed to send report." -ForegroundColor Red
+                            Write-Console "[Scheduled Report] Failed to send report." -Level Error -NoTimestamp
                         }
                     }
                 }
@@ -6912,15 +6971,15 @@ if ($MyInvocation.InvocationName -ne '.') {
                 if ($iteration -eq 1 -and -not $SkipHtml) {
 
                     if ($watchState['ListenerReady']) {
-                        Write-Host "  Opening report in browser: $apiUrl" -ForegroundColor Cyan
+                        Write-Console "Opening report in browser: $apiUrl" -Level Info -NoTimestamp
                         Start-Process $apiUrl
                     }
                     elseif (Test-Path $reportFile) {
-                        Write-Host "  Listener unavailable. Opening report file directly: $reportFile" -ForegroundColor Yellow
+                        Write-Console "Listener unavailable. Opening report file directly: $reportFile" -Level Warn -NoTimestamp
                         Start-Process $reportFile
                     }
                     else {
-                        Write-Host "  Browser auto-open skipped: listener unavailable and report file not found yet." -ForegroundColor Yellow
+                        Write-Console "Browser auto-open skipped: listener unavailable and report file not found yet." -Level Warn -NoTimestamp
                     }
 
                 }
@@ -6928,7 +6987,7 @@ if ($MyInvocation.InvocationName -ne '.') {
 
 
 
-                Write-Host "  Next refresh in $RefreshIntervalSeconds s. API: $apiUrl  |  Ctrl+C to stop`n" -ForegroundColor DarkGray
+                Write-Console "Next refresh in $RefreshIntervalSeconds s. API: $apiUrl  |  Ctrl+C to stop" -Level Status -NoTimestamp
 
                 # ── Countdown — check for pending API commands every second ──────
                 for ($i = $RefreshIntervalSeconds; $i -gt 0; $i--) {
@@ -6944,7 +7003,7 @@ if ($MyInvocation.InvocationName -ne '.') {
                         $cmd = $watchState['PendingCommands'][0]
                         $watchState['PendingCommands'].RemoveAt(0)
 
-                        Write-Host "  [API] Command received: $($cmd.Action)" -ForegroundColor Magenta
+                        Write-Console "Command received: $($cmd.Action)" -Level API
 
                         if ($cmd.Action -eq 'switch') {
                             # Update invoke params based on what was requested
@@ -6955,50 +7014,61 @@ if ($MyInvocation.InvocationName -ne '.') {
                                 if ($batchList.Count -eq 1) {
                                     $invokeParams.MigrationBatchName = $batchList[0]
                                     $watchState['CurrentScope'] = "Batch: $($batchList[0])"
+                                    Write-Console "Scope changed to Batch: $($batchList[0])" -Level API -NoTimestamp
                                 } else {
                                     $invokeParams.MigrationBatchName = $batchList
                                     $watchState['CurrentScope'] = "Batches: $($batchList.Count) selected"
+                                    Write-Console "Scope changed to $($batchList.Count) batches: $($batchList -join ', ')" -Level API -NoTimestamp
                                 }
                             } elseif ($cmd.Mailbox -and $cmd.Mailbox -ne '') {
                                 $invokeParams.Remove('MigrationBatchName')
                                 $invokeParams.Mailbox = @($cmd.Mailbox -split ',')
                                 $watchState['CurrentScope'] = "Mailbox: $($cmd.Mailbox)"
+                                Write-Console "Scope changed to Mailbox: $($cmd.Mailbox)" -Level API -NoTimestamp
                             } else {
                                 # All — clear filters
                                 $invokeParams.Remove('Mailbox')
                                 $invokeParams.Remove('MigrationBatchName')
                                 $watchState['CurrentScope'] = 'All'
+                                Write-Console "Scope changed to All" -Level API -NoTimestamp
                             }
-                            if ($cmd.IncludeCompleted) { $invokeParams.IncludeCompleted = $true }
+                            if ($cmd.IncludeCompleted) {
+                                $invokeParams.IncludeCompleted = $true
+                                Write-Console "Include Completed enabled" -Level API -NoTimestamp
+                            }
                             if ($cmd.SinceDate -and $cmd.SinceDate -ne '') {
                                 try {
                                     $invokeParams.SinceDate = [datetime]$cmd.SinceDate
                                     $watchState['CurrentSinceDate'] = $cmd.SinceDate
+                                    Write-Console "Since Date set to $($cmd.SinceDate)" -Level API -NoTimestamp
                                 } catch {}
                             } else {
                                 $invokeParams.Remove('SinceDate')
                                 $watchState['CurrentSinceDate'] = ''
                             }
                         }
+                        elseif ($cmd.Action -eq 'refresh') {
+                            Write-Console "Manual refresh requested" -Level API -NoTimestamp
+                        }
                         elseif ($cmd.Action -eq 'UpdateInterval') {
                             $RefreshIntervalSeconds = $cmd.Interval
                             $watchState['Interval'] = $cmd.Interval
-                            Write-Host "  [API] Refresh interval updated to $($cmd.Interval)s" -ForegroundColor Cyan
+                            Write-Console "Refresh interval updated to $($cmd.Interval)s" -Level API -NoTimestamp
                         }
                         elseif ($cmd.Action -eq 'UpdateAutoRetry') {
                             $retryConfig.Enabled = $cmd.Enabled
                             $watchState['AutoRetryEnabled'] = $cmd.Enabled
-                            Write-Host "  [API] Auto-Retry $(if($cmd.Enabled){'enabled'}else{'disabled'})" -ForegroundColor Cyan
+                            Write-Console "Auto-Retry $(if($cmd.Enabled){'enabled'}else{'disabled'})" -Level API -NoTimestamp
                         }
                         elseif ($cmd.Action -eq 'UpdateIncludeDetailReport') {
                             $invokeParams.IncludeDetailReport = $cmd.Enabled
                             $watchState['IncludeDetailReport'] = $cmd.Enabled
-                            Write-Host "  [API] Include Detail Report $(if($cmd.Enabled){'enabled'}else{'disabled'})" -ForegroundColor Cyan
+                            Write-Console "Include Detail Report $(if($cmd.Enabled){'enabled'}else{'disabled'})" -Level API -NoTimestamp
                         }
                         elseif ($cmd.Action -eq 'UpdateIncludeDetailInScheduled') {
                             $scheduleConfig.IncludeDetail = $cmd.Enabled
                             $watchState['IncludeDetailInScheduled'] = $cmd.Enabled
-                            Write-Host "  [API] Include Detail in Scheduled Reports $(if($cmd.Enabled){'enabled'}else{'disabled'})" -ForegroundColor Cyan
+                            Write-Console "Include Detail in Scheduled Reports $(if($cmd.Enabled){'enabled'}else{'disabled'})" -Level API -NoTimestamp
                         }
                         elseif ($cmd.Action -eq 'UpdateAlertConfig') {
                             $cfg = $cmd.Config
@@ -7013,7 +7083,7 @@ if ($MyInvocation.InvocationName -ne '.') {
                                 $script:AlertOnCompletion = $cfg.alertOnComplete
                                 $script:AlertOnStall = $cfg.alertOnStall
                                 $script:StallThresholdMinutes = $cfg.stallThreshold
-                                Write-Host "  [API] Alert configuration updated" -ForegroundColor Cyan
+                                Write-Console "Alert configuration updated" -Level API -NoTimestamp
                             }
                         }
                         elseif ($cmd.Action -eq 'UpdateStatusFilter') {
@@ -7024,18 +7094,18 @@ if ($MyInvocation.InvocationName -ne '.') {
                                 $invokeParams.StatusFilter = 'All'
                             }
                             $watchState['CurrentStatusFilter'] = $invokeParams.StatusFilter
-                            Write-Host "  [API] Status Filter changed to $($invokeParams.StatusFilter)" -ForegroundColor Cyan
+                            Write-Console "Status Filter changed to $($invokeParams.StatusFilter)" -Level API -NoTimestamp
                         }
                         elseif ($cmd.Action -eq 'UpdatePaused') {
                             $watchState['IsPaused'] = $cmd.Paused
                             if ($cmd.Paused) {
-                                Write-Host "  [API] Auto-refresh PAUSED" -ForegroundColor Yellow
+                                Write-Console "Auto-refresh PAUSED" -Level Warn -NoTimestamp
                             } else {
-                                Write-Host "  [API] Auto-refresh RESUMED" -ForegroundColor Green
+                                Write-Console "Auto-refresh RESUMED" -Level Success -NoTimestamp
                             }
                         }
                         elseif ($cmd.Action -eq 'TestAlert') {
-                            Write-Host "  [API] Sending test alert..." -ForegroundColor Cyan
+                            Write-Console "Sending test alert..." -Level API -NoTimestamp
                             $testSubject = "Migration Monitor - Test Alert"
                             $testBody = "This is a test alert from the Migration Analysis tool.`n`nTimestamp: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`nServer: $env:COMPUTERNAME"
 
@@ -7053,9 +7123,9 @@ if ($MyInvocation.InvocationName -ne '.') {
                                     }
                                     if ($alertCfg.smtpSsl) { $emailParams['UseSsl'] = $true }
                                     Send-MailMessage @emailParams -ErrorAction Stop
-                                    Write-Host "  [API] Test email sent successfully" -ForegroundColor Green
+                                    Write-Console "Test email sent successfully" -Level Success -NoTimestamp
                                 } catch {
-                                    Write-Host "  [API] Test email failed: $($_.Exception.Message)" -ForegroundColor Red
+                                    Write-Console "Test email failed: $($_.Exception.Message)" -Level Error -NoTimestamp
                                 }
                             }
 
@@ -7071,9 +7141,9 @@ if ($MyInvocation.InvocationName -ne '.') {
                                         text       = $testBody -replace "`n", "<br>"
                                     }
                                     Invoke-RestMethod -Uri $alertCfg.teamsWebhook -Method Post -Body ($teamsCard | ConvertTo-Json -Depth 5) -ContentType 'application/json' -ErrorAction Stop
-                                    Write-Host "  [API] Test Teams message sent successfully" -ForegroundColor Green
+                                    Write-Console "Test Teams message sent successfully" -Level Success -NoTimestamp
                                 } catch {
-                                    Write-Host "  [API] Test Teams message failed: $($_.Exception.Message)" -ForegroundColor Red
+                                    Write-Console "Test Teams message failed: $($_.Exception.Message)" -Level Error -NoTimestamp
                                 }
                             }
 
@@ -7097,7 +7167,8 @@ if ($MyInvocation.InvocationName -ne '.') {
                 try { $listenerJob.PS.Stop() } catch {}
                 try { $listenerJob.Runspace.Close() } catch {}
             }
-            Write-Host "`n[$(Get-Date -Format 'HH:mm:ss')] Watch mode stopped." -ForegroundColor Yellow
+            Write-Host ""
+            Write-Console "Watch mode stopped." -Level Warn
         }
     }
     else {
