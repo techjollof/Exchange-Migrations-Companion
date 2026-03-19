@@ -49,7 +49,7 @@
     Press Ctrl+C to stop. Only valid in Live mode.
 
 .PARAMETER RefreshIntervalSeconds
-    Interval between report refreshes in watch mode. Default: 60 seconds. Range: 10–3600.
+    Interval between report refreshes in watch mode. Default: 60 seconds. Range: 10–86400 (24 hours).
 
 .PARAMETER ListenerPort
     TCP port for the local HTTP API used by the browser control panel in watch mode.
@@ -194,7 +194,7 @@ param (
     [switch]$WatchMode,
 
     [Parameter(ParameterSetName = "Live")]
-    [ValidateRange(10,3600)]
+    [ValidateRange(10,86400)]
     [int]$RefreshIntervalSeconds = 60,
 
     [Parameter(ParameterSetName = "Live")]
@@ -694,8 +694,10 @@ function Check-MigrationAlerts {
         [hashtable]$AlertConfig
     )
 
+    $alertsSent = $false
+
     if (-not $AlertConfig.AlertOnFailure -and -not $AlertConfig.AlertOnComplete -and -not $AlertConfig.AlertOnStall) {
-        return
+        return $alertsSent
     }
 
     $now = Get-Date
@@ -708,6 +710,7 @@ function Check-MigrationAlerts {
             if (-not $script:AlertedFailures.ContainsKey($key)) {
                 Send-MigrationAlert -AlertType "Failure" -Mailbox $mbx -Summary $Summary -AlertConfig $AlertConfig
                 $script:AlertedFailures[$key] = $now
+                $alertsSent = $true
             }
         }
 
@@ -716,6 +719,7 @@ function Check-MigrationAlerts {
             if (-not $script:AlertedCompletions.ContainsKey($key)) {
                 Send-MigrationAlert -AlertType "Completion" -Mailbox $mbx -Summary $Summary -AlertConfig $AlertConfig
                 $script:AlertedCompletions[$key] = $now
+                $alertsSent = $true
             }
         }
 
@@ -734,6 +738,7 @@ function Check-MigrationAlerts {
                             $mbx | Add-Member -NotePropertyName StallMinutes -NotePropertyValue ([math]::Round($stallMinutes)) -Force
                             Send-MigrationAlert -AlertType "Stall" -Mailbox $mbx -Summary $Summary -AlertConfig $AlertConfig
                             $script:AlertedStalls[$key] = $now
+                            $alertsSent = $true
                         }
                     }
                 }
@@ -749,6 +754,8 @@ function Check-MigrationAlerts {
             }
         }
     }
+
+    return $alertsSent
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3015,6 +3022,15 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
   .watch-inp { width:100%; padding:5px 9px; background:#334155; border:1px solid #475569;
                border-radius:6px; color:#e2e8f0; font-size:.79rem; box-sizing:border-box; }
   .watch-inp:focus { border-color:#60a5fa; outline:none; }
+  .batch-dropdown { position:relative; }
+  .batch-dropdown-btn { width:100%; padding:5px 9px; background:#334155; border:1px solid #475569;
+               border-radius:6px; color:#e2e8f0; font-size:.79rem; box-sizing:border-box; cursor:pointer; }
+  .batch-dropdown-btn:hover { border-color:#60a5fa; }
+  .batch-dropdown-list { position:absolute; top:100%; left:0; right:0; background:#1e293b; border:1px solid #475569;
+               border-radius:6px; margin-top:2px; max-height:200px; overflow-y:auto; z-index:1000; }
+  .batch-checkbox-item { display:block; padding:6px 10px; color:#e2e8f0; font-size:.78rem; cursor:pointer; }
+  .batch-checkbox-item:hover { background:#334155; }
+  .batch-checkbox-item input { margin-right:6px; vertical-align:middle; }
   .watch-btn-row { display:flex; gap:5px; }
   .wbtn { padding:6px 12px; border-radius:6px; border:none; cursor:pointer; font-size:.79rem; font-weight:600; }
   .wbtn-p { background:#3b82f6; color:#fff; } .wbtn-p:hover { background:#2563eb; }
@@ -3662,6 +3678,9 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     // Read advanced filters if available
     if (typeof readAdvFilters === 'function') readAdvFilters();
 
+    // Check watch panel status filter
+    var wStatusFilter = (document.getElementById('wStatusFilter') || {}).value || '';
+
     var visible = 0;
     var total   = 0;
     var activeRows = inSlowestTab ? slowestRows : rows;
@@ -3672,7 +3691,13 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
 
     activeRows.forEach(function (r) {
       total++;
-      var statusMatch = inSlowestTab || (activeTab === 'All') || (r.getAttribute('data-status') === activeTab);
+      var rowStatus = r.getAttribute('data-status') || '';
+      // Check main tab filter
+      var statusMatch = inSlowestTab || (activeTab === 'All') || (rowStatus === activeTab);
+      // Also check watch panel status filter if set
+      if (wStatusFilter && statusMatch) {
+        statusMatch = rowStatus.toLowerCase().indexOf(wStatusFilter.toLowerCase()) !== -1;
+      }
       var textMatch   = !q || r.textContent.toLowerCase().indexOf(q) !== -1;
       var advMatch    = (typeof rowMatchesAdvFilters === 'function') ? rowMatchesAdvFilters(r) : true;
       var show = statusMatch && textMatch && advMatch;
@@ -3710,10 +3735,23 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
         Array.from(tbody.querySelectorAll('tr')).forEach(function(r){ rows.push(r); });
       }
       applyFilters();
-      // Update sort indicators
+      // Update sort indicators (preserve tooltip spans)
       document.querySelectorAll('#mbx-table thead th').forEach(function(h,i){
-        h.textContent = h.textContent.replace(/ [\u25b2\u25bc]$/,'');
-        if (i === idx) h.textContent += asc ? ' \u25b2' : ' \u25bc';
+        // Find or create sort indicator span
+        var sortSpan = h.querySelector('.sort-indicator');
+        if (!sortSpan) {
+          sortSpan = document.createElement('span');
+          sortSpan.className = 'sort-indicator';
+          sortSpan.style.marginLeft = '4px';
+          // Insert before tooltip span if exists
+          var tipSpan = h.querySelector('.th-tip');
+          if (tipSpan) {
+            h.insertBefore(sortSpan, tipSpan);
+          } else {
+            h.appendChild(sortSpan);
+          }
+        }
+        sortSpan.textContent = (i === idx) ? (asc ? '\u25b2' : '\u25bc') : '';
       });
     };
   });
@@ -4029,12 +4067,22 @@ function togglePanel(id, btnId) {
 var hiddenCols = {};
 var colHeaders = [];
 
+// Helper to get clean header text (excluding tooltips and sort indicators)
+function getHeaderText(th) {
+  var clone = th.cloneNode(true);
+  var tip = clone.querySelector('.th-tip');
+  var sort = clone.querySelector('.sort-indicator');
+  if (tip) tip.remove();
+  if (sort) sort.remove();
+  return clone.textContent.replace(/[▲▼]/g,'').trim();
+}
+
 function initColumns() {
   var ths = document.querySelectorAll('#mbx-table thead th');
   var grid = document.getElementById('col-grid');
   if (!grid) return;
   ths.forEach(function(th, i) {
-    colHeaders[i] = th.textContent.replace(/[▲▼]/g,'').trim().split('\n')[0].trim();
+    colHeaders[i] = getHeaderText(th);
     var tog = document.createElement('div');
     tog.className = 'col-toggle';
     tog.id = 'coltog-' + i;
@@ -4230,7 +4278,7 @@ function getVisibleRows() {
 function exportCSV() {
   var ths = Array.from(document.querySelectorAll('#mbx-table thead th'));
   var headers = ths.map(function(th,i){
-    return hiddenCols[i] ? null : '"' + th.textContent.replace(/[▲▼]/g,'').trim().replace(/"/g,'""') + '"';
+    return hiddenCols[i] ? null : '"' + getHeaderText(th).replace(/"/g,'""') + '"';
   }).filter(Boolean);
 
   var vrows = getVisibleRows();
@@ -4248,7 +4296,7 @@ function exportCSV() {
 function exportExcel() {
   var ths = Array.from(document.querySelectorAll('#mbx-table thead th'));
   var headerRow = '<tr>' + ths.map(function(th,i){
-    return hiddenCols[i] ? '' : '<th>' + th.textContent.replace(/[▲▼]/g,'').trim() + '</th>';
+    return hiddenCols[i] ? '' : '<th>' + getHeaderText(th) + '</th>';
   }).join('') + '</tr>';
 
   var vrows = getVisibleRows();
@@ -5063,17 +5111,53 @@ $(if($ListenerPort -gt 0){
 
     <div class='watch-prog'><div class='watch-prog-fill' id='wProg' style='width:0%'></div></div>
 
+    <div class='watch-stat'><span class='wl'>Next refresh in</span><span class='wv' id='wCountdown'>&#x2014;</span></div>
+
     <div class='watch-btn-row'>
 
       <button class='wbtn wbtn-p' style='flex:1' onclick='apiRefresh()'>&#x21BA; Refresh Now</button>
 
     </div>
 
+    <div class='watch-sec' style='margin-top:12px;border-top:1px solid #334155;padding-top:10px;'>⚙️ Settings</div>
+
+    <div>
+      <div class='watch-sec'>Refresh Interval</div>
+      <div style='display:flex;align-items:center;gap:8px;'>
+        <input type='range' id='wIntervalSlider' min='1' max='1440' step='1' value='$([math]::Floor($AutoRefreshSeconds/60))'
+               style='flex:1;height:6px;' onchange='updateInterval(this.value)' oninput='showIntervalValue(this.value)'>
+        <span id='wIntervalValue' style='color:#94a3b8;font-size:.78rem;min-width:50px;'>$(if($AutoRefreshSeconds -ge 3600){"$([math]::Floor($AutoRefreshSeconds/3600))h $(([math]::Floor(($AutoRefreshSeconds%3600)/60)))m"}elseif($AutoRefreshSeconds -ge 60){"$([math]::Floor($AutoRefreshSeconds/60))m"}else{"$($AutoRefreshSeconds)s"})</span>
+      </div>
+    </div>
+
+    <div>
+      <div class='watch-sec'>Status Filter</div>
+      <select class='watch-inp' id='wStatusFilter' onchange='applyStatusFilter()'>
+        <option value=''>All Statuses</option>
+        <option value='InProgress'>In Progress</option>
+        <option value='Completed'>Completed</option>
+        <option value='Failed'>Failed</option>
+        <option value='Synced'>Synced</option>
+        <option value='Queued'>Queued</option>
+      </select>
+    </div>
+
     <div>
 
-      <div class='watch-sec'>Switch Batch</div>
+      <div class='watch-sec'>Switch Batch(es)</div>
 
-      <select class='watch-inp' id='wBatchSel'><option value=''>All Batches</option></select>
+      <div class='batch-dropdown' id='wBatchDropdown'>
+        <div class='batch-dropdown-btn' onclick='toggleBatchDropdown()'>
+          <span id='wBatchLabel'>All Batches</span>
+          <span style='float:right;'>▼</span>
+        </div>
+        <div class='batch-dropdown-list' id='wBatchList' style='display:none;'>
+          <label class='batch-checkbox-item'>
+            <input type='checkbox' id='wBatchAll' checked onchange='toggleAllBatches(this.checked)'> <strong>All Batches</strong>
+          </label>
+          <div id='wBatchItems'></div>
+        </div>
+      </div>
 
     </div>
 
@@ -5087,10 +5171,32 @@ $(if($ListenerPort -gt 0){
 
     <div>
 
-      <label style='display:flex;align-items:center;gap:6px;color:#94a3b8;font-size:.78rem'>
+      <div class='watch-sec'>Since Date</div>
 
+      <input class='watch-inp' id='wSinceDate' type='date' style='width:100%;'>
+
+    </div>
+
+    <div style='display:flex;flex-direction:column;gap:8px;margin-top:8px;'>
+
+      <label style='display:flex;align-items:center;gap:6px;color:#94a3b8;font-size:.78rem;cursor:pointer;'>
         <input type='checkbox' id='wIncludeCompleted' style='width:14px;height:14px'> Include Completed
+      </label>
 
+      <label style='display:flex;align-items:center;gap:6px;color:#94a3b8;font-size:.78rem;cursor:pointer;'>
+        <input type='checkbox' id='wAutoRetryEnabled' style='width:14px;height:14px' onchange='toggleAutoRetry(this.checked)'> Auto-Retry Failed
+      </label>
+
+      <label style='display:flex;align-items:center;gap:6px;color:#94a3b8;font-size:.78rem;cursor:pointer;'>
+        <input type='checkbox' id='wSoundEnabled' style='width:14px;height:14px' onchange='toggleSoundFromPanel(this.checked)'> Sound Alerts
+      </label>
+
+      <label style='display:flex;align-items:center;gap:6px;color:#94a3b8;font-size:.78rem;cursor:pointer;' title='Fetch full Report object with SourceSide%, DestSide%, Latency metrics'>
+        <input type='checkbox' id='wIncludeDetailReport' style='width:14px;height:14px' onchange='toggleIncludeDetailReport(this.checked)'> Include Detail Report
+      </label>
+
+      <label style='display:flex;align-items:center;gap:6px;color:#94a3b8;font-size:.78rem;cursor:pointer;'>
+        <input type='checkbox' id='wIncludeDetailInScheduled' style='width:14px;height:14px' onchange='toggleIncludeDetailInScheduled(this.checked)'> Detail in Sched. Reports
       </label>
 
     </div>
@@ -5101,6 +5207,77 @@ $(if($ListenerPort -gt 0){
 
       <button class='wbtn wbtn-s' onclick='apiSwitchAll()'>All</button>
 
+    </div>
+
+    <div class='watch-sec' style='margin-top:12px;border-top:1px solid #334155;padding-top:10px;'>📊 Quick Stats</div>
+
+    <div class='watch-stat'><span class='wl'>Retry Queue</span><span class='wv' id='wRetryQueue'>0</span></div>
+
+    <div class='watch-stat'><span class='wl'>Next Sched. Report</span><span class='wv' id='wNextReport' style='font-size:.7rem;'>&#x2014;</span></div>
+
+    <div class='watch-stat'><span class='wl'>Throughput</span><span class='wv' id='wThroughput'>&#x2014;</span></div>
+
+    <div class='watch-stat'><span class='wl'>Last Alert</span><span class='wv' id='wLastAlert' style='font-size:.7rem;'>&#x2014;</span></div>
+
+    <!-- SMTP/Alert Configuration Section -->
+    <div class='watch-sec' style='margin-top:12px;border-top:1px solid #334155;padding-top:10px;cursor:pointer;' onclick='toggleSmtpPanel()'>
+      📧 Email/Alert Config <span id='smtpChevron' style='float:right;'>▶</span>
+    </div>
+
+    <div id='smtpConfigPanel' style='display:none;'>
+      <div style='margin-bottom:8px;'>
+        <div class='watch-sec'>SMTP Server</div>
+        <input class='watch-inp' id='wSmtpServer' placeholder='smtp.example.com' type='text'>
+      </div>
+
+      <div style='display:grid;grid-template-columns:2fr 1fr;gap:8px;margin-bottom:8px;'>
+        <div>
+          <div class='watch-sec'>Port</div>
+          <input class='watch-inp' id='wSmtpPort' placeholder='25' type='number' value='25' style='width:100%;'>
+        </div>
+        <div style='display:flex;align-items:flex-end;'>
+          <label style='display:flex;align-items:center;gap:4px;color:#94a3b8;font-size:.75rem;cursor:pointer;'>
+            <input type='checkbox' id='wSmtpSsl' style='width:12px;height:12px;'> SSL
+          </label>
+        </div>
+      </div>
+
+      <div style='margin-bottom:8px;'>
+        <div class='watch-sec'>From Email</div>
+        <input class='watch-inp' id='wEmailFrom' placeholder='alerts@example.com' type='email'>
+      </div>
+
+      <div style='margin-bottom:8px;'>
+        <div class='watch-sec'>To Email(s)</div>
+        <input class='watch-inp' id='wEmailTo' placeholder='admin@example.com' type='text'>
+      </div>
+
+      <div style='margin-bottom:8px;'>
+        <div class='watch-sec'>Teams Webhook URL</div>
+        <input class='watch-inp' id='wTeamsWebhook' placeholder='https://outlook.office.com/webhook/...' type='url'>
+      </div>
+
+      <div style='display:flex;flex-direction:column;gap:6px;margin:10px 0;'>
+        <label style='display:flex;align-items:center;gap:6px;color:#94a3b8;font-size:.78rem;cursor:pointer;'>
+          <input type='checkbox' id='wAlertOnFailure' style='width:14px;height:14px;'> Alert on Failure
+        </label>
+        <label style='display:flex;align-items:center;gap:6px;color:#94a3b8;font-size:.78rem;cursor:pointer;'>
+          <input type='checkbox' id='wAlertOnComplete' style='width:14px;height:14px;'> Alert on Complete
+        </label>
+        <label style='display:flex;align-items:center;gap:6px;color:#94a3b8;font-size:.78rem;cursor:pointer;'>
+          <input type='checkbox' id='wAlertOnStall' style='width:14px;height:14px;'> Alert on Stall
+        </label>
+      </div>
+
+      <div style='margin-bottom:10px;'>
+        <div class='watch-sec'>Stall Threshold (min)</div>
+        <input class='watch-inp' id='wStallThreshold' type='number' value='30' min='5' max='1440' style='width:80px;'>
+      </div>
+
+      <div class='watch-btn-row'>
+        <button class='wbtn wbtn-p' style='flex:1;' onclick='saveAlertConfig()'>💾 Save Config</button>
+        <button class='wbtn wbtn-s' onclick='testEmailAlert()'>📧 Test</button>
+      </div>
     </div>
 
   </div>
@@ -5150,12 +5327,14 @@ $(if($ListenerPort -gt 0){
   };
 
   window.apiSwitch = function() {
-    var batch   = (document.getElementById('wBatchSel')||{}).value || '';
+    // Get selected batches from checkbox dropdown
+    var batch = getSelectedBatches();
     var mailbox = (document.getElementById('wMailboxInput')||{}).value || '';
     var incComp = (document.getElementById('wIncludeCompleted')||{}).checked || false;
+    var sinceDate = (document.getElementById('wSinceDate')||{}).value || '';
     setDot('stale');
     apiCall('/api/switch','POST',{
-      batch: batch, mailbox: mailbox, includeCompleted: incComp
+      batch: batch, mailbox: mailbox, includeCompleted: incComp, sincedate: sinceDate
     }).then(function(){
       nextRefreshAt = Date.now() + 2000;
     }).catch(function(){ setDot('err'); });
@@ -5212,33 +5391,334 @@ $(if($ListenerPort -gt 0){
 
   function loadBatches() {
     apiCall('/api/batches').then(function(batches) {
-      var sel = document.getElementById('wBatchSel');
-      if (!sel || !batches || !batches.length) return;
-      sel.innerHTML = '<option value="">All Batches</option>';
+      var container = document.getElementById('wBatchItems');
+      if (!container || !batches || !batches.length) return;
+      container.innerHTML = '';
       batches.forEach(function(b) {
-        var opt = document.createElement('option');
-        opt.value = b.Name;
-        opt.textContent = b.Name + ' (' + b.Count + ')';
-        sel.appendChild(opt);
+        var label = document.createElement('label');
+        label.className = 'batch-checkbox-item';
+        label.innerHTML = '<input type="checkbox" class="batch-cb" value="' + b.Name + '" onchange="updateBatchSelection()"> ' + b.Name + ' <span style="color:#64748b;">(' + b.Count + ')</span>';
+        container.appendChild(label);
       });
     }).catch(function(){});
+  }
+
+  // Toggle batch dropdown visibility
+  window.toggleBatchDropdown = function() {
+    var list = document.getElementById('wBatchList');
+    if (list) {
+      list.style.display = list.style.display === 'none' ? 'block' : 'none';
+    }
+  };
+
+  // Close dropdown when clicking outside
+  document.addEventListener('click', function(e) {
+    var dropdown = document.getElementById('wBatchDropdown');
+    var list = document.getElementById('wBatchList');
+    if (dropdown && list && !dropdown.contains(e.target)) {
+      list.style.display = 'none';
+    }
+  });
+
+  // Toggle all batches checkbox
+  window.toggleAllBatches = function(checked) {
+    var checkboxes = document.querySelectorAll('.batch-cb');
+    checkboxes.forEach(function(cb) { cb.checked = false; });
+    updateBatchLabel();
+  };
+
+  // Update batch selection when individual checkbox changes
+  window.updateBatchSelection = function() {
+    var allCheck = document.getElementById('wBatchAll');
+    var checkboxes = document.querySelectorAll('.batch-cb:checked');
+    if (allCheck) {
+      allCheck.checked = checkboxes.length === 0;
+    }
+    updateBatchLabel();
+  };
+
+  // Update the dropdown button label
+  function updateBatchLabel() {
+    var label = document.getElementById('wBatchLabel');
+    var checkboxes = document.querySelectorAll('.batch-cb:checked');
+    if (!label) return;
+    if (checkboxes.length === 0) {
+      label.textContent = 'All Batches';
+    } else if (checkboxes.length === 1) {
+      label.textContent = checkboxes[0].value;
+    } else {
+      label.textContent = checkboxes.length + ' batches selected';
+    }
+  }
+
+  // Get selected batches as comma-separated string
+  function getSelectedBatches() {
+    var checkboxes = document.querySelectorAll('.batch-cb:checked');
+    var batches = [];
+    checkboxes.forEach(function(cb) { batches.push(cb.value); });
+    return batches.join(',');
   }
 
   // Smooth countdown progress between polls
   function tickCountdown() {
     if (nextRefreshAt) {
-      var remaining = (nextRefreshAt - Date.now()) / 1000;
+      var remaining = Math.max(0, (nextRefreshAt - Date.now()) / 1000);
       var pct = ((watchInterval - remaining) / watchInterval) * 100;
       setProgress(pct);
+      // Update countdown display
+      var countdownEl = document.getElementById('wCountdown');
+      if (countdownEl) countdownEl.textContent = Math.ceil(remaining) + 's';
     }
   }
+
+  // ── New Dashboard Control Functions ──────────────────────────────────
+
+  // Format minutes to human readable (e.g., "5m", "1h 30m")
+  function formatInterval(minutes) {
+    var m = parseInt(minutes, 10);
+    if (m >= 60) {
+      var h = Math.floor(m / 60);
+      var rm = m % 60;
+      return rm > 0 ? h + 'h ' + rm + 'm' : h + 'h';
+    }
+    return m + 'm';
+  }
+
+  // Show interval value while dragging slider (slider is in minutes)
+  window.showIntervalValue = function(val) {
+    var el = document.getElementById('wIntervalValue');
+    if (el) el.textContent = formatInterval(val);
+  };
+
+  // Update refresh interval (slider is in minutes, server expects seconds)
+  window.updateInterval = function(val) {
+    var minutes = parseInt(val, 10);
+    if (minutes >= 1 && minutes <= 1440) {
+      var seconds = minutes * 60;
+      watchInterval = seconds;
+      // Send to server in seconds
+      apiCall('/api/settings', 'POST', { interval: seconds })
+        .then(function() {
+          nextRefreshAt = Date.now() + seconds * 1000;
+        })
+        .catch(function() {});
+    }
+  };
+
+  // Apply status filter - save to server and apply locally
+  window.applyStatusFilter = function() {
+    var statusFilter = (document.getElementById('wStatusFilter') || {}).value || '';
+    // Save to server for persistence
+    apiCall('/api/settings', 'POST', { statusFilter: statusFilter }).catch(function() {});
+    // Apply filters locally
+    if (typeof applyFilters === 'function') {
+      applyFilters();
+    }
+  };
+
+  // Toggle auto-retry from panel
+  window.toggleAutoRetry = function(enabled) {
+    apiCall('/api/settings', 'POST', { autoRetry: enabled })
+      .catch(function() {});
+  };
+
+  // Toggle sound from panel (sync with main sound toggle)
+  window.toggleSoundFromPanel = function(enabled) {
+    if (typeof window.soundEnabled !== 'undefined') {
+      window.soundEnabled = enabled;
+      localStorage.setItem('migrationSoundEnabled', enabled ? '1' : '0');
+      var btn = document.getElementById('sound-toggle');
+      if (btn) btn.textContent = enabled ? '🔔' : '🔕';
+    }
+  };
+
+  // Sync panel checkboxes with current state
+  function syncPanelState() {
+    // Sync sound toggle
+    var soundCheck = document.getElementById('wSoundEnabled');
+    if (soundCheck && typeof window.soundEnabled !== 'undefined') {
+      soundCheck.checked = window.soundEnabled;
+    }
+
+    // Fetch current settings from server
+    apiCall('/api/status').then(function(data) {
+      if (!data.ok) return;
+
+      // Update quick stats
+      setText('wRetryQueue', data.retryQueue || '0');
+      setText('wThroughput', (data.throughput || 0).toFixed(2) + ' GB/h');
+
+      if (data.nextScheduledReport) {
+        setText('wNextReport', data.nextScheduledReport);
+      }
+
+      if (data.lastAlert) {
+        setText('wLastAlert', data.lastAlert);
+      }
+
+      // Sync interval slider (server returns seconds, slider uses minutes)
+      if (data.interval) {
+        var slider = document.getElementById('wIntervalSlider');
+        var label = document.getElementById('wIntervalValue');
+        var minutes = Math.floor(data.interval / 60);
+        if (slider && slider.value != minutes) {
+          slider.value = minutes;
+          watchInterval = data.interval;
+        }
+        if (label) {
+          label.textContent = formatInterval(minutes);
+        }
+      }
+
+      // Sync auto-retry checkbox
+      var retryCheck = document.getElementById('wAutoRetryEnabled');
+      if (retryCheck && typeof data.autoRetryEnabled !== 'undefined') {
+        retryCheck.checked = data.autoRetryEnabled;
+      }
+
+      // Sync include detail report checkbox (for -IncludeDetailReport parameter)
+      var detailReportCheck = document.getElementById('wIncludeDetailReport');
+      if (detailReportCheck && typeof data.includeDetailReport !== 'undefined') {
+        detailReportCheck.checked = data.includeDetailReport;
+      }
+
+      // Sync include detail in scheduled reports checkbox
+      var detailSchedCheck = document.getElementById('wIncludeDetailInScheduled');
+      if (detailSchedCheck && typeof data.includeDetailInScheduled !== 'undefined') {
+        detailSchedCheck.checked = data.includeDetailInScheduled;
+      }
+
+      // Sync since date
+      var sinceDateInput = document.getElementById('wSinceDate');
+      if (sinceDateInput && data.currentSinceDate) {
+        sinceDateInput.value = data.currentSinceDate;
+      }
+
+      // Sync status filter and reapply filters
+      var statusFilterSelect = document.getElementById('wStatusFilter');
+      if (statusFilterSelect) {
+        if (data.currentStatusFilter) {
+          statusFilterSelect.value = data.currentStatusFilter;
+        }
+        // Reapply filters after sync to ensure status filter is applied
+        if (typeof applyFilters === 'function') {
+          applyFilters();
+        }
+      }
+    }).catch(function() {});
+  }
+
+  // Toggle Include Detail Report (-IncludeDetailReport parameter)
+  window.toggleIncludeDetailReport = function(enabled) {
+    apiCall('/api/settings', 'POST', { includeDetailReport: enabled })
+      .catch(function() {});
+  };
+
+  // Toggle Include Detail in Scheduled Reports
+  window.toggleIncludeDetailInScheduled = function(enabled) {
+    apiCall('/api/settings', 'POST', { includeDetailInScheduled: enabled })
+      .catch(function() {});
+  };
+
+  // Toggle SMTP configuration panel visibility
+  window.toggleSmtpPanel = function() {
+    var panel = document.getElementById('smtpConfigPanel');
+    var chev = document.getElementById('smtpChevron');
+    if (panel) {
+      var isHidden = panel.style.display === 'none';
+      panel.style.display = isHidden ? 'block' : 'none';
+      if (chev) chev.textContent = isHidden ? '▼' : '▶';
+      // Load current config when opening
+      if (isHidden) loadAlertConfig();
+    }
+  };
+
+  // Load current alert configuration
+  function loadAlertConfig() {
+    apiCall('/api/alert-config').then(function(cfg) {
+      if (!cfg) return;
+      var setVal = function(id, val) {
+        var el = document.getElementById(id);
+        if (el) el.value = val || '';
+      };
+      var setChk = function(id, val) {
+        var el = document.getElementById(id);
+        if (el) el.checked = !!val;
+      };
+      setVal('wSmtpServer', cfg.smtpServer);
+      setVal('wSmtpPort', cfg.smtpPort);
+      setChk('wSmtpSsl', cfg.smtpSsl);
+      setVal('wEmailFrom', cfg.smtpFrom);
+      setVal('wEmailTo', cfg.smtpTo);
+      setVal('wTeamsWebhook', cfg.teamsWebhook);
+      setChk('wAlertOnFailure', cfg.alertOnFail);
+      setChk('wAlertOnComplete', cfg.alertOnComplete);
+      setChk('wAlertOnStall', cfg.alertOnStall);
+      setVal('wStallThreshold', cfg.stallThreshold);
+    }).catch(function() {});
+  }
+
+  // Save alert configuration
+  window.saveAlertConfig = function() {
+    var getVal = function(id) {
+      var el = document.getElementById(id);
+      return el ? el.value : '';
+    };
+    var getChk = function(id) {
+      var el = document.getElementById(id);
+      return el ? el.checked : false;
+    };
+
+    var config = {
+      smtpServer: getVal('wSmtpServer'),
+      smtpPort: parseInt(getVal('wSmtpPort'), 10) || 587,
+      smtpSsl: getChk('wSmtpSsl'),
+      smtpFrom: getVal('wEmailFrom'),
+      smtpTo: getVal('wEmailTo'),
+      teamsWebhook: getVal('wTeamsWebhook'),
+      alertOnFail: getChk('wAlertOnFailure'),
+      alertOnComplete: getChk('wAlertOnComplete'),
+      alertOnStall: getChk('wAlertOnStall'),
+      stallThreshold: parseInt(getVal('wStallThreshold'), 10) || 30
+    };
+
+    apiCall('/api/alert-config', 'POST', config).then(function(res) {
+      if (res && res.ok) {
+        alert('Alert configuration saved successfully!');
+      } else {
+        alert('Failed to save configuration: ' + (res.error || 'Unknown error'));
+      }
+    }).catch(function(err) {
+      alert('Error saving configuration: ' + err);
+    });
+  };
+
+  // Test email alert
+  window.testEmailAlert = function() {
+    var btn = document.querySelector('#smtpConfigPanel button:last-child');
+    if (btn) btn.disabled = true;
+
+    apiCall('/api/test-alert', 'POST', {}).then(function(res) {
+      if (res && res.ok) {
+        alert('Test alert sent successfully! Check your email/Teams.');
+      } else {
+        alert('Failed to send test alert: ' + (res.error || 'Unknown error'));
+      }
+    }).catch(function(err) {
+      alert('Error sending test alert: ' + err);
+    }).finally(function() {
+      if (btn) btn.disabled = false;
+    });
+  };
 
   // Start polling
   window.addEventListener('load', function() {
     loadBatches();
     pollStatus();
+    syncPanelState();
     setInterval(pollStatus, 3000);         // status poll every 3s
     setInterval(tickCountdown, 500);       // smooth progress every 0.5s
+    setInterval(syncPanelState, 10000);    // sync panel state every 10s
   });
 })();
 </script>
@@ -5473,11 +5953,63 @@ function Start-WatchListener {
                             iteration    = [int]$State['Iteration']
                             mailboxCount = [int]$State['MailboxCount']
                             currentScope = "$($State['CurrentScope'])"
+                            currentSinceDate = "$($State['CurrentSinceDate'])"
+                            currentStatusFilter = "$($State['CurrentStatusFilter'])"
                             isRefreshing = [bool]$State['IsRefreshing']
                             interval     = [int]$State['Interval']
                             nextIn       = [int]$State['NextIn']
+                            retryQueue   = [int]$State['RetryQueue']
+                            autoRetryEnabled = [bool]$State['AutoRetryEnabled']
+                            throughput   = if ($State['Throughput']) { [double]$State['Throughput'] } else { 0 }
+                            nextScheduledReport = if ($State['NextScheduledReport']) { $State['NextScheduledReport'] } else { $null }
+                            lastAlert    = if ($State['LastAlert']) { $State['LastAlert'] } else { $null }
+                            includeDetailReport = [bool]$State['IncludeDetailReport']
+                            includeDetailInScheduled = [bool]$State['IncludeDetailInScheduled']
                         } | ConvertTo-Json -Compress
                         $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+                    }
+                    elseif ($path -eq '/api/settings' -and $req.HttpMethod -eq 'POST') {
+                        $contentType = 'application/json; charset=utf-8'
+                        try {
+                            $body = [System.IO.StreamReader]::new($req.InputStream).ReadToEnd()
+                            $settings = $body | ConvertFrom-Json
+
+                            # Update interval if provided
+                            if ($settings.interval) {
+                                $newInterval = [int]$settings.interval
+                                if ($newInterval -ge 60 -and $newInterval -le 86400) {
+                                    $State['Interval'] = $newInterval
+                                    [void]$State['PendingCommands'].Add(@{ Action = 'UpdateInterval'; Interval = $newInterval })
+                                }
+                            }
+
+                            # Update auto-retry if provided
+                            if ($null -ne $settings.autoRetry) {
+                                $State['AutoRetryEnabled'] = [bool]$settings.autoRetry
+                                [void]$State['PendingCommands'].Add(@{ Action = 'UpdateAutoRetry'; Enabled = [bool]$settings.autoRetry })
+                            }
+
+                            # Update include detail report (-IncludeDetailReport parameter) if provided
+                            if ($null -ne $settings.includeDetailReport) {
+                                $State['IncludeDetailReport'] = [bool]$settings.includeDetailReport
+                                [void]$State['PendingCommands'].Add(@{ Action = 'UpdateIncludeDetailReport'; Enabled = [bool]$settings.includeDetailReport })
+                            }
+
+                            # Update include detail in scheduled reports if provided
+                            if ($null -ne $settings.includeDetailInScheduled) {
+                                $State['IncludeDetailInScheduled'] = [bool]$settings.includeDetailInScheduled
+                                [void]$State['PendingCommands'].Add(@{ Action = 'UpdateIncludeDetailInScheduled'; Enabled = [bool]$settings.includeDetailInScheduled })
+                            }
+
+                            # Update status filter if provided
+                            if ($null -ne $settings.statusFilter) {
+                                $State['CurrentStatusFilter'] = "$($settings.statusFilter)"
+                            }
+
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true,"message":"Settings updated"}')
+                        } catch {
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"Invalid settings"}')
+                        }
                     }
                     elseif ($path -eq '/api/batches') {
                         $contentType = 'application/json; charset=utf-8'
@@ -5487,7 +6019,7 @@ function Start-WatchListener {
                     }
                     elseif ($path -eq '/api/refresh') {
                         $contentType = 'application/json; charset=utf-8'
-                        $State['PendingCommand'] = @{ Action = 'refresh' }
+                        [void]$State['PendingCommands'].Add(@{ Action = 'refresh' })
                         $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true,"message":"Refresh queued"}')
                     }
                     elseif ($path -eq '/api/switch') {
@@ -5500,13 +6032,13 @@ function Start-WatchListener {
                                 $reader.Close()
                             }
                             $d = $reqBody | ConvertFrom-Json
-                            $State['PendingCommand'] = @{
+                            [void]$State['PendingCommands'].Add(@{
                                 Action           = 'switch'
                                 Batch            = "$($d.batch)"
                                 Mailbox          = "$($d.mailbox)"
                                 SinceDate        = "$($d.sincedate)"
                                 IncludeCompleted = [bool]$d.includeCompleted
-                            }
+                            })
                             $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true,"message":"Switch queued"}')
                         } catch {
                             $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"Invalid request"}')
@@ -5619,6 +6151,67 @@ function Start-WatchListener {
                             $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"QueueCount":0,"Log":[]}')
                         }
                     }
+                    elseif ($path -eq '/api/alert-config') {
+                        $contentType = 'application/json; charset=utf-8'
+                        if ($req.HttpMethod -eq 'GET') {
+                            # Return current alert configuration
+                            try {
+                                $alertCfg = $State['AlertConfig']
+                                if ($alertCfg) {
+                                    $responseBytes = [System.Text.Encoding]::UTF8.GetBytes(($alertCfg | ConvertTo-Json -Compress))
+                                } else {
+                                    # Return defaults
+                                    $defaults = @{
+                                        smtpServer = ''
+                                        smtpPort = 587
+                                        smtpSsl = $true
+                                        smtpFrom = ''
+                                        smtpTo = ''
+                                        teamsWebhook = ''
+                                        alertOnFail = $true
+                                        alertOnComplete = $false
+                                        alertOnStall = $true
+                                        stallThreshold = 30
+                                    }
+                                    $responseBytes = [System.Text.Encoding]::UTF8.GetBytes(($defaults | ConvertTo-Json -Compress))
+                                }
+                            } catch {
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"error":"Failed to get config"}')
+                            }
+                        } else {
+                            # POST - Save alert configuration
+                            try {
+                                $body = [System.IO.StreamReader]::new($req.InputStream).ReadToEnd()
+                                $newConfig = $body | ConvertFrom-Json
+
+                                $State['AlertConfig'] = @{
+                                    smtpServer = "$($newConfig.smtpServer)"
+                                    smtpPort = [int]$newConfig.smtpPort
+                                    smtpSsl = [bool]$newConfig.smtpSsl
+                                    smtpFrom = "$($newConfig.smtpFrom)"
+                                    smtpTo = "$($newConfig.smtpTo)"
+                                    teamsWebhook = "$($newConfig.teamsWebhook)"
+                                    alertOnFail = [bool]$newConfig.alertOnFail
+                                    alertOnComplete = [bool]$newConfig.alertOnComplete
+                                    alertOnStall = [bool]$newConfig.alertOnStall
+                                    stallThreshold = [int]$newConfig.stallThreshold
+                                }
+                                [void]$State['PendingCommands'].Add(@{ Action = 'UpdateAlertConfig'; Config = $State['AlertConfig'] })
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true,"message":"Alert configuration saved"}')
+                            } catch {
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"Invalid configuration"}')
+                            }
+                        }
+                    }
+                    elseif ($path -eq '/api/test-alert') {
+                        $contentType = 'application/json; charset=utf-8'
+                        try {
+                            [void]$State['PendingCommands'].Add(@{ Action = 'TestAlert' })
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true,"message":"Test alert queued"}')
+                        } catch {
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"Failed to queue test alert"}')
+                        }
+                    }
                     else {
                         $contentType = 'application/json; charset=utf-8'
                         $resp.StatusCode = 404
@@ -5713,7 +6306,7 @@ function Invoke-MigrationReport {
         [switch]$WatchMode,
 
         [Parameter(ParameterSetName = "Live")]
-        [ValidateRange(10,3600)]
+        [ValidateRange(10,86400)]
         [int]$RefreshIntervalSeconds = 60,
 
         [Parameter(ParameterSetName = "Live")]
@@ -6020,18 +6613,38 @@ if ($MyInvocation.InvocationName -ne '.') {
             Running       = $true
             ListenerReady = $false
             ListenerError = ''
-            PendingCommand= $null
+            PendingCommands = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
             LastRefresh   = $null
             Iteration     = 0
             MailboxCount  = 0
             IsRefreshing  = $false
             CurrentScope  = if ($MigrationBatchName) { $MigrationBatchName } elseif ($Mailbox) { $Mailbox -join ',' } else { 'All' }
+            CurrentSinceDate = if ($SinceDate) { $SinceDate.ToString('yyyy-MM-dd') } else { '' }
+            CurrentStatusFilter = ''
             Interval      = $RefreshIntervalSeconds
             NextIn        = $RefreshIntervalSeconds
             Batches       = @()
-
             ReportFile    = $reportFile
-
+            # New fields for enhanced dashboard
+            RetryQueue    = 0
+            AutoRetryEnabled = $AutoRetryFailed.IsPresent
+            Throughput    = 0
+            NextScheduledReport = $null
+            LastAlert     = $null
+            IncludeDetailReport = $IncludeDetailReport.IsPresent
+            IncludeDetailInScheduled = $IncludeDetailInScheduledReport.IsPresent
+            AlertConfig   = @{
+                smtpServer = $SmtpServer
+                smtpPort = $SmtpPort
+                smtpSsl = $SmtpUseSsl.IsPresent
+                smtpFrom = $SmtpFrom
+                smtpTo = $AlertEmailTo
+                teamsWebhook = $TeamsWebhookUrl
+                alertOnFail = $AlertOnFailure.IsPresent
+                alertOnComplete = $AlertOnCompletion.IsPresent
+                alertOnStall = $AlertOnStall.IsPresent
+                stallThreshold = $StallThresholdMinutes
+            }
         })
 
         # ── Start HTTP listener in background runspace ────────────────────────
@@ -6097,15 +6710,54 @@ if ($MyInvocation.InvocationName -ne '.') {
 
                 Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Iteration $iteration — $($watchState['CurrentScope'])..." -ForegroundColor DarkCyan
 
+                # Show current applied settings before refresh
+                $settingsList = @()
+                if ($invokeParams.ContainsKey('IncludeDetailReport') -and $invokeParams.IncludeDetailReport) { $settingsList += 'DetailReport' }
+                if ($invokeParams.ContainsKey('IncludeCompleted') -and $invokeParams.IncludeCompleted) { $settingsList += 'IncludeCompleted' }
+                if ($invokeParams.ContainsKey('SinceDate')) { $settingsList += "Since:$($invokeParams.SinceDate.ToString('yyyy-MM-dd'))" }
+                if ($retryConfig.Enabled) { $settingsList += 'AutoRetry' }
+                if ($scheduleConfig.Enabled) { $settingsList += "SchedReport:$($scheduleConfig.Schedule)" }
+                if ($scheduleConfig.IncludeDetail) { $settingsList += 'SchedDetail' }
+                if ($settingsList.Count -gt 0) {
+                    Write-Host "  [Settings] $($settingsList -join ' | ')" -ForegroundColor DarkGray
+                }
+
                 $result = Invoke-MigrationReport @invokeParams
 
                 $watchState['LastRefresh']  = Get-Date
                 $watchState['IsRefreshing'] = $false
-                if ($result) { $watchState['MailboxCount'] = $result.MailboxCount }
+                if ($result) {
+                    $watchState['MailboxCount'] = $result.MailboxCount
+                    $watchState['Throughput'] = $result.TotalThroughputGBPerHour
+                    $watchState['CachedMailboxes'] = $result.PerMailboxDetail
+                }
+
+                # ── Update next scheduled report time ────────────────────────────────────
+                if ($scheduleConfig.Enabled) {
+                    $now = Get-Date
+                    $targetTime = [datetime]::ParseExact($scheduleConfig.ReportTime, 'H:mm', $null)
+                    $nextReport = $now.Date.AddHours($targetTime.Hour).AddMinutes($targetTime.Minute)
+
+                    if ($scheduleConfig.Schedule -eq 'Hourly') {
+                        $nextReport = $now.Date.AddHours($now.Hour + 1)
+                    }
+                    elseif ($scheduleConfig.Schedule -eq 'Daily') {
+                        if ($nextReport -le $now) { $nextReport = $nextReport.AddDays(1) }
+                    }
+                    elseif ($scheduleConfig.Schedule -eq 'Weekly') {
+                        $daysUntil = ($scheduleConfig.DayOfWeek - [int]$now.DayOfWeek + 7) % 7
+                        if ($daysUntil -eq 0 -and $nextReport -le $now) { $daysUntil = 7 }
+                        $nextReport = $now.Date.AddDays($daysUntil).AddHours($targetTime.Hour).AddMinutes($targetTime.Minute)
+                    }
+                    $watchState['NextScheduledReport'] = $nextReport.ToString('MM/dd HH:mm')
+                }
 
                 # ── Check for alert conditions ──────────────────────────────────────
                 if ($alertsEnabled -and $result -and $result.PerMailboxDetail) {
-                    Check-MigrationAlerts -Mailboxes $result.PerMailboxDetail -Summary $result -AlertConfig $alertConfig
+                    $alertsSent = Check-MigrationAlerts -Mailboxes $result.PerMailboxDetail -Summary $result -AlertConfig $alertConfig
+                    if ($alertsSent) {
+                        $watchState['LastAlert'] = (Get-Date).ToString('HH:mm:ss')
+                    }
                 }
 
                 # ── Auto-Retry failed migrations ────────────────────────────────────────
@@ -6194,10 +6846,11 @@ if ($MyInvocation.InvocationName -ne '.') {
                                    -PercentComplete ([math]::Round((($RefreshIntervalSeconds - $i) / $RefreshIntervalSeconds) * 100))
                     Start-Sleep -Seconds 1
 
-                    # Check for command from browser API
-                    if ($watchState['PendingCommand']) {
-                        $cmd = $watchState['PendingCommand']
-                        $watchState['PendingCommand'] = $null
+                    # Check for commands from browser API (process all queued commands)
+                    $shouldBreak = $false
+                    while ($watchState['PendingCommands'].Count -gt 0) {
+                        $cmd = $watchState['PendingCommands'][0]
+                        $watchState['PendingCommands'].RemoveAt(0)
 
                         Write-Host "  [API] Command received: $($cmd.Action)" -ForegroundColor Magenta
 
@@ -6205,26 +6858,135 @@ if ($MyInvocation.InvocationName -ne '.') {
                             # Update invoke params based on what was requested
                             if ($cmd.Batch -and $cmd.Batch -ne '') {
                                 $invokeParams.Remove('Mailbox')
-                                $invokeParams.MigrationBatchName = $cmd.Batch
-                                $watchState['CurrentScope'] = "Batch: $($cmd.Batch)"
+                                # Support multiple batches (comma-separated)
+                                $batchList = @($cmd.Batch -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+                                if ($batchList.Count -eq 1) {
+                                    $invokeParams.MigrationBatchName = $batchList[0]
+                                    $watchState['CurrentScope'] = "Batch: $($batchList[0])"
+                                    Write-Host "  [API] Scope changed to Batch: $($batchList[0])" -ForegroundColor Cyan
+                                } else {
+                                    $invokeParams.MigrationBatchName = $batchList
+                                    $watchState['CurrentScope'] = "Batches: $($batchList.Count) selected"
+                                    Write-Host "  [API] Scope changed to $($batchList.Count) batches: $($batchList -join ', ')" -ForegroundColor Cyan
+                                }
                             } elseif ($cmd.Mailbox -and $cmd.Mailbox -ne '') {
                                 $invokeParams.Remove('MigrationBatchName')
                                 $invokeParams.Mailbox = @($cmd.Mailbox -split ',')
                                 $watchState['CurrentScope'] = "Mailbox: $($cmd.Mailbox)"
+                                Write-Host "  [API] Scope changed to Mailbox: $($cmd.Mailbox)" -ForegroundColor Cyan
                             } else {
                                 # All — clear filters
                                 $invokeParams.Remove('Mailbox')
                                 $invokeParams.Remove('MigrationBatchName')
                                 $watchState['CurrentScope'] = 'All'
+                                Write-Host "  [API] Scope changed to All" -ForegroundColor Cyan
                             }
-                            if ($cmd.IncludeCompleted) { $invokeParams.IncludeCompleted = $true }
+                            if ($cmd.IncludeCompleted) {
+                                $invokeParams.IncludeCompleted = $true
+                                Write-Host "  [API] Include Completed enabled" -ForegroundColor Cyan
+                            }
                             if ($cmd.SinceDate -and $cmd.SinceDate -ne '') {
-                                try { $invokeParams.SinceDate = [datetime]$cmd.SinceDate } catch {}
+                                try {
+                                    $invokeParams.SinceDate = [datetime]$cmd.SinceDate
+                                    $watchState['CurrentSinceDate'] = $cmd.SinceDate
+                                    Write-Host "  [API] Since Date set to $($cmd.SinceDate)" -ForegroundColor Cyan
+                                } catch {}
+                            } else {
+                                $invokeParams.Remove('SinceDate')
+                                $watchState['CurrentSinceDate'] = ''
                             }
                         }
-                        # Break countdown to refresh immediately
-                        break
+                        elseif ($cmd.Action -eq 'refresh') {
+                            Write-Host "  [API] Manual refresh requested" -ForegroundColor Cyan
+                        }
+                        elseif ($cmd.Action -eq 'UpdateInterval') {
+                            $RefreshIntervalSeconds = $cmd.Interval
+                            $watchState['Interval'] = $cmd.Interval
+                            Write-Host "  [API] Refresh interval updated to $($cmd.Interval)s" -ForegroundColor Cyan
+                        }
+                        elseif ($cmd.Action -eq 'UpdateAutoRetry') {
+                            $retryConfig.Enabled = $cmd.Enabled
+                            $watchState['AutoRetryEnabled'] = $cmd.Enabled
+                            Write-Host "  [API] Auto-Retry $(if($cmd.Enabled){'enabled'}else{'disabled'})" -ForegroundColor Cyan
+                        }
+                        elseif ($cmd.Action -eq 'UpdateIncludeDetailReport') {
+                            $invokeParams.IncludeDetailReport = $cmd.Enabled
+                            $watchState['IncludeDetailReport'] = $cmd.Enabled
+                            Write-Host "  [API] Include Detail Report $(if($cmd.Enabled){'enabled'}else{'disabled'})" -ForegroundColor Cyan
+                        }
+                        elseif ($cmd.Action -eq 'UpdateIncludeDetailInScheduled') {
+                            $scheduleConfig.IncludeDetail = $cmd.Enabled
+                            $watchState['IncludeDetailInScheduled'] = $cmd.Enabled
+                            Write-Host "  [API] Include Detail in Scheduled Reports $(if($cmd.Enabled){'enabled'}else{'disabled'})" -ForegroundColor Cyan
+                        }
+                        elseif ($cmd.Action -eq 'UpdateAlertConfig') {
+                            $cfg = $cmd.Config
+                            if ($cfg) {
+                                $script:SmtpServer = $cfg.smtpServer
+                                $script:SmtpPort = $cfg.smtpPort
+                                $script:SmtpUseSsl = $cfg.smtpSsl
+                                $script:SmtpFrom = $cfg.smtpFrom
+                                $script:AlertEmailTo = $cfg.smtpTo
+                                $script:TeamsWebhookUrl = $cfg.teamsWebhook
+                                $script:AlertOnFailure = $cfg.alertOnFail
+                                $script:AlertOnCompletion = $cfg.alertOnComplete
+                                $script:AlertOnStall = $cfg.alertOnStall
+                                $script:StallThresholdMinutes = $cfg.stallThreshold
+                                Write-Host "  [API] Alert configuration updated" -ForegroundColor Cyan
+                            }
+                        }
+                        elseif ($cmd.Action -eq 'TestAlert') {
+                            Write-Host "  [API] Sending test alert..." -ForegroundColor Cyan
+                            $testSubject = "Migration Monitor - Test Alert"
+                            $testBody = "This is a test alert from the Migration Analysis tool.`n`nTimestamp: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`nServer: $env:COMPUTERNAME"
+
+                            # Try email
+                            $alertCfg = $watchState['AlertConfig']
+                            if ($alertCfg.smtpServer -and $alertCfg.smtpFrom -and $alertCfg.smtpTo) {
+                                try {
+                                    $emailParams = @{
+                                        From       = $alertCfg.smtpFrom
+                                        To         = $alertCfg.smtpTo
+                                        Subject    = $testSubject
+                                        Body       = $testBody
+                                        SmtpServer = $alertCfg.smtpServer
+                                        Port       = $alertCfg.smtpPort
+                                    }
+                                    if ($alertCfg.smtpSsl) { $emailParams['UseSsl'] = $true }
+                                    Send-MailMessage @emailParams -ErrorAction Stop
+                                    Write-Host "  [API] Test email sent successfully" -ForegroundColor Green
+                                } catch {
+                                    Write-Host "  [API] Test email failed: $($_.Exception.Message)" -ForegroundColor Red
+                                }
+                            }
+
+                            # Try Teams
+                            if ($alertCfg.teamsWebhook) {
+                                try {
+                                    $teamsCard = @{
+                                        '@type'    = 'MessageCard'
+                                        '@context' = 'http://schema.org/extensions'
+                                        summary    = $testSubject
+                                        themeColor = '0076D7'
+                                        title      = $testSubject
+                                        text       = $testBody -replace "`n", "<br>"
+                                    }
+                                    Invoke-RestMethod -Uri $alertCfg.teamsWebhook -Method Post -Body ($teamsCard | ConvertTo-Json -Depth 5) -ContentType 'application/json' -ErrorAction Stop
+                                    Write-Host "  [API] Test Teams message sent successfully" -ForegroundColor Green
+                                } catch {
+                                    Write-Host "  [API] Test Teams message failed: $($_.Exception.Message)" -ForegroundColor Red
+                                }
+                            }
+
+                            $watchState['LastAlert'] = (Get-Date).ToString('HH:mm:ss')
+                        }
+                        # Mark that we should break to refresh after processing all commands
+                        if ($cmd.Action -eq 'refresh' -or $cmd.Action -eq 'switch') {
+                            $shouldBreak = $true
+                        }
                     }
+                    # Break countdown to refresh immediately if needed
+                    if ($shouldBreak) { break }
                 }
                 Write-Progress -Activity "Watch Mode" -Completed
             }
