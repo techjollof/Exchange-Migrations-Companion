@@ -5553,6 +5553,7 @@ $(if($ListenerPort -gt 0){
 
   // Smooth countdown progress between polls
   function tickCountdown() {
+    if (isPaused) return; // Don't update countdown when paused
     if (nextRefreshAt) {
       var remaining = Math.max(0, (nextRefreshAt - Date.now()) / 1000);
       var pct = ((watchInterval - remaining) / watchInterval) * 100;
