@@ -5628,6 +5628,27 @@ $(if($ListenerPort -gt 0){
           applyFilters();
         }
       }
+
+      // Sync paused state
+      if (typeof data.isPaused !== 'undefined') {
+        isPaused = data.isPaused;
+        var btn = document.getElementById('wPauseBtn');
+        var countdownEl = document.getElementById('wCountdown');
+        if (isPaused) {
+          if (btn) {
+            btn.innerHTML = '&#x25B6; Resume';
+            btn.classList.remove('wbtn-s');
+            btn.classList.add('wbtn-p');
+          }
+          if (countdownEl) countdownEl.textContent = 'PAUSED';
+        } else {
+          if (btn) {
+            btn.innerHTML = '&#x23F8; Pause';
+            btn.classList.remove('wbtn-p');
+            btn.classList.add('wbtn-s');
+          }
+        }
+      }
     }).catch(function() {});
   }
 
@@ -5988,6 +6009,7 @@ function Start-WatchListener {
                             lastAlert    = if ($State['LastAlert']) { $State['LastAlert'] } else { $null }
                             includeDetailReport = [bool]$State['IncludeDetailReport']
                             includeDetailInScheduled = [bool]$State['IncludeDetailInScheduled']
+                            isPaused     = [bool]$State['IsPaused']
                         } | ConvertTo-Json -Compress
                         $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
                     }
@@ -6663,6 +6685,7 @@ if ($MyInvocation.InvocationName -ne '.') {
             LastAlert     = $null
             IncludeDetailReport = $IncludeDetailReport.IsPresent
             IncludeDetailInScheduled = $IncludeDetailInScheduledReport.IsPresent
+            IsPaused      = $false
             AlertConfig   = @{
                 smtpServer = $SmtpServer
                 smtpPort = $SmtpPort
@@ -6708,12 +6731,12 @@ if ($MyInvocation.InvocationName -ne '.') {
         }
 
         Write-Host ""
-        Write-Host "  ████████████████████████████████████████████████████████" -ForegroundColor Cyan
+        Write-Host "  #############################################################################" -ForegroundColor Cyan
         Write-Host "  WATCH MODE  —  refreshing every $RefreshIntervalSeconds seconds" -ForegroundColor Cyan
         Write-Host "  Report : $reportFile" -ForegroundColor Cyan
         Write-Host "  API    : $apiUrl" -ForegroundColor Cyan
         Write-Host "  Ctrl+C : stop" -ForegroundColor Cyan
-        Write-Host "  ████████████████████████████████████████████████████████" -ForegroundColor Cyan
+        Write-Host "  #############################################################################" -ForegroundColor Cyan
         Write-Host ""
 
         # ── Pre-fetch batch list from EXO for the control panel ───────────────
@@ -6734,6 +6757,44 @@ if ($MyInvocation.InvocationName -ne '.') {
 
         try {
             while ($true) {
+                # Check if paused - skip refresh but still process commands
+                if ($watchState['IsPaused']) {
+                    Write-Host "[$(Get-Date -Format 'HH:mm:ss')] PAUSED - waiting for resume..." -ForegroundColor Yellow
+
+                    # Wait loop while paused - still process commands
+                    while ($watchState['IsPaused']) {
+                        Start-Sleep -Seconds 1
+
+                        # Process any pending commands while paused
+                        while ($watchState['PendingCommands'].Count -gt 0) {
+                            $cmd = $watchState['PendingCommands'][0]
+                            $watchState['PendingCommands'].RemoveAt(0)
+
+                            Write-Host "  [API] Command received: $($cmd.Action)" -ForegroundColor Magenta
+
+                            if ($cmd.Action -eq 'UpdatePaused' -and -not $cmd.Paused) {
+                                $watchState['IsPaused'] = $false
+                                Write-Host "  [API] Auto-refresh RESUMED" -ForegroundColor Green
+                                break
+                            }
+                            elseif ($cmd.Action -eq 'refresh') {
+                                # Allow manual refresh even when paused
+                                Write-Host "  [API] Manual refresh requested (overriding pause)" -ForegroundColor Cyan
+                                $watchState['IsPaused'] = $false
+                                break
+                            }
+                            elseif ($cmd.Action -eq 'UpdatePaused' -and $cmd.Paused) {
+                                # Already paused, just acknowledge
+                            }
+                            else {
+                                # Queue other commands for later processing
+                                [void]$watchState['PendingCommands'].Add($cmd)
+                            }
+                        }
+                    }
+                    Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Resuming auto-refresh..." -ForegroundColor Green
+                }
+
                 $iteration++
                 $watchState['Iteration']    = $iteration
                 $watchState['IsRefreshing'] = $true
@@ -6964,6 +7025,14 @@ if ($MyInvocation.InvocationName -ne '.') {
                             }
                             $watchState['CurrentStatusFilter'] = $invokeParams.StatusFilter
                             Write-Host "  [API] Status Filter changed to $($invokeParams.StatusFilter)" -ForegroundColor Cyan
+                        }
+                        elseif ($cmd.Action -eq 'UpdatePaused') {
+                            $watchState['IsPaused'] = $cmd.Paused
+                            if ($cmd.Paused) {
+                                Write-Host "  [API] Auto-refresh PAUSED" -ForegroundColor Yellow
+                            } else {
+                                Write-Host "  [API] Auto-refresh RESUMED" -ForegroundColor Green
+                            }
                         }
                         elseif ($cmd.Action -eq 'TestAlert') {
                             Write-Host "  [API] Sending test alert..." -ForegroundColor Cyan
