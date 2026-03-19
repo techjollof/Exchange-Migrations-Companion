@@ -49,7 +49,7 @@
     Press Ctrl+C to stop. Only valid in Live mode.
 
 .PARAMETER RefreshIntervalSeconds
-    Interval between report refreshes in watch mode. Default: 60 seconds. Range: 10–86400 (24 hours).
+    Interval between report refreshes in watch mode. Default: 300 seconds. Range: 10–86400 (24 hours).
 
 .PARAMETER ListenerPort
     TCP port for the local HTTP API used by the browser control panel in watch mode.
@@ -1116,7 +1116,7 @@ function Process-FailedMigrations {
 
     $now = Get-Date
     $failedMailboxes = @($Mailboxes | Where-Object {
-        $_.StatusDetail -eq 'Failed' -or $_.Status -eq 'Failed'
+        $_.Status -eq 'Failed'
     })
 
     foreach ($mbx in $failedMailboxes) {
@@ -1124,8 +1124,7 @@ function Process-FailedMigrations {
         if (-not $key) { $key = $mbx.DisplayName }
         if (-not $key) { continue }
 
-        $errorMsg = $mbx.Message
-        if (-not $errorMsg) { $errorMsg = $mbx.FailureMessage }
+        $errorMsg = $mbx.LastFailure
 
         # Check if error is retryable
         if (-not (Test-RetryableError -ErrorMessage $errorMsg -Patterns $RetryConfig.ErrorPatterns)) {
@@ -1397,10 +1396,10 @@ function New-ScheduledReportHtml {
             <div class="section">
                 <h2>📈 Overall Progress</h2>
                 <div style="margin-bottom:8px;">
-                    <span style="font-weight:600;">$([math]::Round($Summary.OverallPercentComplete, 1))%</span> Complete
+                    <span style="font-weight:600;">$([math]::Round($Summary.PercentComplete, 1))%</span> Complete
                 </div>
                 <div class="progress-bar">
-                    <div class="progress-fill" style="width:$([math]::Round($Summary.OverallPercentComplete, 1))%"></div>
+                    <div class="progress-fill" style="width:$([math]::Round($Summary.PercentComplete, 1))%"></div>
                 </div>
             </div>
 
@@ -1408,9 +1407,9 @@ function New-ScheduledReportHtml {
                 <h2>📊 Performance Metrics</h2>
                 <table>
                     <tr><td style="width:50%"><strong>Total Data Size</strong></td><td>$([math]::Round($Summary.TotalSourceSizeGB, 2)) GB</td></tr>
-                    <tr><td><strong>Data Transferred</strong></td><td>$([math]::Round($Summary.TotalTransferredGB, 2)) GB</td></tr>
+                    <tr><td><strong>Data Transferred</strong></td><td>$([math]::Round($Summary.TotalGBTransferred, 2)) GB</td></tr>
                     <tr><td><strong>Throughput</strong></td><td>$([math]::Round($Summary.TotalThroughputGBPerHour, 2)) GB/hour</td></tr>
-                    <tr><td><strong>Avg Transfer Rate</strong></td><td>$([math]::Round($Summary.AverageTransferRateMBPerHour, 2)) MB/hour</td></tr>
+                    <tr><td><strong>Avg Transfer Rate</strong></td><td>$([math]::Round($Summary.AvgPerMoveTransferRateGBPerHour * 1024, 2)) MB/hour</td></tr>
                     $(if($Summary.EstimatedCompletionTime){"<tr><td><strong>Est. Completion</strong></td><td>$($Summary.EstimatedCompletionTime.ToString('yyyy-MM-dd HH:mm'))</td></tr>"})
                 </table>
             </div>
@@ -1428,7 +1427,7 @@ function New-ScheduledReportHtml {
                     <tbody>
 "@
         foreach ($mbx in $failedMailboxes) {
-            $errorMsg = if ($mbx.Message) { $mbx.Message.Substring(0, [Math]::Min(100, $mbx.Message.Length)) } else { 'Unknown error' }
+            $errorMsg = if ($mbx.LastFailure) { $mbx.LastFailure.Substring(0, [Math]::Min(100, $mbx.LastFailure.Length)) } else { 'Unknown error' }
             $html += "                        <tr><td>$($mbx.DisplayName)</td><td style='color:#ef4444;'>$errorMsg</td></tr>`n"
         }
         $html += @"
@@ -1455,7 +1454,7 @@ function New-ScheduledReportHtml {
                 'Failed'     { 'status-failed' }
                 default      { '' }
             }
-            $html += "                        <tr><td>$($mbx.DisplayName)</td><td class='$statusClass'>$($mbx.StatusDetail)</td><td>$([math]::Round($mbx.PercentComplete, 1))%</td><td>$([math]::Round($mbx.TotalMailboxSizeGB, 2))</td><td>$([math]::Round($mbx.BytesTransferredGB, 2)) GB</td></tr>`n"
+            $html += "                        <tr><td>$($mbx.DisplayName)</td><td class='$statusClass'>$($mbx.Status)</td><td>$([math]::Round($mbx.PercentComplete, 1))%</td><td>$([math]::Round($mbx.MailboxSizeGB, 2))</td><td>$([math]::Round($mbx.TransferredGB, 2)) GB</td></tr>`n"
         }
         if ($Mailboxes.Count -gt 50) {
             $html += "                        <tr><td colspan='5' style='text-align:center;color:#94a3b8;'>... and $($Mailboxes.Count - 50) more mailboxes</td></tr>`n"
@@ -1511,7 +1510,7 @@ function Send-ScheduledReport {
     $htmlBody = New-ScheduledReportHtml -Summary $Summary -Mailboxes $Mailboxes `
         -IncludeDetail $ScheduleConfig.IncludeDetail -Schedule $ScheduleConfig.Schedule
 
-    $subject = "[$periodLabel] Migration Report - $([math]::Round($Summary.OverallPercentComplete, 1))% Complete - $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
+    $subject = "[$periodLabel] Migration Report - $([math]::Round($Summary.PercentComplete, 1))% Complete - $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
 
     # Determine recipients
     $recipients = if ($ScheduleConfig.EmailTo) { $ScheduleConfig.EmailTo } else { $AlertConfig.EmailTo }
@@ -1562,11 +1561,8 @@ function Get-MoveRequests {
 
         # Status filter
         $moves = switch ($StatusFilter) {
-            "All"   { if ($IncludeCompleted) { $all } else { $all | Where-Object { $_.Status -ne 'Queued' } } }
+            "All"   { if ($IncludeCompleted) { $all } else { $all | Where-Object { $_.Status -ne 'Completed' -and $_.Status -ne 'CompletedWithWarning' -and $_.Status -ne 'CompletedWithSkippedItems' } } }
             default { $all | Where-Object { $_.Status -eq $StatusFilter } }
-        }
-        if (-not $IncludeCompleted -and $StatusFilter -eq "All") {
-            $moves = @($moves) | Where-Object { $_.Status -ne 'Queued' }
         }
 
         # MigrationBatchName filter
@@ -1629,7 +1625,7 @@ function Get-MoveRequests {
                             @($direct) | ForEach-Object { $directMatched.Add($_) }
                             Write-Console "  Direct lookup '$filter' — found $(@($direct).Count) move(s)." -Level INFO
                         }
-                    } catch {}
+                    } catch { Write-Console "  Direct lookup '$filter' failed: $($_.Exception.Message)" -Level WARN }
                 }
                 $moves = if ($directMatched.Count -gt 0) { $directMatched.ToArray() } else { @() }
             } else {
@@ -1828,7 +1824,7 @@ function Get-MoveStats {
                     try {
                         $fs = Get-MoveRequestStatistics -Identity $item.Guid -ErrorAction Stop
                         if ($fs) { $fastStatMap["$($fs.ExchangeGuid)"] = $fs }
-                    } catch {}
+                    } catch { Write-Console "  Stats fetch failed for $($item.Guid): $($_.Exception.Message)" -Level WARN }
                 }
             }
 
@@ -1854,7 +1850,7 @@ function Get-MoveStats {
                     try {
                         $fs = Get-MoveRequestStatistics -Identity $item.Guid -ErrorAction Stop
                         if ($fs) { $fastStatMap["$($fs.ExchangeGuid)"] = $fs }
-                    } catch {}
+                    } catch { Write-Console "    Stats retry failed for $($item.Guid): $($_.Exception.Message)" -Level WARN }
                 }
             }
         }
@@ -6823,55 +6819,58 @@ function Start-WatchListener {
     #>
     param(
         [int]$Port,
-        [System.Collections.Hashtable]$State
+        [System.Collections.Hashtable]$State,
+        [switch]$NoPortKill
     )
 
-    # Kill any existing process using this port
-    Write-Host "  Checking for processes using port $Port..." -ForegroundColor DarkGray
-    try {
-        # Method 1: Use Get-NetTCPConnection (more reliable on Windows)
-        $connections = Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue
-        foreach ($conn in $connections) {
-            if ($conn.OwningProcess -and $conn.OwningProcess -ne 0) {
-                try {
-                    $proc = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
-                    if ($proc) {
-                        Write-Host "  Killing process '$($proc.ProcessName)' (PID $($conn.OwningProcess)) using port $Port" -ForegroundColor Yellow
-                        Stop-Process -Id $conn.OwningProcess -Force -ErrorAction SilentlyContinue
-                        Start-Sleep -Milliseconds 500
-                    }
-                } catch {}
-            }
-        }
-    } catch {
-        # Method 2: Fallback to netstat if Get-NetTCPConnection fails
+    if (-not $NoPortKill) {
+        # Kill any existing process using this port
+        Write-Host "  Checking for processes using port $Port..." -ForegroundColor DarkGray
         try {
-            $netstat = netstat -ano 2>$null | Select-String "[:.]$Port\s" | ForEach-Object {
-                if ($_ -match '\s+(\d+)\s*$') { $Matches[1] }
-            } | Where-Object { $_ -and $_ -ne '0' } | Select-Object -Unique
-
-            foreach ($procId in $netstat) {
-                try {
-                    $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
-                    if ($proc) {
-                        Write-Host "  Killing process '$($proc.ProcessName)' (PID $procId) using port $Port" -ForegroundColor Yellow
-                        Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
-                        Start-Sleep -Milliseconds 500
-                    }
-                } catch {}
+            # Method 1: Use Get-NetTCPConnection (more reliable on Windows)
+            $connections = Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue
+            foreach ($conn in $connections) {
+                if ($conn.OwningProcess -and $conn.OwningProcess -ne 0) {
+                    try {
+                        $proc = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
+                        if ($proc) {
+                            Write-Host "  Killing process '$($proc.ProcessName)' (PID $($conn.OwningProcess)) using port $Port" -ForegroundColor Yellow
+                            Stop-Process -Id $conn.OwningProcess -Force -ErrorAction SilentlyContinue
+                            Start-Sleep -Milliseconds 500
+                        }
+                    } catch {}
+                }
             }
+        } catch {
+            # Method 2: Fallback to netstat if Get-NetTCPConnection fails
+            try {
+                $netstat = netstat -ano 2>$null | Select-String "[:.]$Port\s" | ForEach-Object {
+                    if ($_ -match '\s+(\d+)\s*$') { $Matches[1] }
+                } | Where-Object { $_ -and $_ -ne '0' } | Select-Object -Unique
+
+                foreach ($procId in $netstat) {
+                    try {
+                        $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
+                        if ($proc) {
+                            Write-Host "  Killing process '$($proc.ProcessName)' (PID $procId) using port $Port" -ForegroundColor Yellow
+                            Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+                            Start-Sleep -Milliseconds 500
+                        }
+                    } catch {}
+                }
+            } catch {}
+        }
+
+        # Also try to delete any HTTP URL reservation that might be blocking
+        try {
+            $null = netsh http delete urlacl url="http://127.0.0.1:$Port/" 2>$null
+            $null = netsh http delete urlacl url="http://localhost:$Port/" 2>$null
+            $null = netsh http delete urlacl url="http://+:$Port/" 2>$null
         } catch {}
+
+        # Small delay to ensure port is released
+        Start-Sleep -Milliseconds 300
     }
-
-    # Also try to delete any HTTP URL reservation that might be blocking
-    try {
-        $null = netsh http delete urlacl url="http://127.0.0.1:$Port/" 2>$null
-        $null = netsh http delete urlacl url="http://localhost:$Port/" 2>$null
-        $null = netsh http delete urlacl url="http://+:$Port/" 2>$null
-    } catch {}
-
-    # Small delay to ensure port is released
-    Start-Sleep -Milliseconds 300
 
     $listenerScript = {
         param([int]$Port, [System.Collections.Hashtable]$State)
@@ -7024,9 +7023,20 @@ function Start-WatchListener {
                     }
                     elseif ($path -eq '/api/batches') {
                         $contentType = 'application/json; charset=utf-8'
-                        $b = $State['Batches']
-                        $json = if ($b -and $b.Count -gt 0) { $b | ConvertTo-Json -Compress } else { '[]' }
-                        $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+                        try {
+                            $cachedMailboxes = $State['CachedMailboxes']
+                            if ($cachedMailboxes -and $cachedMailboxes.Count -gt 0) {
+                                $batchGroups = $cachedMailboxes | Group-Object -Property BatchName | Where-Object { $_.Name } | Sort-Object Name
+                                $batchList = @($batchGroups | ForEach-Object { @{ Name = $_.Name; Count = $_.Count } })
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes(($batchList | ConvertTo-Json -Compress))
+                            } else {
+                                $b = $State['Batches']
+                                $json = if ($b -and $b.Count -gt 0) { $b | ConvertTo-Json -Compress } else { '[]' }
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+                            }
+                        } catch {
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('[]')
+                        }
                     }
                     elseif ($path -eq '/api/refresh') {
                         $contentType = 'application/json; charset=utf-8'
@@ -7181,21 +7191,21 @@ function Start-WatchListener {
 
                                     if ($batchMailboxes -and @($batchMailboxes).Count -gt 0) {
                                         $batchArray = @($batchMailboxes)
-                                        $completedCount = @($batchArray | Where-Object { $_.StatusDetail -eq 'Completed' -or $_.Status -eq 'Completed' }).Count
-                                        $inProgressCount = @($batchArray | Where-Object { $_.StatusDetail -like '*Progress*' -or $_.Status -eq 'InProgress' }).Count
-                                        $failedCount = @($batchArray | Where-Object { $_.StatusDetail -eq 'Failed' -or $_.Status -eq 'Failed' }).Count
+                                        $completedCount = @($batchArray | Where-Object { $_.Status -eq 'Completed' -or $_.Status -eq 'CompletedWithWarning' -or $_.Status -eq 'CompletedWithSkippedItems' }).Count
+                                        $inProgressCount = @($batchArray | Where-Object { $_.Status -eq 'InProgress' }).Count
+                                        $failedCount = @($batchArray | Where-Object { $_.Status -eq 'Failed' }).Count
 
-                                        $totalSourceGB = ($batchArray | Measure-Object -Property TotalMailboxSizeGB -Sum).Sum
-                                        $totalTransferredGB = ($batchArray | Measure-Object -Property BytesTransferredGB -Sum).Sum
+                                        $totalSourceGB = ($batchArray | Measure-Object -Property MailboxSizeGB -Sum).Sum
+                                        $totalTransferredGB = ($batchArray | Measure-Object -Property TransferredGB -Sum).Sum
                                         $avgPercent = ($batchArray | Measure-Object -Property PercentComplete -Average).Average
-                                        $avgTransferRate = ($batchArray | Where-Object { $_.TransferRateMBPerHour -gt 0 } | Measure-Object -Property TransferRateMBPerHour -Average).Average
+                                        $avgTransferRateGBph = ($batchArray | Where-Object { $_.TransferRateGBph -gt 0 } | Measure-Object -Property TransferRateGBph -Average).Average
 
-                                        # Calculate throughput
+                                        # Calculate throughput using InProgressDuration (TimeSpan)
                                         $totalThroughput = 0
                                         if ($totalSourceGB -gt 0 -and $avgPercent -gt 0) {
-                                            $avgDuration = ($batchArray | Where-Object { $_.TotalInProgressDurationHours -gt 0 } | Measure-Object -Property TotalInProgressDurationHours -Average).Average
-                                            if ($avgDuration -gt 0) {
-                                                $totalThroughput = [math]::Round($totalTransferredGB / $avgDuration, 2)
+                                            $avgDurationHours = ($batchArray | Where-Object { $_.InProgressDuration -and $_.InProgressDuration.TotalHours -gt 0 } | ForEach-Object { $_.InProgressDuration.TotalHours } | Measure-Object -Average).Average
+                                            if ($avgDurationHours -gt 0) {
+                                                $totalThroughput = [math]::Round($totalTransferredGB / $avgDurationHours, 2)
                                             }
                                         }
 
@@ -7209,7 +7219,7 @@ function Start-WatchListener {
                                             TotalSourceSizeGB = [math]::Round($totalSourceGB, 2)
                                             TotalTransferredGB = [math]::Round($totalTransferredGB, 2)
                                             TotalThroughputGBPerHour = $totalThroughput
-                                            AvgTransferRateMBPerHour = [math]::Round($avgTransferRate, 2)
+                                            AvgTransferRateMBPerHour = [math]::Round($avgTransferRateGBph * 1024, 2)
                                             MoveEfficiency = $moveEfficiency
                                             CompletedCount = $completedCount
                                             InProgressCount = $inProgressCount
@@ -7225,24 +7235,6 @@ function Start-WatchListener {
                             }
                         } catch {
                             $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"Failed to get batch stats"}')
-                        }
-                    }
-                    elseif ($path -eq '/api/batches') {
-                        # Return list of all batch names with counts for the comparison selector
-                        $contentType = 'application/json; charset=utf-8'
-                        try {
-                            $cachedMailboxes = $State['CachedMailboxes']
-                            if ($cachedMailboxes -and $cachedMailboxes.Count -gt 0) {
-                                $batchGroups = $cachedMailboxes | Group-Object -Property BatchName | Where-Object { $_.Name } | Sort-Object Name
-                                $batchList = @($batchGroups | ForEach-Object {
-                                    @{ Name = $_.Name; Count = $_.Count }
-                                })
-                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes(($batchList | ConvertTo-Json -Compress))
-                            } else {
-                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('[]')
-                            }
-                        } catch {
-                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('[]')
                         }
                     }
                     elseif ($path -eq '/api/retry-status') {
@@ -7414,7 +7406,7 @@ function Invoke-MigrationReport {
 
         [Parameter(ParameterSetName = "Live")]
         [ValidateRange(10,86400)]
-        [int]$RefreshIntervalSeconds = 60,
+        [int]$RefreshIntervalSeconds = 300,
 
         [Parameter(ParameterSetName = "Live")]
         [ValidateRange(1024,65535)]
@@ -7743,11 +7735,11 @@ if ($MyInvocation.InvocationName -ne '.') {
                 smtpServer = $SmtpServer
                 smtpPort = $SmtpPort
                 smtpSsl = $SmtpUseSsl.IsPresent
-                smtpFrom = $SmtpFrom
+                smtpFrom = $AlertEmailFrom
                 smtpTo = $AlertEmailTo
                 teamsWebhook = $TeamsWebhookUrl
                 alertOnFail = $AlertOnFailure.IsPresent
-                alertOnComplete = $AlertOnCompletion.IsPresent
+                alertOnComplete = $AlertOnComplete.IsPresent
                 alertOnStall = $AlertOnStall.IsPresent
                 stallThreshold = $StallThresholdMinutes
             }
@@ -7817,9 +7809,10 @@ if ($MyInvocation.InvocationName -ne '.') {
                         Start-Sleep -Seconds 1
 
                         # Process any pending commands while paused
-                        while ($watchState['PendingCommands'].Count -gt 0) {
-                            $cmd = $watchState['PendingCommands'][0]
-                            $watchState['PendingCommands'].RemoveAt(0)
+                        $pendingCount = $watchState['PendingCommands'].Count
+                        for ($pi = $pendingCount - 1; $pi -ge 0; $pi--) {
+                            $cmd = $watchState['PendingCommands'][$pi]
+                            $watchState['PendingCommands'].RemoveAt($pi)
 
                             Write-Console "Command received: $($cmd.Action)" -Level API
 
@@ -7829,17 +7822,17 @@ if ($MyInvocation.InvocationName -ne '.') {
                                 break
                             }
                             elseif ($cmd.Action -eq 'refresh') {
-                                # Allow manual refresh even when paused
                                 Write-Console "Manual refresh requested (overriding pause)" -Level API
                                 $watchState['IsPaused'] = $false
                                 break
                             }
                             elseif ($cmd.Action -eq 'UpdatePaused' -and $cmd.Paused) {
-                                # Already paused, just acknowledge
+                                # Already paused, acknowledge silently
                             }
+                            # All other commands (scope change, filter, etc.) are deferred
+                            # by leaving them in the queue — they will be processed after resume
                             else {
-                                # Queue other commands for later processing
-                                [void]$watchState['PendingCommands'].Add($cmd)
+                                $watchState['PendingCommands'].Add($cmd) | Out-Null
                             }
                         }
                     }
@@ -7963,9 +7956,9 @@ if ($MyInvocation.InvocationName -ne '.') {
                     $trendPoint = @{
                         Timestamp       = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss')
                         TimeLabel       = (Get-Date).ToString('HH:mm')
-                        PercentComplete = $result.OverallPercentComplete
+                        PercentComplete = $result.PercentComplete
                         TransferRateGBh = $result.TotalThroughputGBPerHour
-                        TransferredGB   = $result.TotalTransferredGB
+                        TransferredGB   = $result.TotalGBTransferred
                         CompletedCount  = ($result.PerMailboxDetail | Where-Object { $_.Status -eq 'Completed' }).Count
                         InProgressCount = ($result.PerMailboxDetail | Where-Object { $_.Status -eq 'InProgress' }).Count
                         FailedCount     = ($result.PerMailboxDetail | Where-Object { $_.Status -eq 'Failed' }).Count
@@ -8102,7 +8095,7 @@ if ($MyInvocation.InvocationName -ne '.') {
                                     $watchState['CurrentScope'] = "Batch: $($batchList[0])"
                                     Write-Console "Scope changed to Batch: $($batchList[0])" -Level API -NoTimestamp
                                 } else {
-                                    $invokeParams.MigrationBatchName = $batchList
+                                    $invokeParams.MigrationBatchName = $batchList -join ','
                                     $watchState['CurrentScope'] = "Batches: $($batchList.Count) selected"
                                     Write-Console "Scope changed to $($batchList.Count) batches: $($batchList -join ', ')" -Level API -NoTimestamp
                                 }
@@ -8118,16 +8111,16 @@ if ($MyInvocation.InvocationName -ne '.') {
                                 $watchState['CurrentScope'] = 'All'
                                 Write-Console "Scope changed to All" -Level API -NoTimestamp
                             }
-                            if ($cmd.IncludeCompleted) {
-                                $invokeParams.IncludeCompleted = $true
-                                Write-Console "Include Completed enabled" -Level API -NoTimestamp
+                            if ($null -ne $cmd.IncludeCompleted) {
+                                $invokeParams.IncludeCompleted = [bool]$cmd.IncludeCompleted
+                                Write-Console "Include Completed set to $($cmd.IncludeCompleted)" -Level API -NoTimestamp
                             }
                             if ($cmd.SinceDate -and $cmd.SinceDate -ne '') {
                                 try {
                                     $invokeParams.SinceDate = [datetime]$cmd.SinceDate
                                     $watchState['CurrentSinceDate'] = $cmd.SinceDate
                                     Write-Console "Since Date set to $($cmd.SinceDate)" -Level API -NoTimestamp
-                                } catch {}
+                                } catch { Write-Console "Invalid SinceDate value '$($cmd.SinceDate)': $($_.Exception.Message)" -Level WARN }
                             } else {
                                 $invokeParams.Remove('SinceDate')
                                 $watchState['CurrentSinceDate'] = ''
@@ -8159,16 +8152,31 @@ if ($MyInvocation.InvocationName -ne '.') {
                         elseif ($cmd.Action -eq 'UpdateAlertConfig') {
                             $cfg = $cmd.Config
                             if ($cfg) {
-                                $script:SmtpServer = $cfg.smtpServer
-                                $script:SmtpPort = $cfg.smtpPort
-                                $script:SmtpUseSsl = $cfg.smtpSsl
-                                $script:SmtpFrom = $cfg.smtpFrom
-                                $script:AlertEmailTo = $cfg.smtpTo
-                                $script:TeamsWebhookUrl = $cfg.teamsWebhook
-                                $script:AlertOnFailure = $cfg.alertOnFail
-                                $script:AlertOnCompletion = $cfg.alertOnComplete
-                                $script:AlertOnStall = $cfg.alertOnStall
-                                $script:StallThresholdMinutes = $cfg.stallThreshold
+                                $alertConfig.SmtpServer           = $cfg.smtpServer
+                                $alertConfig.SmtpPort             = $cfg.smtpPort
+                                $alertConfig.SmtpUseSsl           = $cfg.smtpSsl
+                                $alertConfig.EmailFrom            = $cfg.smtpFrom
+                                $alertConfig.EmailTo              = $cfg.smtpTo
+                                $alertConfig.TeamsWebhookUrl      = $cfg.teamsWebhook
+                                $alertConfig.AlertOnFailure       = $cfg.alertOnFail
+                                $alertConfig.AlertOnComplete      = $cfg.alertOnComplete
+                                $alertConfig.AlertOnStall         = $cfg.alertOnStall
+                                $alertConfig.StallThresholdMinutes= $cfg.stallThreshold
+                                # Recompute alertsEnabled so new settings take effect immediately
+                                $alertsEnabled = $alertConfig.AlertOnFailure -or $alertConfig.AlertOnComplete -or $alertConfig.AlertOnStall
+                                # Keep watch-state schema in smtp* form for UI + test-alert endpoints.
+                                $watchState['AlertConfig'] = @{
+                                    smtpServer    = $alertConfig.SmtpServer
+                                    smtpPort      = $alertConfig.SmtpPort
+                                    smtpSsl       = [bool]$alertConfig.SmtpUseSsl
+                                    smtpFrom      = $alertConfig.EmailFrom
+                                    smtpTo        = $alertConfig.EmailTo
+                                    teamsWebhook  = $alertConfig.TeamsWebhookUrl
+                                    alertOnFail   = [bool]$alertConfig.AlertOnFailure
+                                    alertOnComplete = [bool]$alertConfig.AlertOnComplete
+                                    alertOnStall  = [bool]$alertConfig.AlertOnStall
+                                    stallThreshold = [int]$alertConfig.StallThresholdMinutes
+                                }
                                 Write-Console "Alert configuration updated" -Level API -NoTimestamp
                             }
                         }
