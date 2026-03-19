@@ -1149,7 +1149,7 @@ function New-ScheduledReportHtml {
         .header h1 { margin: 0 0 8px 0; font-size: 1.5rem; }
         .header p { margin: 0; opacity: 0.9; font-size: 0.9rem; }
         .content { padding: 24px; }
-        .kpi-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }
+        .kpi-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 16px; margin-bottom: 24px; }
         .kpi { background: #f1f5f9; border-radius: 8px; padding: 16px; text-align: center; }
         .kpi-value { font-size: 1.8rem; font-weight: 700; color: #1e293b; }
         .kpi-label { font-size: 0.8rem; color: #64748b; margin-top: 4px; }
@@ -2893,7 +2893,7 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
   .score-desc  { font-size:0.9rem; color:#64748b; margin-top:4px; }
 
   /* KPI grid */
-  .kpi-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:16px; margin-bottom:20px; }
+  .kpi-grid { display:grid; grid-template-columns:repeat(6,1fr); gap:16px; margin-bottom:20px; }
   .kpi { background:white; border-radius:12px; padding:18px 20px;
          box-shadow:0 1px 4px rgba(0,0,0,.06); border-top:4px solid #e2e8f0; }
   .kpi.blue  { border-color:#3b82f6; }
