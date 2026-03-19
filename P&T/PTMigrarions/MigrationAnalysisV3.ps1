@@ -2373,7 +2373,9 @@ function Invoke-ProcessStats {
     # Measure-Object with all flags in one call avoids re-enumerating the collection.
     # [math]::Round() cannot take an inline if-expression as an argument —
     # resolve to a variable first, then round.
-    $ratesMeasure = $filtered |
+    # Use all mailboxes with non-zero rates (not the percentile-filtered set) so that
+    # Max/Min/Avg reflect the full active population, not just the top-N subset.
+    $ratesMeasure = $perMailbox |
                     Where-Object   { $_.TransferRateGBph -gt 0 } |
                     Measure-Object -Property TransferRateGBph -Maximum -Minimum -Average
 
