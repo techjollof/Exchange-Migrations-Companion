@@ -903,15 +903,6 @@ function Invoke-MigrationRetry {
 }
 
 function Get-MigrationTrend {
-    <#
-    .SYNOPSIS
-        Extracts migration trend data from Report.Entries for charting progress over time.
-    .DESCRIPTION
-        Parses the Report.Entries collection to extract progress points, transfer points,
-        and anchor points (start/complete) for visualizing migration progress.
-    .PARAMETER InputObject
-        A MoveRequestStatistics object (with Report), a MoveReport object, or Report.Entries collection.
-    #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory, ValueFromPipeline)]
@@ -935,117 +926,174 @@ function Get-MigrationTrend {
         return $obj
     }
 
-    # Timezone-safe elapsed minutes — always compare in UTC
-    function Get-ElapsedMin ([datetime]$eventTime, [datetime]$start) {
-        [math]::Round(($eventTime.ToUniversalTime() - $start.ToUniversalTime()).TotalMinutes, 2)
+    function ToLocal ([object]$dt) {
+        if ($null -eq $dt) { return $null }
+        return $dt.ToLocalTime()
     }
 
-    $entries   = $null
-    $startTime = $null
+    # ── Input resolution ─────────────────────────────────────────────────────
+    $entries    = $null
+    $startTime  = $null
+    $hasAnchors = $false
 
     if ($InputObject.PSObject.Properties['StartTimestamp'] -and
         $InputObject.PSObject.Properties['Report']) {
-        # Full stats object
-        $entries   = $InputObject.Report.Entries
-        $startTime = $InputObject.StartTimestamp
+        Write-Verbose "Input: MoveRequestStatistics — anchors and totals available"
+        $entries    = $InputObject.Report.Entries
+        $startTime  = $InputObject.StartTimestamp
+        $hasAnchors = $true
 
     } elseif ($InputObject.PSObject.Properties['Entries']) {
-        # Report object
+        Write-Verbose "Input: MoveReport — no anchors"
         $entries   = $InputObject.Entries
         $startTime = $null
 
     } elseif ((Get-FirstItem $InputObject).PSObject.Properties['CreationTime']) {
-        # Entry collection
+        Write-Verbose "Input: Entry collection — no anchors"
         $entries   = $InputObject
         $startTime = $null
 
     } else {
-        Write-Console "InputObject must be a MoveRequestStatistics, MoveReport, or Report.Entries collection" -Level Warn
-        return @()
+        Write-Error "InputObject must be a MoveRequestStatistics, MoveReport, or Report.Entries collection"
+        return
     }
 
-    if (-not $entries -or $entries.Count -eq 0) {
-        return @()
+    if (-not $hasAnchors) {
+        Write-Warning "Running in fallback mode: Start/Complete anchors unavailable. Pass the full MoveRequestStatistics object for best results."
     }
 
-    # Fall back to first entry's CreationTime when no StartTimestamp available
     if ($null -eq $startTime) {
         $startTime = ($entries | Sort-Object CreationTime | Select-Object -First 1).CreationTime
     }
 
-    # Progress points — Stage + PercentComplete from log messages
+    # ── 1. Progress points ───────────────────────────────────────────────────
     $progressPoints = $entries |
         Where-Object { $_.Message.ToString() -like '*Percent complete*' } |
         ForEach-Object {
             $msg = $_.Message.ToString()
             [PSCustomObject]@{
                 Type             = 'Progress'
-                Timestamp        = $_.CreationTime
-                ElapsedMin       = Get-ElapsedMin $_.CreationTime $startTime
+                Timestamp        = ToLocal $_.CreationTime
                 Stage            = [regex]::Match($msg, 'Stage:\s*(\w+)').Groups[1].Value
                 PercentComplete  = [int][regex]::Match($msg, 'Percent complete:\s*(\d+)').Groups[1].Value
+                SizeLabel        = $null
                 BytesTransferred = $null
+                BytesTotal       = $null
                 ItemsTransferred = $null
+                ItemsTotal       = $null
+                FoldersCompleted = $null
+                FoldersTotal     = $null
             }
         }
 
-    # Transfer points — parse bytes directly from seeding/sync completion messages
+    # ── 2. Transfer points ───────────────────────────────────────────────────
     $transferPoints = $entries |
         Where-Object {
             $msg = $_.Message.ToString()
+            $msg -like '*Copy progress:*'           -or
             $msg -like '*items copied, total size*' -or
             $msg -like '*seeding completed*'        -or
             $msg -like '*content changes applied*'
         } |
         ForEach-Object {
-            $msg   = $_.Message.ToString()
-            $bytes = 0
-            $items = 0
-
-            # "Initial seeding completed, 21 items copied, total size 54.54 KB (55,846 bytes)"
-            $mBytes = [regex]::Match($msg, '\(([0-9,]+)\s*bytes\)')
-            if ($mBytes.Success) {
-                $bytes = [int64]($mBytes.Groups[1].Value -replace ',')
-            }
-
-            $mItems = [regex]::Match($msg, '(\d+)\s+items copied')
-            if ($mItems.Success) {
-                $items = [int]$mItems.Groups[1].Value
-            }
-
-            [PSCustomObject]@{
+            $msg  = $_.Message.ToString()
+            $p    = [PSCustomObject]@{
                 Type             = 'Transfer'
-                Timestamp        = $_.CreationTime
-                ElapsedMin       = Get-ElapsedMin $_.CreationTime $startTime
+                Timestamp        = ToLocal $_.CreationTime
                 Stage            = $null
                 PercentComplete  = $null
-                BytesTransferred = $bytes
-                ItemsTransferred = $items
+                SizeLabel        = $null
+                BytesTransferred = $null
+                BytesTotal       = $null
+                ItemsTransferred = $null
+                ItemsTotal       = $null
+                FoldersCompleted = $null
+                FoldersTotal     = $null
+            }
+
+            if ($msg -like '*Copy progress:*') {
+                $m = [regex]::Match($msg, '(\d+)/(\d+) messages')
+                if ($m.Success) { $p.ItemsTransferred = [int]$m.Groups[1].Value; $p.ItemsTotal = [int]$m.Groups[2].Value }
+
+                $m = [regex]::Match($msg, '\(([0-9,]+) bytes\)/')
+                if ($m.Success) { $p.BytesTransferred = [int64]($m.Groups[1].Value -replace ',') }
+
+                $m = [regex]::Match($msg, '/[\d.]+ \w+ \(([0-9,]+) bytes\)')
+                if ($m.Success) { $p.BytesTotal = [int64]($m.Groups[1].Value -replace ',') }
+
+                $m = [regex]::Match($msg, 'messages,\s+([\d.]+ \w+)\s+\(')
+                if ($m.Success) { $p.SizeLabel = $m.Groups[1].Value }
+
+                $m = [regex]::Match($msg, '(\d+)/(\d+) folders')
+                if ($m.Success) { $p.FoldersCompleted = [int]$m.Groups[1].Value; $p.FoldersTotal = [int]$m.Groups[2].Value }
+
+            } elseif ($msg -like '*content changes applied*') {
+                $m = [regex]::Match($msg, 'Total (\d+)')
+                if ($m.Success) { $p.ItemsTransferred = [int]$m.Groups[1].Value }
+
+            } else {
+                # Seeding complete
+                $m = [regex]::Match($msg, '\(([0-9,]+)\s*bytes\)')
+                if ($m.Success) { $p.BytesTransferred = [int64]($m.Groups[1].Value -replace ',') }
+
+                $m = [regex]::Match($msg, '(\d+)\s+items copied')
+                if ($m.Success) { $p.ItemsTransferred = [int]$m.Groups[1].Value }
+
+                $m = [regex]::Match($msg, 'total size\s+([\d.]+\s*\w+)\s+\(')
+                if ($m.Success) { $p.SizeLabel = $m.Groups[1].Value }
+            }
+            $p
+        }
+
+    # ── 3. Anchors ───────────────────────────────────────────────────────────
+    $anchors = @()
+    if ($hasAnchors) {
+        $totalLabel = $InputObject.TotalMailboxSize.ToString()
+
+        if ($InputObject.StartTimestamp) {
+            $anchors += [PSCustomObject]@{
+                Type             = 'Anchor'
+                Timestamp        = ToLocal $InputObject.StartTimestamp
+                Stage            = 'Start'
+                PercentComplete  = 0
+                SizeLabel        = $totalLabel
+                BytesTransferred = 0
+                BytesTotal       = ConvertTo-Bytes $InputObject.TotalMailboxSize
+                ItemsTransferred = 0
+                ItemsTotal       = $InputObject.TotalMailboxItemCount
+                FoldersCompleted = 0
+                FoldersTotal     = $null
             }
         }
 
-    # Anchors — only when we have the full stats object
-    $anchors = @()
-    if ($InputObject.PSObject.Properties['StartTimestamp'] -and $InputObject.StartTimestamp) {
-        $anchors += [PSCustomObject]@{
-            Type             = 'Anchor'
-            Timestamp        = $InputObject.StartTimestamp
-            ElapsedMin       = 0
-            Stage            = 'Start'
-            PercentComplete  = 0
-            BytesTransferred = 0
-            ItemsTransferred = 0
-        }
-    }
-    if ($InputObject.PSObject.Properties['CompletionTimestamp'] -and $InputObject.CompletionTimestamp) {
-        $anchors += [PSCustomObject]@{
-            Type             = 'Anchor'
-            Timestamp        = $InputObject.CompletionTimestamp
-            ElapsedMin       = Get-ElapsedMin $InputObject.CompletionTimestamp $startTime
-            Stage            = 'Complete'
-            PercentComplete  = $InputObject.PercentComplete
-            BytesTransferred = ConvertTo-Bytes $InputObject.BytesTransferred
-            ItemsTransferred = $InputObject.ItemsTransferred
+        if ($InputObject.CompletionTimestamp) {
+            $anchors += [PSCustomObject]@{
+                Type             = 'Anchor'
+                Timestamp        = ToLocal $InputObject.CompletionTimestamp
+                Stage            = 'Complete'
+                PercentComplete  = $InputObject.PercentComplete
+                SizeLabel        = $totalLabel
+                BytesTransferred = ConvertTo-Bytes $InputObject.BytesTransferred
+                BytesTotal       = ConvertTo-Bytes $InputObject.TotalMailboxSize
+                ItemsTransferred = $InputObject.ItemsTransferred
+                ItemsTotal       = $InputObject.TotalMailboxItemCount
+                FoldersCompleted = $null
+                FoldersTotal     = $null
+            }
+        } else {
+            $anchors += [PSCustomObject]@{
+                Type             = 'Anchor'
+                Timestamp        = ToLocal $InputObject.LastUpdateTimestamp
+                Stage            = 'InProgress'
+                PercentComplete  = $InputObject.PercentComplete
+                SizeLabel        = $totalLabel
+                BytesTransferred = ConvertTo-Bytes $InputObject.BytesTransferred
+                BytesTotal       = ConvertTo-Bytes $InputObject.TotalMailboxSize
+                ItemsTransferred = $InputObject.ItemsTransferred
+                ItemsTotal       = $InputObject.TotalMailboxItemCount
+                FoldersCompleted = $null
+                FoldersTotal     = $null
+            }
         }
     }
 
@@ -4384,111 +4432,107 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     var trendContainer = document.getElementById('mdTrendSection');
     if (!trendContainer) return;
 
-    // Separate data by type
-    var progressPoints = data.filter(function(d) { return d.Type === 'Progress' || d.Type === 'Anchor'; });
-    var transferPoints = data.filter(function(d) { return d.Type === 'Transfer' || d.Type === 'Anchor'; });
+    // Sort chronologically
+    var sorted = data.slice().sort(function(a, b) {
+      if (!a.Timestamp) return -1;
+      if (!b.Timestamp) return 1;
+      return new Date(a.Timestamp) - new Date(b.Timestamp);
+    });
 
-    // Build metrics table - show all events
+    var progressPoints = sorted.filter(function(d) { return d.Type === 'Progress' || d.Type === 'Anchor'; });
+    var transferPoints = sorted.filter(function(d) { return d.Type === 'Transfer' || d.Type === 'Anchor'; });
+
+    // Extract totals from anchor
+    var totalGB = null, totalItems = null;
+    sorted.forEach(function(d) {
+      if (d.Type === 'Anchor') {
+        if (d.TotalGB    != null && totalGB    === null) totalGB    = d.TotalGB;
+        if (d.ItemsTotal != null && totalItems === null) totalItems = d.ItemsTotal;
+      }
+    });
+
+    // Timeline table (newest first)
     var tableHtml = "<div class='mbx-section-title'>Migration Timeline</div>";
-    tableHtml += "<div style='overflow-x:auto;margin-bottom:16px;max-height:200px;overflow-y:auto;'><table style='width:100%;font-size:.8rem;border-collapse:collapse;'>";
+    tableHtml += "<div style='overflow-x:auto;margin-bottom:14px;max-height:200px;overflow-y:auto;'><table style='width:100%;font-size:.78rem;border-collapse:collapse;'>";
     tableHtml += "<thead><tr style='background:#f8fafc;position:sticky;top:0;'>";
-    tableHtml += "<th style='padding:8px;text-align:left;border-bottom:2px solid #e2e8f0;'>Time</th>";
-    tableHtml += "<th style='padding:8px;text-align:left;border-bottom:2px solid #e2e8f0;'>Type</th>";
-    tableHtml += "<th style='padding:8px;text-align:left;border-bottom:2px solid #e2e8f0;'>Stage</th>";
-    tableHtml += "<th style='padding:8px;text-align:right;border-bottom:2px solid #e2e8f0;'>Elapsed (min)</th>";
-    tableHtml += "<th style='padding:8px;text-align:right;border-bottom:2px solid #e2e8f0;'>% Complete</th>";
-    tableHtml += "<th style='padding:8px;text-align:right;border-bottom:2px solid #e2e8f0;'>Transferred</th>";
-    tableHtml += "<th style='padding:8px;text-align:right;border-bottom:2px solid #e2e8f0;'>Items</th>";
+    tableHtml += "<th style='padding:6px 8px;text-align:left;border-bottom:2px solid #e2e8f0;'>Date/Time</th>";
+    tableHtml += "<th style='padding:6px 8px;text-align:left;border-bottom:2px solid #e2e8f0;'>Type</th>";
+    tableHtml += "<th style='padding:6px 8px;text-align:left;border-bottom:2px solid #e2e8f0;'>Stage</th>";
+    tableHtml += "<th style='padding:6px 8px;text-align:right;border-bottom:2px solid #e2e8f0;'>% Done</th>";
+    tableHtml += "<th style='padding:6px 8px;text-align:right;border-bottom:2px solid #e2e8f0;'>Transferred</th>";
+    tableHtml += "<th style='padding:6px 8px;text-align:right;border-bottom:2px solid #e2e8f0;'>Items</th>";
+    tableHtml += "<th style='padding:6px 8px;text-align:right;border-bottom:2px solid #e2e8f0;'>Folders</th>";
     tableHtml += "</tr></thead><tbody>";
 
-    // Show all entries (newest first for readability)
-    var sortedData = data.slice().reverse();
-    sortedData.forEach(function(d) {
+    sorted.slice().reverse().forEach(function(d) {
       var typeColor = d.Type === 'Anchor' ? '#22c55e' : d.Type === 'Progress' ? '#3b82f6' : '#f59e0b';
-      var typeBadge = "<span style='display:inline-block;padding:2px 6px;border-radius:4px;font-size:.7rem;font-weight:600;background:" + typeColor + "20;color:" + typeColor + ";'>" + d.Type + "</span>";
-      var transferred = d.TransferredGB ? d.TransferredGB.toFixed(3) + ' GB' : (d.BytesTransferred ? (d.BytesTransferred / 1024 / 1024).toFixed(2) + ' MB' : '—');
+      var badge = "<span style='display:inline-block;padding:2px 6px;border-radius:4px;font-size:.7rem;font-weight:600;background:" + typeColor + "20;color:" + typeColor + ";'>" + d.Type + "</span>";
+      var xfer  = d.TransferredGB != null ? d.TransferredGB.toFixed(3) + ' GB' : (d.BytesTransferred ? (d.BytesTransferred / 1048576).toFixed(1) + ' MB' : '—');
+      var pctColor = d.PercentComplete >= 95 ? '#22c55e' : d.PercentComplete >= 50 ? '#3b82f6' : '#64748b';
+      var items   = d.ItemsTransferred != null ? (d.ItemsTotal != null ? d.ItemsTransferred + '/' + d.ItemsTotal : d.ItemsTransferred) : '—';
+      var folders = (d.FoldersCompleted != null && d.FoldersTotal != null) ? d.FoldersCompleted + '/' + d.FoldersTotal : '—';
       tableHtml += "<tr style='border-bottom:1px solid #f1f5f9;'>";
-      tableHtml += "<td style='padding:6px 8px;font-family:monospace;font-size:.75rem;'>" + (d.TimeLabel || '—') + "</td>";
-      tableHtml += "<td style='padding:6px 8px;'>" + typeBadge + "</td>";
-      tableHtml += "<td style='padding:6px 8px;'>" + (d.Stage || '—') + "</td>";
-      tableHtml += "<td style='padding:6px 8px;text-align:right;font-family:monospace;'>" + (d.ElapsedMin != null ? d.ElapsedMin.toFixed(1) : '—') + "</td>";
-      tableHtml += "<td style='padding:6px 8px;text-align:right;font-weight:600;color:" + (d.PercentComplete >= 95 ? '#22c55e' : d.PercentComplete >= 50 ? '#3b82f6' : '#64748b') + ";'>" + (d.PercentComplete != null ? d.PercentComplete + '%' : '—') + "</td>";
-      tableHtml += "<td style='padding:6px 8px;text-align:right;'>" + transferred + "</td>";
-      tableHtml += "<td style='padding:6px 8px;text-align:right;'>" + (d.ItemsTransferred || '—') + "</td>";
+      tableHtml += "<td style='padding:5px 8px;font-family:monospace;font-size:.73rem;white-space:nowrap;'>" + (d.TimeLabel || '—') + "</td>";
+      tableHtml += "<td style='padding:5px 8px;'>" + badge + "</td>";
+      tableHtml += "<td style='padding:5px 8px;font-size:.75rem;'>" + (d.Stage || '—') + "</td>";
+      tableHtml += "<td style='padding:5px 8px;text-align:right;font-weight:600;color:" + pctColor + ";'>" + (d.PercentComplete != null ? d.PercentComplete + '%' : '—') + "</td>";
+      tableHtml += "<td style='padding:5px 8px;text-align:right;'>" + xfer + "</td>";
+      tableHtml += "<td style='padding:5px 8px;text-align:right;font-size:.75rem;'>" + items + "</td>";
+      tableHtml += "<td style='padding:5px 8px;text-align:right;font-size:.75rem;'>" + folders + "</td>";
       tableHtml += "</tr>";
     });
     tableHtml += "</tbody></table></div>";
 
-    // Chart container
+    // Charts
     tableHtml += "<div class='mbx-section-title'>Progress Over Time</div>";
-    tableHtml += "<div style='display:grid;grid-template-columns:1fr 1fr;gap:16px;'>";
+    tableHtml += "<div style='display:grid;grid-template-columns:1fr 1fr;gap:12px;'>";
     tableHtml += "<div style='height:150px;'><canvas id='mbxTrendChart1'></canvas></div>";
     tableHtml += "<div style='height:150px;'><canvas id='mbxTrendChart2'></canvas></div>";
     tableHtml += "</div>";
 
     trendContainer.innerHTML = tableHtml;
 
-    // Render charts if Chart.js is available
-    if (typeof Chart !== 'undefined') {
-      var ctx1 = document.getElementById('mbxTrendChart1');
-      var ctx2 = document.getElementById('mbxTrendChart2');
+    if (typeof Chart === 'undefined') return;
 
-      // Chart 1: % Complete over elapsed time (Progress + Anchor points)
-      if (ctx1 && progressPoints.length > 0) {
-        var pctLabels = progressPoints.map(function(d) { return d.ElapsedMin != null ? d.ElapsedMin.toFixed(0) + 'm' : d.TimeLabel; });
-        var pctData = progressPoints.map(function(d) { return d.PercentComplete; });
+    var gc = 'rgba(0,0,0,0.05)';
+    var xt = { maxRotation: 45, minRotation: 45, font: { size: 8 } };
 
-        new Chart(ctx1.getContext('2d'), {
-          type: 'line',
-          data: {
-            labels: pctLabels,
-            datasets: [
-              { label: '% Complete', data: pctData, borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.1)', fill: true, tension: 0.3, pointRadius: 3 }
-            ]
-          },
-          options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: { legend: { display: true, position: 'bottom', labels: { boxWidth: 12, font: { size: 10 } } } },
-            scales: {
-              x: { title: { display: true, text: 'Elapsed Time', font: { size: 10 } } },
-              y: { beginAtZero: true, max: 100, title: { display: true, text: '%', font: { size: 10 } } }
-            }
-          }
-        });
-      }
+    // Chart 1: % Complete
+    var ctx1 = document.getElementById('mbxTrendChart1');
+    if (ctx1 && progressPoints.length > 0) {
+      new Chart(ctx1.getContext('2d'), {
+        type: 'line',
+        data: {
+          labels: progressPoints.map(function(d) { return d.TimeLabel || ''; }),
+          datasets: [{ label: '% Complete', data: progressPoints.map(function(d) { return d.PercentComplete; }),
+            borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.08)', fill: true, tension: 0.3, pointRadius: 2 }]
+        },
+        options: { responsive: true, maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: { x: { grid: { color: gc }, ticks: xt }, y: { beginAtZero: true, max: 100, title: { display: true, text: '%', font: { size: 9 } }, grid: { color: gc } } }
+        }
+      });
+    }
 
-      // Chart 2: Data transferred over elapsed time (Transfer + Anchor points)
-      if (ctx2 && transferPoints.length > 0) {
-        var xferLabels = transferPoints.map(function(d) { return d.ElapsedMin != null ? d.ElapsedMin.toFixed(0) + 'm' : d.TimeLabel; });
-        var xferData = transferPoints.map(function(d) {
-          if (d.TransferredGB) return d.TransferredGB;
-          if (d.BytesTransferred) return d.BytesTransferred / 1024 / 1024 / 1024;
-          return null;
-        });
-        var itemsData = transferPoints.map(function(d) { return d.ItemsTransferred; });
-
-        new Chart(ctx2.getContext('2d'), {
-          type: 'line',
-          data: {
-            labels: xferLabels,
-            datasets: [
-              { label: 'Transferred (GB)', data: xferData, borderColor: '#8b5cf6', tension: 0.3, pointRadius: 3, yAxisID: 'y' },
-              { label: 'Items', data: itemsData, borderColor: '#f59e0b', tension: 0.3, pointRadius: 3, yAxisID: 'y1' }
-            ]
-          },
-          options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: { legend: { display: true, position: 'bottom', labels: { boxWidth: 12, font: { size: 10 } } } },
-            scales: {
-              x: { title: { display: true, text: 'Elapsed Time', font: { size: 10 } } },
-              y: { type: 'linear', position: 'left', beginAtZero: true, title: { display: true, text: 'GB', font: { size: 10 } } },
-              y1: { type: 'linear', position: 'right', beginAtZero: true, grid: { drawOnChartArea: false }, title: { display: true, text: 'Items', font: { size: 10 } } }
-            }
-          }
-        });
-      }
+    // Chart 2: GB Transferred + target line
+    var ctx2 = document.getElementById('mbxTrendChart2');
+    if (ctx2 && transferPoints.length > 0) {
+      var xferLabels = transferPoints.map(function(d) { return d.TimeLabel || ''; });
+      var xferData   = transferPoints.map(function(d) {
+        if (d.TransferredGB != null) return d.TransferredGB;
+        if (d.BytesTransferred != null) return d.BytesTransferred / 1073741824;
+        return null;
+      });
+      var ds = [{ label: 'GB', data: xferData, borderColor: '#8b5cf6', backgroundColor: 'rgba(139,92,246,0.08)', fill: true, tension: 0.3, pointRadius: 2 }];
+      if (totalGB !== null) ds.push({ label: 'Target', data: xferLabels.map(function() { return totalGB; }), borderColor: '#ef4444', borderDash: [4,3], borderWidth: 1.5, pointRadius: 0, fill: false });
+      new Chart(ctx2.getContext('2d'), {
+        type: 'line',
+        data: { labels: xferLabels, datasets: ds },
+        options: { responsive: true, maintainAspectRatio: false,
+          plugins: { legend: { display: totalGB !== null, position: 'bottom', labels: { boxWidth: 8, font: { size: 9 } } } },
+          scales: { x: { grid: { color: gc }, ticks: xt }, y: { beginAtZero: true, title: { display: true, text: 'GB', font: { size: 9 } }, grid: { color: gc } } }
+        }
+      });
     }
   }
 
@@ -5623,13 +5667,13 @@ function renderTrendPanelContent(data) {
   html += '<div style="overflow-x:auto;max-height:280px;overflow-y:auto;border:1px solid #e2e8f0;border-radius:8px;">';
   html += '<table style="width:100%;font-size:.8rem;border-collapse:collapse;">';
   html += '<thead><tr style="background:#f8fafc;position:sticky;top:0;">';
-  html += '<th style="padding:10px 12px;text-align:left;border-bottom:2px solid #e2e8f0;font-weight:600;">Date/Time</th>';
-  html += '<th style="padding:10px 12px;text-align:left;border-bottom:2px solid #e2e8f0;font-weight:600;">Type</th>';
-  html += '<th style="padding:10px 12px;text-align:left;border-bottom:2px solid #e2e8f0;font-weight:600;">Stage</th>';
-  html += '<th style="padding:10px 12px;text-align:right;border-bottom:2px solid #e2e8f0;font-weight:600;">Elapsed</th>';
-  html += '<th style="padding:10px 12px;text-align:right;border-bottom:2px solid #e2e8f0;font-weight:600;">% Complete</th>';
-  html += '<th style="padding:10px 12px;text-align:right;border-bottom:2px solid #e2e8f0;font-weight:600;">Transferred</th>';
-  html += '<th style="padding:10px 12px;text-align:right;border-bottom:2px solid #e2e8f0;font-weight:600;">Items</th>';
+  html += '<th style="padding:8px 12px;text-align:left;border-bottom:2px solid #e2e8f0;font-weight:600;">Date/Time</th>';
+  html += '<th style="padding:8px 12px;text-align:left;border-bottom:2px solid #e2e8f0;font-weight:600;">Type</th>';
+  html += '<th style="padding:8px 12px;text-align:left;border-bottom:2px solid #e2e8f0;font-weight:600;">Stage</th>';
+  html += '<th style="padding:8px 12px;text-align:right;border-bottom:2px solid #e2e8f0;font-weight:600;">% Done</th>';
+  html += '<th style="padding:8px 12px;text-align:right;border-bottom:2px solid #e2e8f0;font-weight:600;">Transferred</th>';
+  html += '<th style="padding:8px 12px;text-align:right;border-bottom:2px solid #e2e8f0;font-weight:600;">Items</th>';
+  html += '<th style="padding:8px 12px;text-align:right;border-bottom:2px solid #e2e8f0;font-weight:600;">Folders</th>';
   html += '</tr></thead><tbody>';
 
   // Show newest first in table for readability
@@ -5637,26 +5681,74 @@ function renderTrendPanelContent(data) {
   tableData.forEach(function(d) {
     var typeColor = d.Type === 'Anchor' ? '#22c55e' : d.Type === 'Progress' ? '#3b82f6' : '#f59e0b';
     var typeBadge = '<span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:.7rem;font-weight:600;background:' + typeColor + '20;color:' + typeColor + ';">' + d.Type + '</span>';
-    var transferred = d.TransferredGB ? d.TransferredGB.toFixed(3) + ' GB' : (d.BytesTransferred ? (d.BytesTransferred / 1024 / 1024).toFixed(2) + ' MB' : '—');
+    var transferred = d.TransferredGB != null ? d.TransferredGB.toFixed(3) + ' GB' : (d.BytesTransferred ? (d.BytesTransferred / 1048576).toFixed(1) + ' MB' : '—');
     var pctColor = d.PercentComplete >= 95 ? '#22c55e' : d.PercentComplete >= 50 ? '#3b82f6' : '#64748b';
+    var items = d.ItemsTransferred != null ? (d.ItemsTotal != null ? d.ItemsTransferred + '/' + d.ItemsTotal : d.ItemsTransferred) : '—';
+    var folders = (d.FoldersCompleted != null && d.FoldersTotal != null) ? d.FoldersCompleted + '/' + d.FoldersTotal : '—';
 
     html += '<tr style="border-bottom:1px solid #f1f5f9;">';
-    html += '<td style="padding:8px 12px;font-family:monospace;font-size:.75rem;white-space:nowrap;">' + (d.TimeLabel || '—') + '</td>';
-    html += '<td style="padding:8px 12px;">' + typeBadge + '</td>';
-    html += '<td style="padding:8px 12px;">' + (d.Stage || '—') + '</td>';
-    html += '<td style="padding:8px 12px;text-align:right;font-family:monospace;">' + (d.ElapsedMin != null ? d.ElapsedMin.toFixed(1) + 'm' : '—') + '</td>';
-    html += '<td style="padding:8px 12px;text-align:right;font-weight:600;color:' + pctColor + ';">' + (d.PercentComplete != null ? d.PercentComplete + '%' : '—') + '</td>';
-    html += '<td style="padding:8px 12px;text-align:right;">' + transferred + '</td>';
-    html += '<td style="padding:8px 12px;text-align:right;">' + (d.ItemsTransferred || '—') + '</td>';
+    html += '<td style="padding:7px 12px;font-family:monospace;font-size:.75rem;white-space:nowrap;">' + (d.TimeLabel || '—') + '</td>';
+    html += '<td style="padding:7px 12px;">' + typeBadge + '</td>';
+    html += '<td style="padding:7px 12px;font-size:.78rem;">' + (d.Stage || '—') + '</td>';
+    html += '<td style="padding:7px 12px;text-align:right;font-weight:600;color:' + pctColor + ';">' + (d.PercentComplete != null ? d.PercentComplete + '%' : '—') + '</td>';
+    html += '<td style="padding:7px 12px;text-align:right;">' + transferred + '</td>';
+    html += '<td style="padding:7px 12px;text-align:right;font-size:.78rem;">' + items + '</td>';
+    html += '<td style="padding:7px 12px;text-align:right;font-size:.78rem;">' + folders + '</td>';
     html += '</tr>';
   });
   html += '</tbody></table></div></div>';
 
-  // Charts section
+  // Extract totals from anchor point
+  var bytesTotal = null;
+  var itemsTotal = null;
+  var foldersTotal = null;
+  var anchorPoint = sortedByTime.find(function(d) { return d.Type === 'Anchor'; });
+  if (anchorPoint) {
+    bytesTotal = anchorPoint.TotalGB;
+    itemsTotal = anchorPoint.ItemsTotal;
+    foldersTotal = anchorPoint.FoldersTotal;
+  }
+
+  // Detect stage changes for vertical markers
+  var stageChanges = [];
+  var lastStage = null;
+  sortedByTime.forEach(function(d, idx) {
+    if (d.Type === 'Progress' && d.Stage && d.Stage !== lastStage) {
+      stageChanges.push({ index: idx, stage: d.Stage, label: d.TimeLabel });
+      lastStage = d.Stage;
+    }
+  });
+
+  // Calculate transfer rate (MB/min) between consecutive transfer points using Timestamp
+  var transferRates = [];
+  for (var i = 1; i < transferPoints.length; i++) {
+    var prev = transferPoints[i - 1];
+    var curr = transferPoints[i];
+    if (prev.BytesTransferred != null && curr.BytesTransferred != null &&
+        prev.Timestamp && curr.Timestamp) {
+      var deltaBytes = curr.BytesTransferred - prev.BytesTransferred;
+      var deltaMin = (new Date(curr.Timestamp) - new Date(prev.Timestamp)) / 60000;
+      if (deltaMin > 0) {
+        transferRates.push(parseFloat(((deltaBytes / 1048576) / deltaMin).toFixed(2)));
+      } else {
+        transferRates.push(null);
+      }
+    } else {
+      transferRates.push(null);
+    }
+  }
+  // First point has no rate
+  transferRates.unshift(null);
+
+  // Charts section - now with 4 charts in 2x2 grid
   html += '<div style="font-size:.75rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:#94a3b8;margin-bottom:12px;">Progress Charts</div>';
-  html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;">';
+  html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px;">';
   html += '<div style="background:#f8fafc;border-radius:8px;padding:16px;"><div style="font-size:.8rem;font-weight:600;color:#475569;margin-bottom:12px;">% Complete Over Time</div><div style="height:180px;"><canvas id="trendChart1"></canvas></div></div>';
-  html += '<div style="background:#f8fafc;border-radius:8px;padding:16px;"><div style="font-size:.8rem;font-weight:600;color:#475569;margin-bottom:12px;">Data Transferred</div><div style="height:180px;"><canvas id="trendChart2"></canvas></div></div>';
+  html += '<div style="background:#f8fafc;border-radius:8px;padding:16px;"><div style="font-size:.8rem;font-weight:600;color:#475569;margin-bottom:12px;">Data Transferred (GB)</div><div style="height:180px;"><canvas id="trendChart2"></canvas></div></div>';
+  html += '</div>';
+  html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;">';
+  html += '<div style="background:#f8fafc;border-radius:8px;padding:16px;"><div style="font-size:.8rem;font-weight:600;color:#475569;margin-bottom:12px;">Items Transferred</div><div style="height:180px;"><canvas id="trendChart3"></canvas></div></div>';
+  html += '<div style="background:#f8fafc;border-radius:8px;padding:16px;"><div style="font-size:.8rem;font-weight:600;color:#475569;margin-bottom:12px;">Transfer Rate (MB/min)</div><div style="height:180px;"><canvas id="trendChart4"></canvas></div></div>';
   html += '</div>';
 
   contentEl.innerHTML = html;
@@ -5665,10 +5757,37 @@ function renderTrendPanelContent(data) {
   if (typeof Chart !== 'undefined') {
     var ctx1 = document.getElementById('trendChart1');
     var ctx2 = document.getElementById('trendChart2');
+    var ctx3 = document.getElementById('trendChart3');
+    var ctx4 = document.getElementById('trendChart4');
 
+    // Chart 1: % Complete with stage markers
     if (ctx1 && progressPoints.length > 0) {
       var pctLabels = progressPoints.map(function(d) { return d.TimeLabel || (d.ElapsedMin != null ? d.ElapsedMin.toFixed(0) + 'm' : '—'); });
       var pctData = progressPoints.map(function(d) { return d.PercentComplete; });
+
+      // Build stage change annotations
+      var annotations = {};
+      stageChanges.forEach(function(sc, idx) {
+        var matchIdx = progressPoints.findIndex(function(p) { return p.TimeLabel === sc.label; });
+        if (matchIdx !== -1) {
+          annotations['stageLine' + idx] = {
+            type: 'line',
+            xMin: matchIdx,
+            xMax: matchIdx,
+            borderColor: 'rgba(239,68,68,0.5)',
+            borderWidth: 2,
+            borderDash: [5, 5],
+            label: {
+              display: true,
+              content: sc.stage,
+              position: 'start',
+              backgroundColor: 'rgba(239,68,68,0.8)',
+              color: '#fff',
+              font: { size: 9 }
+            }
+          };
+        }
+      });
 
       new Chart(ctx1.getContext('2d'), {
         type: 'line',
@@ -5679,7 +5798,10 @@ function renderTrendPanelContent(data) {
         options: {
           responsive: true,
           maintainAspectRatio: false,
-          plugins: { legend: { display: false } },
+          plugins: {
+            legend: { display: false },
+            annotation: { annotations: annotations }
+          },
           scales: {
             x: { title: { display: true, text: 'Date/Time', font: { size: 11 } }, grid: { color: 'rgba(0,0,0,0.05)' }, ticks: { maxRotation: 45, minRotation: 45, font: { size: 9 } } },
             y: { beginAtZero: true, max: 100, title: { display: true, text: '%', font: { size: 11 } }, grid: { color: 'rgba(0,0,0,0.05)' } }
@@ -5688,32 +5810,117 @@ function renderTrendPanelContent(data) {
       });
     }
 
+    // Chart 2: Bytes Transferred + target + 50% line + seeding marker
     if (ctx2 && transferPoints.length > 0) {
-      var xferLabels = transferPoints.map(function(d) { return d.TimeLabel || (d.ElapsedMin != null ? d.ElapsedMin.toFixed(0) + 'm' : '—'); });
+      var xferLabels = transferPoints.map(function(d) { return d.TimeLabel || ''; });
       var xferData = transferPoints.map(function(d) {
-        if (d.TransferredGB) return d.TransferredGB;
-        if (d.BytesTransferred) return d.BytesTransferred / 1024 / 1024 / 1024;
+        if (d.TransferredGB != null) return d.TransferredGB;
+        if (d.BytesTransferred != null) return d.BytesTransferred / 1073741824;
         return null;
       });
-      var itemsData = transferPoints.map(function(d) { return d.ItemsTransferred; });
+
+      var datasets2 = [
+        { label: 'GB Transferred', data: xferData, borderColor: '#8b5cf6', backgroundColor: 'rgba(139,92,246,0.1)', fill: true, tension: 0.3, pointRadius: 4 }
+      ];
+
+      if (bytesTotal != null) {
+        datasets2.push({ label: 'Target GB', data: new Array(xferLabels.length).fill(bytesTotal), borderColor: '#22c55e', borderWidth: 2, borderDash: [8, 4], pointRadius: 0, fill: false });
+        datasets2.push({ label: '50% Mark', data: new Array(xferLabels.length).fill(parseFloat((bytesTotal / 2).toFixed(3))), borderColor: '#94a3b8', borderWidth: 1, borderDash: [4, 4], pointRadius: 0, fill: false });
+      }
+
+      // Detect seeding complete point (first Transfer point where BytesTransferred jumps from 0)
+      var seedingAnnotations2 = {};
+      for (var si = 0; si < transferPoints.length; si++) {
+        var sp = transferPoints[si];
+        if (sp.Type === 'Transfer' && sp.BytesTransferred > 0) {
+          var prevBytes = si > 0 ? (transferPoints[si-1].BytesTransferred || 0) : 0;
+          if (prevBytes === 0 && sp.BytesTransferred > 0) {
+            var seedGB = sp.TransferredGB != null ? sp.TransferredGB.toFixed(2) + ' GB' : '';
+            var seedItems = sp.ItemsTransferred ? sp.ItemsTransferred + ' items' : '';
+            seedingAnnotations2['seedLine'] = {
+              type: 'line', xMin: si, xMax: si,
+              borderColor: 'rgba(245,158,11,0.7)', borderWidth: 2, borderDash: [6, 3],
+              label: { display: true, content: 'Seeding done' + (seedGB ? ' · ' + seedGB : '') + (seedItems ? ' · ' + seedItems : ''),
+                position: 'start', backgroundColor: 'rgba(245,158,11,0.85)', color: '#fff', font: { size: 9 } }
+            };
+            break;
+          }
+        }
+      }
 
       new Chart(ctx2.getContext('2d'), {
         type: 'line',
+        data: { labels: xferLabels, datasets: datasets2 },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          plugins: {
+            legend: { display: true, position: 'bottom', labels: { boxWidth: 12, font: { size: 10 } } },
+            annotation: Object.keys(seedingAnnotations2).length ? { annotations: seedingAnnotations2 } : {}
+          },
+          scales: {
+            x: { title: { display: true, text: 'Date/Time', font: { size: 11 } }, grid: { color: 'rgba(0,0,0,0.05)' }, ticks: { maxRotation: 45, minRotation: 45, font: { size: 9 } } },
+            y: { beginAtZero: true, title: { display: true, text: 'GB', font: { size: 11 } }, grid: { color: 'rgba(0,0,0,0.05)' } }
+          }
+        }
+      });
+    }
+
+    // Chart 3: Items + Folders transferred with target lines + 50% marker
+    if (ctx3 && transferPoints.length > 0) {
+      var itemsLabels = transferPoints.map(function(d) { return d.TimeLabel || ''; });
+      var itemsData   = transferPoints.map(function(d) { return d.ItemsTransferred != null ? d.ItemsTransferred : null; });
+      var foldersData = transferPoints.map(function(d) { return d.FoldersCompleted != null ? d.FoldersCompleted : null; });
+      var hasFolders  = foldersData.some(function(v) { return v != null; });
+
+      var itemsDatasets = [
+        { label: 'Items', data: itemsData, borderColor: '#f59e0b', backgroundColor: 'rgba(245,158,11,0.08)', fill: true, tension: 0.3, pointRadius: 3, spanGaps: true, yAxisID: 'y' }
+      ];
+      if (hasFolders) {
+        itemsDatasets.push({ label: 'Folders', data: foldersData, borderColor: '#06b6d4', backgroundColor: 'rgba(6,182,212,0.06)', fill: false, tension: 0.3, pointRadius: 3, spanGaps: true, yAxisID: 'y1' });
+      }
+      if (itemsTotal != null) {
+        itemsDatasets.push({ label: 'Items Target', data: new Array(itemsLabels.length).fill(itemsTotal), borderColor: '#22c55e', borderWidth: 2, borderDash: [8, 4], pointRadius: 0, fill: false, yAxisID: 'y' });
+        itemsDatasets.push({ label: 'Items 50%', data: new Array(itemsLabels.length).fill(Math.round(itemsTotal / 2)), borderColor: '#94a3b8', borderWidth: 1, borderDash: [4, 4], pointRadius: 0, fill: false, yAxisID: 'y' });
+      }
+
+      var scales3 = {
+        x: { title: { display: true, text: 'Date/Time', font: { size: 11 } }, grid: { color: 'rgba(0,0,0,0.05)' }, ticks: { maxRotation: 45, minRotation: 45, font: { size: 9 } } },
+        y: { beginAtZero: true, title: { display: true, text: 'Items', font: { size: 11 } }, grid: { color: 'rgba(0,0,0,0.05)' } }
+      };
+      if (hasFolders) {
+        scales3.y1 = { type: 'linear', position: 'right', beginAtZero: true, grid: { drawOnChartArea: false }, title: { display: true, text: 'Folders', font: { size: 11 } } };
+      }
+
+      new Chart(ctx3.getContext('2d'), {
+        type: 'line',
+        data: { labels: itemsLabels, datasets: itemsDatasets },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          plugins: { legend: { display: true, position: 'bottom', labels: { boxWidth: 12, font: { size: 10 } } } },
+          scales: scales3
+        }
+      });
+    }
+
+    // Chart 4: Transfer Rate (MB/min)
+    if (ctx4 && transferPoints.length > 0 && transferRates.length > 0) {
+      var rateLabels = transferPoints.map(function(d) { return d.TimeLabel || ''; });
+
+      new Chart(ctx4.getContext('2d'), {
+        type: 'line',
         data: {
-          labels: xferLabels,
+          labels: rateLabels,
           datasets: [
-            { label: 'GB Transferred', data: xferData, borderColor: '#8b5cf6', tension: 0.3, pointRadius: 4, yAxisID: 'y' },
-            { label: 'Items', data: itemsData, borderColor: '#f59e0b', tension: 0.3, pointRadius: 4, yAxisID: 'y1' }
+            { label: 'MB/min', data: transferRates, borderColor: '#06b6d4', backgroundColor: 'rgba(6,182,212,0.1)', fill: true, tension: 0.3, pointRadius: 4, spanGaps: true }
           ]
         },
         options: {
           responsive: true,
           maintainAspectRatio: false,
-          plugins: { legend: { display: true, position: 'bottom', labels: { boxWidth: 12, font: { size: 10 } } } },
+          plugins: { legend: { display: false } },
           scales: {
             x: { title: { display: true, text: 'Date/Time', font: { size: 11 } }, grid: { color: 'rgba(0,0,0,0.05)' }, ticks: { maxRotation: 45, minRotation: 45, font: { size: 9 } } },
-            y: { type: 'linear', position: 'left', beginAtZero: true, title: { display: true, text: 'GB', font: { size: 11 } }, grid: { color: 'rgba(0,0,0,0.05)' } },
-            y1: { type: 'linear', position: 'right', beginAtZero: true, grid: { drawOnChartArea: false }, title: { display: true, text: 'Items', font: { size: 11 } } }
+            y: { type: 'linear', position: 'left', beginAtZero: true, title: { display: true, text: 'MB/min', font: { size: 11 } }, grid: { color: 'rgba(0,0,0,0.05)' } }
           }
         }
       });
@@ -6915,16 +7122,25 @@ function Start-WatchListener {
                                         } | Select-Object -First 1
                                     }
 
-                                    $status = if ($mbxInfo) { $mbxInfo.StatusDetail } else { 'Unknown' }
+                                    # Resolve status — Status is the correct property on PerMailboxDetail objects
+                                    $status = $null
+                                    if ($mbxInfo) {
+                                        $status = if ($mbxInfo.Status) { $mbxInfo.Status } else { $null }
+                                    }
                                     $pctComplete = if ($mbxInfo) { [int]$mbxInfo.PercentComplete } else { 0 }
 
-                                    # Get latest percent from trend data if available
+                                    # Get latest percent and status from trend data if available
                                     if ($trendData -and @($trendData).Count -gt 0) {
                                         $latestPoint = @($trendData) | Select-Object -Last 1
                                         if ($latestPoint.PercentComplete) {
                                             $pctComplete = [int]$latestPoint.PercentComplete
                                         }
+                                        # Derive status from latest anchor stage if still unknown
+                                        if (-not $status -and $latestPoint.Stage) {
+                                            $status = $latestPoint.Stage
+                                        }
                                     }
+                                    if (-not $status) { $status = 'Unknown' }
 
                                     $mailboxList += @{
                                         Name = $mbxName
@@ -7673,12 +7889,17 @@ if ($MyInvocation.InvocationName -ne '.') {
                                             Timestamp        = if ($_.Timestamp) { $_.Timestamp.ToString('yyyy-MM-ddTHH:mm:ss') } else { $null }
                                             DateLabel        = if ($_.Timestamp) { $_.Timestamp.ToString('MM/dd') } else { $null }
                                             TimeLabel        = if ($_.Timestamp) { $_.Timestamp.ToString('MM/dd HH:mm') } else { $null }
-                                            ElapsedMin       = $_.ElapsedMin
                                             Stage            = $_.Stage
                                             PercentComplete  = $_.PercentComplete
+                                            SizeLabel        = $_.SizeLabel
                                             BytesTransferred = $_.BytesTransferred
+                                            BytesTotal       = $_.BytesTotal
                                             TransferredGB    = if ($_.BytesTransferred) { [math]::Round($_.BytesTransferred / 1GB, 3) } else { $null }
+                                            TotalGB          = if ($_.BytesTotal) { [math]::Round($_.BytesTotal / 1GB, 3) } else { $null }
                                             ItemsTransferred = $_.ItemsTransferred
+                                            ItemsTotal       = $_.ItemsTotal
+                                            FoldersCompleted = $_.FoldersCompleted
+                                            FoldersTotal     = $_.FoldersTotal
                                         }
                                     }
                                     $trendCache[$mbxStat.DisplayName] = @($jsonData)
