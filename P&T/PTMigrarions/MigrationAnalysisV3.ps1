@@ -195,7 +195,7 @@ param (
 
     [Parameter(ParameterSetName = "Live")]
     [ValidateRange(10,86400)]
-    [int]$RefreshIntervalSeconds = 60,
+    [int]$RefreshIntervalSeconds = 300,
 
     [Parameter(ParameterSetName = "Live")]
     [ValidateRange(1024,65535)]
@@ -2572,6 +2572,7 @@ function Export-HtmlReport {
 
             " data-tickwordbreak='$($_.TickWordBreak)'"
         "<tr $rowData style='cursor:pointer'>
+            <td style='text-align:center'><button class='pin-btn' onclick='event.stopPropagation();togglePin(this)' title='Pin to top'>📌</button></td>
             <td><strong>$($_.DisplayName)</strong></td>
             <td style='font-size:.8rem;color:#64748b'>$($_.Alias)</td>
             <td>$statusBadge</td>
@@ -5117,6 +5118,8 @@ $(if($ListenerPort -gt 0){
 
       <button class='wbtn wbtn-p' style='flex:1' onclick='apiRefresh()'>&#x21BA; Refresh Now</button>
 
+      <button class='wbtn wbtn-s' id='wPauseBtn' onclick='togglePause()' title='Pause/Resume auto-refresh'>&#x23F8; Pause</button>
+
     </div>
 
     <div class='watch-sec' style='margin-top:12px;border-top:1px solid #334155;padding-top:10px;'>⚙️ Settings</div>
@@ -5309,6 +5312,7 @@ $(if($ListenerPort -gt 0){
   var countdownTimer = null;
   var nextRefreshAt = null;
   var collapsed = false;
+  var isPaused = false;
 
   function apiCall(endpoint, method, body) {
     return fetch(API_BASE + endpoint, {
@@ -5318,6 +5322,25 @@ $(if($ListenerPort -gt 0){
       body: body ? JSON.stringify(body) : undefined
     }).then(function(r){ return r.json(); });
   }
+
+  window.togglePause = function() {
+    isPaused = !isPaused;
+    var btn = document.getElementById('wPauseBtn');
+    var countdownEl = document.getElementById('wCountdown');
+    if (isPaused) {
+      btn.innerHTML = '&#x25B6; Resume';
+      btn.classList.remove('wbtn-s');
+      btn.classList.add('wbtn-p');
+      if (countdownEl) countdownEl.textContent = 'PAUSED';
+      apiCall('/api/settings', 'POST', { paused: true }).catch(function(){});
+    } else {
+      btn.innerHTML = '&#x23F8; Pause';
+      btn.classList.remove('wbtn-p');
+      btn.classList.add('wbtn-s');
+      nextRefreshAt = Date.now() + watchInterval * 1000;
+      apiCall('/api/settings', 'POST', { paused: false }).catch(function(){});
+    }
+  };
 
   window.apiRefresh = function() {
     setDot('stale');
@@ -6001,9 +6024,16 @@ function Start-WatchListener {
                                 [void]$State['PendingCommands'].Add(@{ Action = 'UpdateIncludeDetailInScheduled'; Enabled = [bool]$settings.includeDetailInScheduled })
                             }
 
+                            # Update paused state if provided
+                            if ($null -ne $settings.paused) {
+                                $State['IsPaused'] = [bool]$settings.paused
+                                [void]$State['PendingCommands'].Add(@{ Action = 'UpdatePaused'; Paused = [bool]$settings.paused })
+                            }
+
                             # Update status filter if provided
                             if ($null -ne $settings.statusFilter) {
                                 $State['CurrentStatusFilter'] = "$($settings.statusFilter)"
+                                [void]$State['PendingCommands'].Add(@{ Action = 'UpdateStatusFilter'; StatusFilter = "$($settings.statusFilter)" })
                             }
 
                             $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true,"message":"Settings updated"}')
@@ -6712,6 +6742,7 @@ if ($MyInvocation.InvocationName -ne '.') {
 
                 # Show current applied settings before refresh
                 $settingsList = @()
+                if ($invokeParams.ContainsKey('StatusFilter') -and $invokeParams.StatusFilter -ne 'All') { $settingsList += "Status:$($invokeParams.StatusFilter)" }
                 if ($invokeParams.ContainsKey('IncludeDetailReport') -and $invokeParams.IncludeDetailReport) { $settingsList += 'DetailReport' }
                 if ($invokeParams.ContainsKey('IncludeCompleted') -and $invokeParams.IncludeCompleted) { $settingsList += 'IncludeCompleted' }
                 if ($invokeParams.ContainsKey('SinceDate')) { $settingsList += "Since:$($invokeParams.SinceDate.ToString('yyyy-MM-dd'))" }
@@ -6863,41 +6894,30 @@ if ($MyInvocation.InvocationName -ne '.') {
                                 if ($batchList.Count -eq 1) {
                                     $invokeParams.MigrationBatchName = $batchList[0]
                                     $watchState['CurrentScope'] = "Batch: $($batchList[0])"
-                                    Write-Host "  [API] Scope changed to Batch: $($batchList[0])" -ForegroundColor Cyan
                                 } else {
                                     $invokeParams.MigrationBatchName = $batchList
                                     $watchState['CurrentScope'] = "Batches: $($batchList.Count) selected"
-                                    Write-Host "  [API] Scope changed to $($batchList.Count) batches: $($batchList -join ', ')" -ForegroundColor Cyan
                                 }
                             } elseif ($cmd.Mailbox -and $cmd.Mailbox -ne '') {
                                 $invokeParams.Remove('MigrationBatchName')
                                 $invokeParams.Mailbox = @($cmd.Mailbox -split ',')
                                 $watchState['CurrentScope'] = "Mailbox: $($cmd.Mailbox)"
-                                Write-Host "  [API] Scope changed to Mailbox: $($cmd.Mailbox)" -ForegroundColor Cyan
                             } else {
                                 # All — clear filters
                                 $invokeParams.Remove('Mailbox')
                                 $invokeParams.Remove('MigrationBatchName')
                                 $watchState['CurrentScope'] = 'All'
-                                Write-Host "  [API] Scope changed to All" -ForegroundColor Cyan
                             }
-                            if ($cmd.IncludeCompleted) {
-                                $invokeParams.IncludeCompleted = $true
-                                Write-Host "  [API] Include Completed enabled" -ForegroundColor Cyan
-                            }
+                            if ($cmd.IncludeCompleted) { $invokeParams.IncludeCompleted = $true }
                             if ($cmd.SinceDate -and $cmd.SinceDate -ne '') {
                                 try {
                                     $invokeParams.SinceDate = [datetime]$cmd.SinceDate
                                     $watchState['CurrentSinceDate'] = $cmd.SinceDate
-                                    Write-Host "  [API] Since Date set to $($cmd.SinceDate)" -ForegroundColor Cyan
                                 } catch {}
                             } else {
                                 $invokeParams.Remove('SinceDate')
                                 $watchState['CurrentSinceDate'] = ''
                             }
-                        }
-                        elseif ($cmd.Action -eq 'refresh') {
-                            Write-Host "  [API] Manual refresh requested" -ForegroundColor Cyan
                         }
                         elseif ($cmd.Action -eq 'UpdateInterval') {
                             $RefreshIntervalSeconds = $cmd.Interval
@@ -6934,6 +6954,16 @@ if ($MyInvocation.InvocationName -ne '.') {
                                 $script:StallThresholdMinutes = $cfg.stallThreshold
                                 Write-Host "  [API] Alert configuration updated" -ForegroundColor Cyan
                             }
+                        }
+                        elseif ($cmd.Action -eq 'UpdateStatusFilter') {
+                            $newFilter = $cmd.StatusFilter
+                            if ($newFilter -and $newFilter -ne '' -and $newFilter -ne 'All') {
+                                $invokeParams.StatusFilter = $newFilter
+                            } else {
+                                $invokeParams.StatusFilter = 'All'
+                            }
+                            $watchState['CurrentStatusFilter'] = $invokeParams.StatusFilter
+                            Write-Host "  [API] Status Filter changed to $($invokeParams.StatusFilter)" -ForegroundColor Cyan
                         }
                         elseif ($cmd.Action -eq 'TestAlert') {
                             Write-Host "  [API] Sending test alert..." -ForegroundColor Cyan
