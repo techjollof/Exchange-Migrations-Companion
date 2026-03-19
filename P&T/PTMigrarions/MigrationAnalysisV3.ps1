@@ -3344,6 +3344,7 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
   <div class="main-tab-bar">
     <button class="main-tab active" onclick="switchMain('perf',this)">📊 Migration Performance Analysis</button>
     <button class="main-tab"        onclick="switchMain('mbx', this)">📬 Mailbox Migration Detail</button>
+    <button class="main-tab"        onclick="switchMain('trends', this)" id="tab-trends" style="display:none">📈 Migration Trends</button>
     <button class="main-tab"        onclick="switchMain('compare', this)" id="tab-compare" style="display:none">📋 Batch Comparison</button>
     <button class="main-tab"        onclick="switchMain('retry', this)" id="tab-retry" style="display:none">🔄 Auto-Retry</button>
   </div>
@@ -3692,6 +3693,47 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
 
   </div><!-- /panel-mbx -->
 
+  <!-- Panel: Migration Trends (Watch Mode Only) -->
+  <div id="panel-trends" class="main-panel">
+    <div class="card" style="padding:0;overflow:hidden;">
+      <div style="display:grid;grid-template-columns:280px 1fr;min-height:600px;">
+        <!-- Left: Mailbox List -->
+        <div style="background:#f8fafc;border-right:1px solid #e2e8f0;display:flex;flex-direction:column;">
+          <div style="padding:16px;border-bottom:1px solid #e2e8f0;">
+            <div style="font-weight:700;font-size:1rem;color:#1e293b;margin-bottom:12px;">📈 Migration Trends</div>
+            <input type="text" id="trend-search" placeholder="🔍 Search mailbox..."
+                   style="width:100%;padding:8px 12px;border:1px solid #e2e8f0;border-radius:6px;font-size:.85rem;"
+                   oninput="filterTrendMailboxes(this.value)">
+          </div>
+          <div id="trend-mailbox-list" style="flex:1;overflow-y:auto;padding:8px;">
+            <div style="text-align:center;padding:40px 20px;color:#94a3b8;font-size:.85rem;">
+              Loading mailboxes...
+            </div>
+          </div>
+          <div style="padding:12px 16px;border-top:1px solid #e2e8f0;background:#fff;">
+            <div style="font-size:.75rem;color:#64748b;">
+              <span id="trend-mailbox-count">0</span> mailboxes with trend data
+            </div>
+          </div>
+        </div>
+        <!-- Right: Trend View -->
+        <div style="display:flex;flex-direction:column;">
+          <div style="padding:16px 20px;border-bottom:1px solid #e2e8f0;background:#fff;">
+            <div id="trend-selected-name" style="font-weight:700;font-size:1.1rem;color:#1e293b;">Select a mailbox</div>
+            <div id="trend-selected-sub" style="font-size:.82rem;color:#64748b;margin-top:2px;">Click on a mailbox from the list to view its migration trend</div>
+          </div>
+          <div id="trend-content" style="flex:1;overflow-y:auto;padding:20px;">
+            <div style="text-align:center;padding:60px 40px;color:#94a3b8;">
+              <div style="font-size:4rem;margin-bottom:16px;">📈</div>
+              <div style="font-size:1rem;font-weight:500;">No mailbox selected</div>
+              <div style="font-size:.85rem;margin-top:8px;">Select a mailbox from the list on the left to view its migration progress timeline and charts.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div><!-- /panel-trends -->
+
   <!-- Panel 3: Batch Comparison (Watch Mode Only) -->
   <div id="panel-compare" class="main-panel" style="display:none">
     <div class="card">
@@ -4001,6 +4043,7 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     animation:modalIn .18s ease;
   }
   @keyframes modalIn { from{opacity:0;transform:translateY(-16px)} to{opacity:1;transform:none} }
+  @keyframes spin { to { transform: rotate(360deg); } }
   .mbx-modal-header {
     display:flex; align-items:flex-start; justify-content:space-between;
     padding:24px 28px 16px; border-bottom:1px solid #e2e8f0; position:sticky; top:0;
@@ -5402,6 +5445,283 @@ function renderBatchCompareChart(batches) {
 }
 
 // ══════════════════════════════════════════════════════════════════
+// MIGRATION TRENDS PANEL
+// ══════════════════════════════════════════════════════════════════
+var trendMailboxList = [];
+var selectedTrendMailbox = null;
+
+function initTrendsPanel() {
+  var apiBase = window.WATCH_API_BASE;
+  console.log('[TrendsPanel] initTrendsPanel called, apiBase:', apiBase);
+  if (!apiBase) return;
+
+  // Show the trends tab
+  var tab = document.getElementById('tab-trends');
+  console.log('[TrendsPanel] tab-trends element:', tab);
+  if (tab) tab.style.display = '';
+
+  // Load mailbox list
+  loadTrendMailboxes();
+
+  // Auto-refresh mailbox list every 60 seconds
+  setInterval(function() {
+    var panel = document.getElementById('panel-trends');
+    if (panel && panel.classList.contains('active')) {
+      loadTrendMailboxes();
+    }
+  }, 60000);
+}
+
+function loadTrendMailboxes() {
+  var apiBase = window.WATCH_API_BASE;
+  console.log('[TrendsPanel] loadTrendMailboxes called, apiBase:', apiBase);
+  if (!apiBase) return;
+
+  var listEl = document.getElementById('trend-mailbox-list');
+  console.log('[TrendsPanel] trend-mailbox-list element:', listEl);
+
+  fetch(apiBase + '/api/trend-mailboxes')
+    .then(function(r) { return r.json(); })
+    .then(function(res) {
+      console.log('[TrendsPanel] API response:', res);
+      if (!res.ok) {
+        var errHtml = '<div style="text-align:center;padding:40px 20px;color:#ef4444;font-size:.85rem;">' + (res.error || 'Failed to load') + '</div>';
+        if (res.needsDetailReport) {
+          errHtml = '<div style="text-align:center;padding:40px 20px;color:#f59e0b;font-size:.85rem;">⚠️ Trend tracking requires<br><code>-IncludeDetailReport</code><br><br>Restart with this flag to enable.</div>';
+        }
+        document.getElementById('trend-mailbox-list').innerHTML = errHtml;
+        return;
+      }
+      trendMailboxList = res.data || [];
+      console.log('[TrendsPanel] trendMailboxList:', trendMailboxList);
+      if (trendMailboxList.length === 0 && res.message) {
+        document.getElementById('trend-mailbox-list').innerHTML =
+          '<div style="text-align:center;padding:40px 20px;color:#94a3b8;font-size:.85rem;">' + res.message + '</div>';
+        document.getElementById('trend-mailbox-count').textContent = '0';
+        return;
+      }
+      renderTrendMailboxList(trendMailboxList);
+      document.getElementById('trend-mailbox-count').textContent = trendMailboxList.length;
+    })
+    .catch(function(e) {
+      console.error('[TrendsPanel] Error:', e);
+      document.getElementById('trend-mailbox-list').innerHTML =
+        '<div style="text-align:center;padding:40px 20px;color:#ef4444;font-size:.85rem;">Failed to load mailboxes<br><small>' + e.message + '</small></div>';
+    });
+}
+
+function renderTrendMailboxList(mailboxes) {
+  console.log('[TrendsPanel] renderTrendMailboxList called with:', mailboxes);
+  var container = document.getElementById('trend-mailbox-list');
+  console.log('[TrendsPanel] container element:', container);
+  if (!container) return;
+
+  if (mailboxes.length === 0) {
+    container.innerHTML = '<div style="text-align:center;padding:40px 20px;color:#94a3b8;font-size:.85rem;">No trend data available yet.<br>Data will appear after multiple refresh cycles.</div>';
+    return;
+  }
+
+  var html = mailboxes.map(function(mbx) {
+    console.log('[TrendsPanel] Processing mailbox:', mbx);
+    var isSelected = selectedTrendMailbox === mbx.Name;
+    var statusColor = mbx.Status === 'Completed' ? '#22c55e' : mbx.Status === 'Failed' ? '#ef4444' : mbx.Status === 'InProgress' ? '#3b82f6' : '#94a3b8';
+    var pctColor = mbx.PercentComplete >= 95 ? '#22c55e' : mbx.PercentComplete >= 50 ? '#3b82f6' : '#64748b';
+
+    return '<div class="trend-mbx-item' + (isSelected ? ' selected' : '') + '" onclick="selectTrendMailbox(\'' + mbx.Name.replace(/'/g, "\\'") + '\')" style="' +
+      'padding:10px 12px;margin-bottom:4px;border-radius:8px;cursor:pointer;' +
+      'background:' + (isSelected ? '#e0e7ff' : '#fff') + ';' +
+      'border:1px solid ' + (isSelected ? '#818cf8' : '#e2e8f0') + ';' +
+      'transition:all .15s;">' +
+      '<div style="display:flex;align-items:center;justify-content:space-between;">' +
+        '<div style="font-weight:500;font-size:.85rem;color:#1e293b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:160px;" title="' + mbx.Name + '">' + mbx.Name + '</div>' +
+        '<div style="font-size:.75rem;font-weight:600;color:' + pctColor + ';">' + (mbx.PercentComplete || 0) + '%</div>' +
+      '</div>' +
+      '<div style="display:flex;align-items:center;gap:6px;margin-top:4px;">' +
+        '<span style="width:6px;height:6px;border-radius:50%;background:' + statusColor + ';"></span>' +
+        '<span style="font-size:.72rem;color:#64748b;">' + (mbx.Status || 'Unknown') + '</span>' +
+        '<span style="font-size:.72rem;color:#94a3b8;margin-left:auto;">' + (mbx.DataPoints || 0) + ' points</span>' +
+      '</div>' +
+    '</div>';
+  }).join('');
+
+  console.log('[TrendsPanel] Generated HTML length:', html.length);
+  container.innerHTML = html;
+  console.log('[TrendsPanel] Container innerHTML set');
+}
+
+function filterTrendMailboxes(query) {
+  if (!query) {
+    renderTrendMailboxList(trendMailboxList);
+    return;
+  }
+  var q = query.toLowerCase();
+  var filtered = trendMailboxList.filter(function(mbx) {
+    return mbx.Name.toLowerCase().indexOf(q) !== -1;
+  });
+  renderTrendMailboxList(filtered);
+}
+
+function selectTrendMailbox(name) {
+  selectedTrendMailbox = name;
+
+  // Update selection in list
+  renderTrendMailboxList(trendMailboxList.filter(function(mbx) {
+    var q = document.getElementById('trend-search').value.toLowerCase();
+    return !q || mbx.Name.toLowerCase().indexOf(q) !== -1;
+  }));
+
+  // Update header
+  document.getElementById('trend-selected-name').textContent = name;
+  document.getElementById('trend-selected-sub').textContent = 'Loading trend data...';
+
+  // Load trend data
+  var apiBase = window.WATCH_API_BASE;
+  var contentEl = document.getElementById('trend-content');
+
+  contentEl.innerHTML = '<div style="text-align:center;padding:60px;color:#64748b;"><div class="spinner" style="width:32px;height:32px;border:3px solid #e2e8f0;border-top-color:#3b82f6;border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 16px;"></div>Loading trend data...</div>';
+
+  fetch(apiBase + '/api/mailbox-trend?name=' + encodeURIComponent(name))
+    .then(function(r) { return r.json(); })
+    .then(function(res) {
+      if (!res.ok || !res.data || res.data.length === 0) {
+        document.getElementById('trend-selected-sub').textContent = 'No trend data available';
+        contentEl.innerHTML = '<div style="text-align:center;padding:60px 40px;color:#94a3b8;"><div style="font-size:3rem;margin-bottom:16px;">📭</div><div>No trend data available for this mailbox yet.</div></div>';
+        return;
+      }
+
+      var mbxInfo = trendMailboxList.find(function(m) { return m.Name === name; });
+      document.getElementById('trend-selected-sub').textContent =
+        (mbxInfo ? mbxInfo.Status + ' • ' + mbxInfo.PercentComplete + '% complete • ' : '') +
+        res.data.length + ' data points';
+
+      renderTrendPanelContent(res.data);
+    })
+    .catch(function(e) {
+      document.getElementById('trend-selected-sub').textContent = 'Failed to load';
+      contentEl.innerHTML = '<div style="text-align:center;padding:60px 40px;color:#ef4444;">Failed to load trend data</div>';
+    });
+}
+
+function renderTrendPanelContent(data) {
+  var contentEl = document.getElementById('trend-content');
+  if (!contentEl) return;
+
+  // Sort data by timestamp (oldest first for chronological order)
+  var sortedByTime = data.slice().sort(function(a, b) {
+    if (!a.Timestamp) return -1;
+    if (!b.Timestamp) return 1;
+    return new Date(a.Timestamp) - new Date(b.Timestamp);
+  });
+
+  // Separate data by type (using sorted data)
+  var progressPoints = sortedByTime.filter(function(d) { return d.Type === 'Progress' || d.Type === 'Anchor'; });
+  var transferPoints = sortedByTime.filter(function(d) { return d.Type === 'Transfer' || d.Type === 'Anchor'; });
+
+  // Build timeline table (show newest first for readability)
+  var html = '<div style="margin-bottom:24px;">';
+  html += '<div style="font-size:.75rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:#94a3b8;margin-bottom:12px;">Migration Timeline</div>';
+  html += '<div style="overflow-x:auto;max-height:280px;overflow-y:auto;border:1px solid #e2e8f0;border-radius:8px;">';
+  html += '<table style="width:100%;font-size:.8rem;border-collapse:collapse;">';
+  html += '<thead><tr style="background:#f8fafc;position:sticky;top:0;">';
+  html += '<th style="padding:10px 12px;text-align:left;border-bottom:2px solid #e2e8f0;font-weight:600;">Date/Time</th>';
+  html += '<th style="padding:10px 12px;text-align:left;border-bottom:2px solid #e2e8f0;font-weight:600;">Type</th>';
+  html += '<th style="padding:10px 12px;text-align:left;border-bottom:2px solid #e2e8f0;font-weight:600;">Stage</th>';
+  html += '<th style="padding:10px 12px;text-align:right;border-bottom:2px solid #e2e8f0;font-weight:600;">Elapsed</th>';
+  html += '<th style="padding:10px 12px;text-align:right;border-bottom:2px solid #e2e8f0;font-weight:600;">% Complete</th>';
+  html += '<th style="padding:10px 12px;text-align:right;border-bottom:2px solid #e2e8f0;font-weight:600;">Transferred</th>';
+  html += '<th style="padding:10px 12px;text-align:right;border-bottom:2px solid #e2e8f0;font-weight:600;">Items</th>';
+  html += '</tr></thead><tbody>';
+
+  // Show newest first in table for readability
+  var tableData = sortedByTime.slice().reverse();
+  tableData.forEach(function(d) {
+    var typeColor = d.Type === 'Anchor' ? '#22c55e' : d.Type === 'Progress' ? '#3b82f6' : '#f59e0b';
+    var typeBadge = '<span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:.7rem;font-weight:600;background:' + typeColor + '20;color:' + typeColor + ';">' + d.Type + '</span>';
+    var transferred = d.TransferredGB ? d.TransferredGB.toFixed(3) + ' GB' : (d.BytesTransferred ? (d.BytesTransferred / 1024 / 1024).toFixed(2) + ' MB' : '—');
+    var pctColor = d.PercentComplete >= 95 ? '#22c55e' : d.PercentComplete >= 50 ? '#3b82f6' : '#64748b';
+
+    html += '<tr style="border-bottom:1px solid #f1f5f9;">';
+    html += '<td style="padding:8px 12px;font-family:monospace;font-size:.75rem;white-space:nowrap;">' + (d.TimeLabel || '—') + '</td>';
+    html += '<td style="padding:8px 12px;">' + typeBadge + '</td>';
+    html += '<td style="padding:8px 12px;">' + (d.Stage || '—') + '</td>';
+    html += '<td style="padding:8px 12px;text-align:right;font-family:monospace;">' + (d.ElapsedMin != null ? d.ElapsedMin.toFixed(1) + 'm' : '—') + '</td>';
+    html += '<td style="padding:8px 12px;text-align:right;font-weight:600;color:' + pctColor + ';">' + (d.PercentComplete != null ? d.PercentComplete + '%' : '—') + '</td>';
+    html += '<td style="padding:8px 12px;text-align:right;">' + transferred + '</td>';
+    html += '<td style="padding:8px 12px;text-align:right;">' + (d.ItemsTransferred || '—') + '</td>';
+    html += '</tr>';
+  });
+  html += '</tbody></table></div></div>';
+
+  // Charts section
+  html += '<div style="font-size:.75rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:#94a3b8;margin-bottom:12px;">Progress Charts</div>';
+  html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;">';
+  html += '<div style="background:#f8fafc;border-radius:8px;padding:16px;"><div style="font-size:.8rem;font-weight:600;color:#475569;margin-bottom:12px;">% Complete Over Time</div><div style="height:180px;"><canvas id="trendChart1"></canvas></div></div>';
+  html += '<div style="background:#f8fafc;border-radius:8px;padding:16px;"><div style="font-size:.8rem;font-weight:600;color:#475569;margin-bottom:12px;">Data Transferred</div><div style="height:180px;"><canvas id="trendChart2"></canvas></div></div>';
+  html += '</div>';
+
+  contentEl.innerHTML = html;
+
+  // Render charts (data already sorted chronologically)
+  if (typeof Chart !== 'undefined') {
+    var ctx1 = document.getElementById('trendChart1');
+    var ctx2 = document.getElementById('trendChart2');
+
+    if (ctx1 && progressPoints.length > 0) {
+      var pctLabels = progressPoints.map(function(d) { return d.TimeLabel || (d.ElapsedMin != null ? d.ElapsedMin.toFixed(0) + 'm' : '—'); });
+      var pctData = progressPoints.map(function(d) { return d.PercentComplete; });
+
+      new Chart(ctx1.getContext('2d'), {
+        type: 'line',
+        data: {
+          labels: pctLabels,
+          datasets: [{ label: '% Complete', data: pctData, borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.1)', fill: true, tension: 0.3, pointRadius: 4 }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: {
+            x: { title: { display: true, text: 'Date/Time', font: { size: 11 } }, grid: { color: 'rgba(0,0,0,0.05)' }, ticks: { maxRotation: 45, minRotation: 45, font: { size: 9 } } },
+            y: { beginAtZero: true, max: 100, title: { display: true, text: '%', font: { size: 11 } }, grid: { color: 'rgba(0,0,0,0.05)' } }
+          }
+        }
+      });
+    }
+
+    if (ctx2 && transferPoints.length > 0) {
+      var xferLabels = transferPoints.map(function(d) { return d.TimeLabel || (d.ElapsedMin != null ? d.ElapsedMin.toFixed(0) + 'm' : '—'); });
+      var xferData = transferPoints.map(function(d) {
+        if (d.TransferredGB) return d.TransferredGB;
+        if (d.BytesTransferred) return d.BytesTransferred / 1024 / 1024 / 1024;
+        return null;
+      });
+      var itemsData = transferPoints.map(function(d) { return d.ItemsTransferred; });
+
+      new Chart(ctx2.getContext('2d'), {
+        type: 'line',
+        data: {
+          labels: xferLabels,
+          datasets: [
+            { label: 'GB Transferred', data: xferData, borderColor: '#8b5cf6', tension: 0.3, pointRadius: 4, yAxisID: 'y' },
+            { label: 'Items', data: itemsData, borderColor: '#f59e0b', tension: 0.3, pointRadius: 4, yAxisID: 'y1' }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { display: true, position: 'bottom', labels: { boxWidth: 12, font: { size: 10 } } } },
+          scales: {
+            x: { title: { display: true, text: 'Date/Time', font: { size: 11 } }, grid: { color: 'rgba(0,0,0,0.05)' }, ticks: { maxRotation: 45, minRotation: 45, font: { size: 9 } } },
+            y: { type: 'linear', position: 'left', beginAtZero: true, title: { display: true, text: 'GB', font: { size: 11 } }, grid: { color: 'rgba(0,0,0,0.05)' } },
+            y1: { type: 'linear', position: 'right', beginAtZero: true, grid: { drawOnChartArea: false }, title: { display: true, text: 'Items', font: { size: 11 } } }
+          }
+        }
+      });
+    }
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════
 // AUTO-RETRY STATUS
 // ══════════════════════════════════════════════════════════════════
 var retryRefreshInterval = null;
@@ -5501,6 +5821,7 @@ window.addEventListener('load', function() {
   initTrendCharts();
   initBatchComparison();
   initRetryPanel();
+  initTrendsPanel();
   checkForAlerts();
   updateSummaryBar(
     document.querySelectorAll('#mbx-tbody tr').length, 0
@@ -5725,6 +6046,11 @@ $(if($ListenerPort -gt 0){
 
   // Expose API base for trend charts
   window.WATCH_API_BASE = API_BASE;
+
+  // Initialize trends panel now that API_BASE is available
+  if (typeof initTrendsPanel === 'function') {
+    initTrendsPanel();
+  }
 
   // When served via HTTP listener, use relative URLs (same origin, no CORS/ad-blocker issues)
 
@@ -6562,6 +6888,63 @@ function Start-WatchListener {
                             $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"ok`":false,`"error`":`"Failed to get mailbox trend: $errMsg`"}")
                         }
                     }
+                    elseif ($path -eq '/api/trend-mailboxes') {
+                        # Returns list of all mailboxes that have trend data
+                        $contentType = 'application/json; charset=utf-8'
+                        try {
+                            $includeDetail = $State['IncludeDetailReport']
+                            $trendCache = $State['MailboxTrendCache']
+                            $cachedMailboxes = $State['CachedMailboxes']
+
+                            if (-not $includeDetail) {
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"IncludeDetailReport not enabled. Run with -IncludeDetailReport to enable trend tracking.","needsDetailReport":true}')
+                            } elseif ($null -eq $trendCache -or @($trendCache.Keys).Count -eq 0) {
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true,"data":[],"message":"No trend data cached yet. Wait for multiple refresh cycles."}')
+                            } else {
+                                # Build list of mailboxes with trend data
+                                $mailboxList = @()
+                                foreach ($mbxName in @($trendCache.Keys)) {
+                                    $trendData = $trendCache[$mbxName]
+                                    $dataPoints = if ($trendData) { @($trendData).Count } else { 0 }
+
+                                    # Get current status from cached mailboxes
+                                    $mbxInfo = $null
+                                    if ($cachedMailboxes) {
+                                        $mbxInfo = $cachedMailboxes | Where-Object {
+                                            $_.DisplayName -eq $mbxName -or $_.Alias -eq $mbxName -or $_.EmailAddress -eq $mbxName
+                                        } | Select-Object -First 1
+                                    }
+
+                                    $status = if ($mbxInfo) { $mbxInfo.StatusDetail } else { 'Unknown' }
+                                    $pctComplete = if ($mbxInfo) { [int]$mbxInfo.PercentComplete } else { 0 }
+
+                                    # Get latest percent from trend data if available
+                                    if ($trendData -and @($trendData).Count -gt 0) {
+                                        $latestPoint = @($trendData) | Select-Object -Last 1
+                                        if ($latestPoint.PercentComplete) {
+                                            $pctComplete = [int]$latestPoint.PercentComplete
+                                        }
+                                    }
+
+                                    $mailboxList += @{
+                                        Name = $mbxName
+                                        Status = $status
+                                        PercentComplete = $pctComplete
+                                        DataPoints = $dataPoints
+                                    }
+                                }
+
+                                # Sort by name
+                                $mailboxList = @($mailboxList | Sort-Object { $_.Name })
+
+                                $json = @{ ok = $true; data = @($mailboxList) } | ConvertTo-Json -Depth 4 -Compress
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+                            }
+                        } catch {
+                            $errMsg = $_.Exception.Message -replace '"', "'"
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"ok`":false,`"error`":`"Failed to get trend mailboxes: $errMsg`"}")
+                        }
+                    }
                     elseif ($path -eq '/api/batch-stats') {
                         $contentType = 'application/json; charset=utf-8'
                         try {
@@ -7288,7 +7671,8 @@ if ($MyInvocation.InvocationName -ne '.') {
                                         @{
                                             Type             = $_.Type
                                             Timestamp        = if ($_.Timestamp) { $_.Timestamp.ToString('yyyy-MM-ddTHH:mm:ss') } else { $null }
-                                            TimeLabel        = if ($_.Timestamp) { $_.Timestamp.ToString('HH:mm') } else { $null }
+                                            DateLabel        = if ($_.Timestamp) { $_.Timestamp.ToString('MM/dd') } else { $null }
+                                            TimeLabel        = if ($_.Timestamp) { $_.Timestamp.ToString('MM/dd HH:mm') } else { $null }
                                             ElapsedMin       = $_.ElapsedMin
                                             Stage            = $_.Stage
                                             PercentComplete  = $_.PercentComplete
@@ -7444,6 +7828,35 @@ if ($MyInvocation.InvocationName -ne '.') {
                 # ── Countdown — check for pending API commands every second ──────
                 for ($i = $RefreshIntervalSeconds; $i -gt 0; $i--) {
                     $watchState['NextIn'] = $i
+
+                    # Handle pause state - stay at current countdown value
+                    while ($watchState['IsPaused']) {
+                        Write-Progress -Activity "Watch Mode [PAUSED]" `
+                                       -Status "Paused at ${i}s  |  Iter $iteration  |  $($watchState['CurrentScope'])  |  API $apiUrl" `
+                                       -PercentComplete ([math]::Round((($RefreshIntervalSeconds - $i) / $RefreshIntervalSeconds) * 100))
+                        Start-Sleep -Seconds 1
+
+                        # Check for commands while paused
+                        while ($watchState['PendingCommands'].Count -gt 0) {
+                            $cmd = $watchState['PendingCommands'][0]
+                            $watchState['PendingCommands'].RemoveAt(0)
+
+                            if ($cmd.Action -eq 'UpdatePaused') {
+                                $watchState['IsPaused'] = $cmd.Paused
+                                if (-not $cmd.Paused) {
+                                    Write-Console "Auto-refresh RESUMED" -Level Success -NoTimestamp
+                                }
+                            }
+                            elseif ($cmd.Action -eq 'refresh') {
+                                # Force refresh even when paused
+                                $watchState['IsPaused'] = $false
+                                Write-Console "Manual refresh requested - resuming" -Level API -NoTimestamp
+                                $i = 1  # Exit countdown
+                                break
+                            }
+                        }
+                    }
+
                     Write-Progress -Activity "Watch Mode" `
                                    -Status "Next refresh in ${i}s  |  Iter $iteration  |  $($watchState['CurrentScope'])  |  API $apiUrl" `
                                    -PercentComplete ([math]::Round((($RefreshIntervalSeconds - $i) / $RefreshIntervalSeconds) * 100))
