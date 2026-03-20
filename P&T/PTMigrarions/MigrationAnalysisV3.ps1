@@ -1269,41 +1269,38 @@ function Test-ScheduledReportDue {
     if (-not $ScheduleConfig.Enabled) { return $false }
 
     $now = Get-Date
-    $targetTime = [datetime]::ParseExact($ScheduleConfig.ReportTime, 'H:mm', $null)
+    $targetTime = $null
+    foreach ($fmt in @('H:mm','HH:mm','h:mm tt','hh:mm tt')) {
+        try { $targetTime = [datetime]::ParseExact($ScheduleConfig.ReportTime, $fmt, $null); break } catch {}
+    }
+    if (-not $targetTime) { return $false }
     $targetHour = $targetTime.Hour
     $targetMinute = $targetTime.Minute
 
-    # Check if we already sent a report in this period
-    if ($script:LastScheduledReport) {
-        $timeSinceLast = ($now - $script:LastScheduledReport).TotalMinutes
-
-        switch ($ScheduleConfig.Schedule) {
-            'Hourly' {
-                if ($timeSinceLast -lt 55) { return $false }
-            }
-            'Daily' {
-                if ($timeSinceLast -lt 1380) { return $false }  # 23 hours
-            }
-            'Weekly' {
-                if ($timeSinceLast -lt 9900) { return $false }  # 6.5 days
-            }
-        }
-    }
+    # All timing logic is handled in the schedule-specific switch below
 
     switch ($ScheduleConfig.Schedule) {
         'Hourly' {
-            # Report at the top of each hour (within 5 min window)
-            return ($now.Minute -ge 0 -and $now.Minute -le 5)
+            # Due if we've never sent, or it's been at least 55 minutes since last
+            if (-not $script:LastScheduledReport) { return $true }
+            return (($now - $script:LastScheduledReport).TotalMinutes -ge 55)
         }
         'Daily' {
-            # Report at specified time (within 5 min window)
-            return ($now.Hour -eq $targetHour -and $now.Minute -ge $targetMinute -and $now.Minute -le ($targetMinute + 5))
+            # Due if target time has passed today and we haven't sent today
+            $todayTarget = $now.Date.AddHours($targetHour).AddMinutes($targetMinute)
+            if ($now -lt $todayTarget) { return $false }
+            if (-not $script:LastScheduledReport) { return $true }
+            # Sent already today at or after the target time
+            return ($script:LastScheduledReport.Date -lt $now.Date -or
+                    $script:LastScheduledReport -lt $todayTarget)
         }
         'Weekly' {
-            # Report on specified day at specified time
-            return ([int]$now.DayOfWeek -eq $ScheduleConfig.DayOfWeek -and
-                    $now.Hour -eq $targetHour -and
-                    $now.Minute -ge $targetMinute -and $now.Minute -le ($targetMinute + 5))
+            # Due if correct day, target time has passed, and not sent this week
+            if ([int]$now.DayOfWeek -ne $ScheduleConfig.DayOfWeek) { return $false }
+            $todayTarget = $now.Date.AddHours($targetHour).AddMinutes($targetMinute)
+            if ($now -lt $todayTarget) { return $false }
+            if (-not $script:LastScheduledReport) { return $true }
+            return (($now - $script:LastScheduledReport).TotalMinutes -ge 9900)  # 6.5 days
         }
     }
 
@@ -2072,8 +2069,10 @@ function Invoke-ProcessStats {
         $xferGB         = ConvertTo-GB $s.BytesTransferred
 
         # Microsoft uses TotalInProgressDuration.TotalSeconds for rate (not SyncDuration)
+        # Use SafeTicks to handle deserialized TimeSpan (string/int) from remote PS sessions
         $inProgressSec = try {
-            [double]$s.TotalInProgressDuration.TotalSeconds
+            $ticks = SafeTicks $s.TotalInProgressDuration
+            if ($ticks -gt 0) { [double]$ticks / 1e7 } else { 0 }
         } catch { 0 }
         $overallDurStr = try {
 
@@ -2480,6 +2479,42 @@ function Invoke-ProcessStats {
     $summary | Add-Member -NotePropertyName IsThrottled -NotePropertyValue $isThrottled -Force
     $summary | Add-Member -NotePropertyName ThrottleReasons -NotePropertyValue ($throttleReason -join "; ") -Force
 
+    # ── Cohort Analysis ─────────────────────────────────────────────────────
+    # Group mailboxes by size bucket; compute completion/failure rates and avg rate per bucket
+    $cohortDefs = @(
+        @{ Label = '0–1 GB';   Min = 0;  Max = 1  }
+        @{ Label = '1–5 GB';   Min = 1;  Max = 5  }
+        @{ Label = '5–10 GB';  Min = 5;  Max = 10 }
+        @{ Label = '10 GB+';   Min = 10; Max = [double]::MaxValue }
+    )
+    $cohortData = foreach ($bucket in $cohortDefs) {
+        $members = @($perMailbox | Where-Object {
+            $_.MailboxSizeGB -ge $bucket.Min -and $_.MailboxSizeGB -lt $bucket.Max
+        })
+        if ($members.Count -eq 0) { continue }
+        $completed = @($members | Where-Object { $_.Status -in @('Completed','CompletedWithWarning','CompletedWithSkippedItems','Synced') })
+        $failed    = @($members | Where-Object { $_.Status -eq 'Failed' })
+        $active    = @($members | Where-Object { $_.Status -in @('InProgress','AutoSuspended','Suspended','Queued') })
+        $rates     = @($members | Where-Object { $_.TransferRateGBph -gt 0 } | Select-Object -ExpandProperty TransferRateGBph)
+        $avgRate   = if ($rates.Count -gt 0) { [math]::Round(($rates | Measure-Object -Sum).Sum / $rates.Count, 4) } else { 0 }
+        $avgPct    = [math]::Round(($members | Measure-Object -Property PercentComplete -Average).Average, 1)
+        $avgSizeGB = [math]::Round(($members | Measure-Object -Property MailboxSizeGB -Average).Average, 2)
+        [PSCustomObject]@{
+            Bucket          = $bucket.Label
+            Count           = $members.Count
+            Completed       = $completed.Count
+            Failed          = $failed.Count
+            Active          = $active.Count
+            CompletionRate  = if ($members.Count -gt 0) { [math]::Round($completed.Count / $members.Count * 100, 1) } else { 0 }
+            FailureRate     = if ($members.Count -gt 0) { [math]::Round($failed.Count    / $members.Count * 100, 1) } else { 0 }
+            AvgTransferRateGBph = $avgRate
+            AvgTransferRateMBmin = [math]::Round($avgRate * 1024 / 60, 2)
+            AvgPercentComplete  = $avgPct
+            AvgSizeGB       = $avgSizeGB
+        }
+    }
+    $summary | Add-Member -NotePropertyName CohortAnalysis -NotePropertyValue @($cohortData) -Force
+
     return $summary
 }
 
@@ -2796,8 +2831,8 @@ function Export-HtmlReport {
 
                 " data-missing='$($_.MissingItems)'" +
 
-            " data-consistency='$($_.DataConsistencyScore)'" +
-            " data-factors='$($_.DataConsistencyFactors)'" +
+            " data-consistency='$([System.Web.HttpUtility]::HtmlAttributeEncode($_.DataConsistencyScore))'" +
+            " data-factors='$([System.Web.HttpUtility]::HtmlAttributeEncode($_.DataConsistencyFactors))'" +
             " data-syncstage='$($_.SyncStage)'" +
             " data-queued='$_tsQueued'" +
             " data-start='$_tsStart'" +
@@ -2932,8 +2967,8 @@ function Export-HtmlReport {
 
                 " data-missing='$($_.MissingItems)'" +
 
-                " data-consistency='$($_.DataConsistencyScore)'" +
-                " data-factors='$($_.DataConsistencyFactors)'" +
+                " data-consistency='$([System.Web.HttpUtility]::HtmlAttributeEncode($_.DataConsistencyScore))'" +
+                " data-factors='$([System.Web.HttpUtility]::HtmlAttributeEncode($_.DataConsistencyFactors))'" +
                 " data-syncstage='$($_.SyncStage)'" +
                 " data-queued='$_tsQueued'" +
                 " data-start='$_tsStart'" +
@@ -3393,6 +3428,7 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     <button class="main-tab"        onclick="switchMain('trends', this)" id="tab-trends" style="display:none">📈 Migration Trends</button>
     <button class="main-tab"        onclick="switchMain('compare', this)" id="tab-compare" style="display:none">📋 Batch Comparison</button>
     <button class="main-tab"        onclick="switchMain('retry', this)" id="tab-retry" style="display:none">🔄 Auto-Retry</button>
+    <button class="main-tab"        onclick="switchMain('cohort', this)" id="tab-cohort">🪣 Cohort Analysis</button>
   </div>
 
   <!-- Panel 1: Performance Analysis -->
@@ -3782,44 +3818,51 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
 
   <!-- Panel 3: Batch Comparison (Watch Mode Only) -->
   <div id="panel-compare" class="main-panel" style="display:none">
-    <div class="card">
-      <h2>📋 Batch Comparison</h2>
-      <p class="section-note">Compare performance metrics across multiple migration batches. Select batches to compare side-by-side. Only available in watch mode.</p>
+    <div class="card" style="padding:0;overflow:hidden;">
+      <div style="display:grid;grid-template-columns:260px 1fr;min-height:500px;">
 
-      <div style="margin-bottom:20px;">
-        <label style="font-weight:600;font-size:.85rem;color:#475569;">Select batches to compare:</label>
-        <div id="batch-selector" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;"></div>
-        <button class="ent-btn" onclick="loadBatchComparison()" style="margin-top:12px;">🔄 Load Comparison</button>
-      </div>
-
-      <div id="comparison-loading" style="display:none;text-align:center;padding:40px;color:#64748b;">
-        <div style="font-size:2rem;margin-bottom:10px;">⏳</div>
-        Loading batch data...
-      </div>
-
-      <div id="comparison-results" style="display:none;">
-        <!-- Comparison Chart -->
-        <div style="margin-bottom:24px;">
-          <div style="font-size:.85rem;font-weight:600;color:#64748b;margin-bottom:12px;">Performance Comparison</div>
-          <canvas id="chart-batch-compare" height="300"></canvas>
+        <!-- Left: Batch list -->
+        <div style="background:#f8fafc;border-right:1px solid #e2e8f0;display:flex;flex-direction:column;">
+          <div style="padding:16px;border-bottom:1px solid #e2e8f0;">
+            <div style="font-weight:700;font-size:1rem;color:#1e293b;margin-bottom:4px;">📋 Batch Comparison</div>
+            <div style="font-size:.75rem;color:#64748b;">Select 2+ batches then click Compare</div>
+          </div>
+          <div style="padding:12px;flex:1;overflow-y:auto;">
+            <div id="batch-selector" style="display:flex;flex-direction:column;gap:6px;"></div>
+            <div id="compare-loading-batches" style="color:#94a3b8;font-size:.82rem;padding:8px 0;">Loading batches…</div>
+          </div>
+          <div style="padding:12px;border-top:1px solid #e2e8f0;">
+            <button class="ent-btn" onclick="loadBatchComparison()" style="width:100%;justify-content:center;">🔄 Compare Selected</button>
+            <div id="compare-selection-hint" style="font-size:.75rem;color:#94a3b8;text-align:center;margin-top:6px;">0 batches selected</div>
+          </div>
         </div>
 
-        <!-- Comparison Table -->
-        <div class="tbl-wrap">
-          <table id="comparison-table">
-            <thead>
-              <tr>
-                <th>Metric</th>
-              </tr>
-            </thead>
-            <tbody id="comparison-tbody"></tbody>
-          </table>
-        </div>
-      </div>
+        <!-- Right: Comparison results -->
+        <div style="padding:20px;overflow-y:auto;">
+          <div id="comparison-loading" style="display:none;text-align:center;padding:60px;color:#64748b;">
+            <div style="font-size:2rem;margin-bottom:10px;">⏳</div>
+            Loading batch data…
+          </div>
 
-      <div id="comparison-empty" style="text-align:center;padding:40px;color:#94a3b8;">
-        <div style="font-size:3rem;margin-bottom:10px;">📊</div>
-        <div>Select at least 2 batches above and click "Load Comparison" to compare their performance.</div>
+          <div id="comparison-results" style="display:none;">
+            <div style="margin-bottom:24px;">
+              <div style="font-size:.85rem;font-weight:600;color:#64748b;margin-bottom:12px;">Performance Comparison</div>
+              <canvas id="chart-batch-compare" height="220"></canvas>
+            </div>
+            <div class="tbl-wrap">
+              <table id="comparison-table" style="width:100%">
+                <thead><tr><th>Metric</th></tr></thead>
+                <tbody id="comparison-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div id="comparison-empty" style="text-align:center;padding:60px;color:#94a3b8;">
+            <div style="font-size:3rem;margin-bottom:10px;">📊</div>
+            <div>Select 2 or more batches from the list on the left, then click <strong>Compare Selected</strong>.</div>
+          </div>
+        </div>
+
       </div>
     </div>
   </div><!-- /panel-compare -->
@@ -3876,6 +3919,55 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
       </div>
     </div>
   </div><!-- /panel-retry -->
+
+  <!-- Panel 5: Cohort Analysis (always visible) -->
+  <div id="panel-cohort" class="main-panel" style="display:none">
+    <div class="card">
+      <div style="display:flex;align-items:baseline;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:18px">
+        <h2 style="margin:0;border:none;padding:0">🪣 Mailbox Cohort Analysis</h2>
+        <span style="font-size:.78rem;color:#64748b" id="cohort-updated">—</span>
+      </div>
+      <p style="font-size:.82rem;color:#64748b;margin:0 0 18px">Mailboxes grouped by total size. Completion rate, failure rate, and average transfer rate per bucket help identify whether large mailboxes are systematically slower.</p>
+
+      <!-- Summary cards row -->
+      <div id="cohort-cards" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-bottom:24px"></div>
+
+      <!-- Table -->
+      <div style="overflow-x:auto">
+        <table id="cohort-table" style="width:100%;border-collapse:collapse;font-size:.85rem">
+          <thead>
+            <tr style="background:#f1f5f9;text-align:left">
+              <th style="padding:8px 12px;border-bottom:2px solid #e2e8f0">Size Bucket</th>
+              <th style="padding:8px 12px;border-bottom:2px solid #e2e8f0;text-align:right">Mailboxes</th>
+              <th style="padding:8px 12px;border-bottom:2px solid #e2e8f0;text-align:right">Avg Size</th>
+              <th style="padding:8px 12px;border-bottom:2px solid #e2e8f0;text-align:right">Active</th>
+              <th style="padding:8px 12px;border-bottom:2px solid #e2e8f0;text-align:right">Completed</th>
+              <th style="padding:8px 12px;border-bottom:2px solid #e2e8f0;text-align:right">Failed</th>
+              <th style="padding:8px 12px;border-bottom:2px solid #e2e8f0;text-align:right">Completion %</th>
+              <th style="padding:8px 12px;border-bottom:2px solid #e2e8f0;text-align:right">Failure %</th>
+              <th style="padding:8px 12px;border-bottom:2px solid #e2e8f0;text-align:right">Avg Rate (MB/min)</th>
+              <th style="padding:8px 12px;border-bottom:2px solid #e2e8f0;text-align:right">Avg % Done</th>
+            </tr>
+          </thead>
+          <tbody id="cohort-tbody">
+            <tr><td colspan="10" style="padding:24px;text-align:center;color:#94a3b8">Loading cohort data…</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Bar chart canvas -->
+      <div style="margin-top:28px;display:grid;grid-template-columns:1fr 1fr;gap:24px" id="cohort-charts">
+        <div>
+          <div style="font-weight:600;font-size:.85rem;color:#475569;margin-bottom:8px">Completion Rate by Bucket (%)</div>
+          <canvas id="cohort-chart-completion" height="160"></canvas>
+        </div>
+        <div>
+          <div style="font-weight:600;font-size:.85rem;color:#475569;margin-bottom:8px">Avg Transfer Rate by Bucket (MB/min)</div>
+          <canvas id="cohort-chart-rate" height="160"></canvas>
+        </div>
+      </div>
+    </div>
+  </div><!-- /panel-cohort -->
 
   <div class="footer">
     Exchange Migration Analyzer &nbsp;•&nbsp; Generated $($Summary.GeneratedAt.ToString("R"))
@@ -4069,8 +4161,142 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
   function switchMain(id, btn) {
     document.querySelectorAll('.main-panel').forEach(function(p){ p.classList.remove('active'); });
     document.querySelectorAll('.main-tab').forEach(function(b){ b.classList.remove('active'); });
-    document.getElementById('panel-' + id).classList.add('active');
+    var panel = document.getElementById('panel-' + id);
+    if (panel) { panel.style.display = ''; panel.classList.add('active'); }
     btn.classList.add('active');
+    if (id === 'cohort') { loadCohortData(); }
+  }
+
+  // ── Cohort Analysis ───────────────────────────────────────────────────────
+  var _cohortCompletionChart = null;
+  var _cohortRateChart       = null;
+
+  function _applyCohortData(data, label) {
+    var updEl = document.getElementById('cohort-updated');
+    if (!data || !data.length) {
+      if (updEl) updEl.textContent = label || 'No cohort data yet.';
+      var tb = document.getElementById('cohort-tbody');
+      if (tb) { tb.innerHTML = '<tr><td colspan="10" style="padding:24px;text-align:center;color:#94a3b8">' + (label || 'No cohort data yet. Wait for first refresh.') + '</td></tr>'; }
+      return;
+    }
+    if (updEl) updEl.textContent = label || ('Updated ' + new Date().toLocaleTimeString());
+    renderCohortCards(data);
+    renderCohortTable(data);
+    renderCohortCharts(data);
+  }
+
+  function loadCohortData() {
+    var apiBase = window.WATCH_API_BASE;
+    if (apiBase) {
+      // Watch mode — fetch live from server
+      fetch(apiBase + '/api/cohort-stats')
+        .then(function(r){ return r.json(); })
+        .then(function(res) {
+          _applyCohortData(res.data || [], res.message || ('Updated ' + new Date().toLocaleTimeString()));
+        })
+        .catch(function() {
+          var tb = document.getElementById('cohort-tbody');
+          if (tb) { tb.innerHTML = '<tr><td colspan="10" style="padding:24px;text-align:center;color:#ef4444">Failed to load cohort data.</td></tr>'; }
+        });
+    } else {
+      // Static report mode — use data injected at generation time
+      var data = (typeof COHORT_STATIC_DATA !== 'undefined') ? COHORT_STATIC_DATA : [];
+      _applyCohortData(data, data.length ? 'From report snapshot' : 'No cohort data in this report.');
+    }
+  }
+
+  function renderCohortCards(data) {
+    var el = document.getElementById('cohort-cards');
+    if (!el) return;
+    var total = data.reduce(function(s,b){ return s + b.Count; }, 0);
+    var totalComp = data.reduce(function(s,b){ return s + b.Completed; }, 0);
+    var totalFail = data.reduce(function(s,b){ return s + b.Failed; }, 0);
+    var totalActive = data.reduce(function(s,b){ return s + b.Active; }, 0);
+    var overallComp = total > 0 ? (totalComp / total * 100).toFixed(1) : '0.0';
+    var overallFail = total > 0 ? (totalFail / total * 100).toFixed(1) : '0.0';
+    el.innerHTML =
+      '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:14px 18px">' +
+        '<div style="font-size:.75rem;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">Total Mailboxes</div>' +
+        '<div style="font-size:1.6rem;font-weight:700;color:#1e293b">' + total + '</div>' +
+      '</div>' +
+      '<div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:14px 18px">' +
+        '<div style="font-size:.75rem;color:#166534;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">Overall Completion</div>' +
+        '<div style="font-size:1.6rem;font-weight:700;color:#166534">' + overallComp + '%</div>' +
+        '<div style="font-size:.78rem;color:#166534">' + totalComp + ' of ' + total + '</div>' +
+      '</div>' +
+      '<div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:14px 18px">' +
+        '<div style="font-size:.75rem;color:#9a3412;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">Active / In-Flight</div>' +
+        '<div style="font-size:1.6rem;font-weight:700;color:#9a3412">' + totalActive + '</div>' +
+      '</div>' +
+      '<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:14px 18px">' +
+        '<div style="font-size:.75rem;color:#991b1b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">Overall Failure Rate</div>' +
+        '<div style="font-size:1.6rem;font-weight:700;color:#991b1b">' + overallFail + '%</div>' +
+        '<div style="font-size:.78rem;color:#991b1b">' + totalFail + ' failed</div>' +
+      '</div>';
+  }
+
+  function renderCohortTable(data) {
+    var tb = document.getElementById('cohort-tbody');
+    if (!tb) return;
+    var rows = data.map(function(b) {
+      var compColor = b.CompletionRate >= 80 ? '#166534' : b.CompletionRate >= 50 ? '#854d0e' : '#991b1b';
+      var failColor = b.FailureRate   >=  5 ? '#991b1b' : b.FailureRate   >=  2 ? '#854d0e' : '#166534';
+      var rateColor = b.AvgTransferRateMBmin >= 1 ? '#166534' : b.AvgTransferRateMBmin >= 0.3 ? '#854d0e' : '#94a3b8';
+      return '<tr style="border-bottom:1px solid #f1f5f9">' +
+        '<td style="padding:8px 12px;font-weight:600">'                              + b.Bucket + '</td>' +
+        '<td style="padding:8px 12px;text-align:right">'                             + b.Count  + '</td>' +
+        '<td style="padding:8px 12px;text-align:right;color:#64748b">'               + b.AvgSizeGB + ' GB</td>' +
+        '<td style="padding:8px 12px;text-align:right">'                             + b.Active + '</td>' +
+        '<td style="padding:8px 12px;text-align:right;color:#166534">'               + b.Completed + '</td>' +
+        '<td style="padding:8px 12px;text-align:right;color:#991b1b">'               + b.Failed + '</td>' +
+        '<td style="padding:8px 12px;text-align:right;font-weight:600;color:' + compColor + '">' + b.CompletionRate + '%</td>' +
+        '<td style="padding:8px 12px;text-align:right;font-weight:600;color:' + failColor + '">' + b.FailureRate    + '%</td>' +
+        '<td style="padding:8px 12px;text-align:right;font-weight:600;color:' + rateColor + '">' + b.AvgTransferRateMBmin + '</td>' +
+        '<td style="padding:8px 12px;text-align:right;color:#64748b">'               + b.AvgPercentComplete + '%</td>' +
+      '</tr>';
+    });
+    tb.innerHTML = rows.join('');
+  }
+
+  function renderCohortCharts(data) {
+    var labels  = data.map(function(b){ return b.Bucket; });
+    var compPct = data.map(function(b){ return b.CompletionRate; });
+    var rates   = data.map(function(b){ return b.AvgTransferRateMBmin; });
+
+    var ctxC = document.getElementById('cohort-chart-completion');
+    var ctxR = document.getElementById('cohort-chart-rate');
+    if (!ctxC || !ctxR) return;
+
+    if (_cohortCompletionChart) { _cohortCompletionChart.destroy(); }
+    if (_cohortRateChart)       { _cohortRateChart.destroy(); }
+
+    var barDefaults = { borderWidth: 1, borderRadius: 4 };
+
+    _cohortCompletionChart = new Chart(ctxC, {
+      type: 'bar',
+      data: {
+        labels: labels,
+        datasets: [{ label: 'Completion %', data: compPct,
+          backgroundColor: compPct.map(function(v){ return v >= 80 ? 'rgba(34,197,94,.7)' : v >= 50 ? 'rgba(245,158,11,.7)' : 'rgba(239,68,68,.7)'; }),
+          borderColor:      compPct.map(function(v){ return v >= 80 ? '#16a34a' : v >= 50 ? '#d97706' : '#dc2626'; }),
+          ...barDefaults }]
+      },
+      options: { responsive: true, plugins: { legend: { display: false } },
+        scales: { y: { min: 0, max: 100, ticks: { callback: function(v){ return v + '%'; } } } } }
+    });
+
+    _cohortRateChart = new Chart(ctxR, {
+      type: 'bar',
+      data: {
+        labels: labels,
+        datasets: [{ label: 'MB/min', data: rates,
+          backgroundColor: rates.map(function(v){ return v >= 1 ? 'rgba(59,130,246,.7)' : v >= 0.3 ? 'rgba(245,158,11,.7)' : 'rgba(148,163,184,.5)'; }),
+          borderColor:      rates.map(function(v){ return v >= 1 ? '#2563eb' : v >= 0.3 ? '#d97706' : '#94a3b8'; }),
+          ...barDefaults }]
+      },
+      options: { responsive: true, plugins: { legend: { display: false } },
+        scales: { y: { min: 0, ticks: { callback: function(v){ return v + ' MB/m'; } } } } }
+    });
   }
 </script>
 
@@ -5336,23 +5562,43 @@ function initBatchComparison() {
   fetch(apiBase + '/api/batches')
     .then(function(r) { return r.json(); })
     .then(function(batches) {
+      var loadingEl = document.getElementById('compare-loading-batches');
+      if (loadingEl) loadingEl.style.display = 'none';
       var selector = document.getElementById('batch-selector');
-      if (!selector || !batches || batches.length === 0) return;
-
+      if (!selector) return;
+      if (!batches || batches.length === 0) {
+        selector.innerHTML = '<div style="color:#94a3b8;font-size:.82rem;">No batches found.</div>';
+        return;
+      }
+      if (!Array.isArray(batches)) batches = [batches];
       selector.innerHTML = batches.map(function(b) {
-        return '<label style="display:flex;align-items:center;gap:6px;padding:6px 12px;background:#f1f5f9;border-radius:6px;cursor:pointer;font-size:.85rem;">' +
-          '<input type="checkbox" class="batch-checkbox" value="' + b.Name + '" onchange="updateSelectedBatches()">' +
-          '<span>' + b.Name + '</span>' +
-          '<span style="color:#94a3b8;font-size:.75rem;">(' + b.Count + ')</span>' +
+        var name  = b.Name  || b.name  || '';
+        var count = b.Count || b.count || 0;
+        return '<label style="display:flex;align-items:center;gap:8px;padding:8px 10px;background:#fff;border:1px solid #e2e8f0;border-radius:6px;cursor:pointer;font-size:.85rem;transition:background .1s;"' +
+          ' onmouseover="this.style.background=\'#f1f5f9\'" onmouseout="this.style.background=\'#fff\'">' +
+          '<input type="checkbox" class="batch-checkbox" value="' + name + '" onchange="updateSelectedBatches()" style="width:14px;height:14px;cursor:pointer;">' +
+          '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + name + '">' + name + '</span>' +
+          '<span style="color:#94a3b8;font-size:.75rem;flex-shrink:0;">' + count + '</span>' +
         '</label>';
       }).join('');
     })
-    .catch(function(e) { console.log('Failed to load batches:', e); });
+    .catch(function(e) {
+      var loadingEl = document.getElementById('compare-loading-batches');
+      if (loadingEl) { loadingEl.textContent = 'Failed to load batches.'; }
+      console.log('Failed to load batches:', e);
+    });
 }
 
 function updateSelectedBatches() {
   var checkboxes = document.querySelectorAll('.batch-checkbox:checked');
   selectedBatches = Array.from(checkboxes).map(function(cb) { return cb.value; });
+  var hint = document.getElementById('compare-selection-hint');
+  if (hint) {
+    hint.textContent = selectedBatches.length === 0
+      ? '0 batches selected'
+      : selectedBatches.length + ' batch' + (selectedBatches.length > 1 ? 'es' : '') + ' selected';
+    hint.style.color = selectedBatches.length >= 2 ? '#3b82f6' : '#94a3b8';
+  }
 }
 
 function loadBatchComparison() {
@@ -5373,18 +5619,30 @@ function loadBatchComparison() {
     return fetch(apiBase + '/api/batch-stats?batch=' + encodeURIComponent(batchName))
       .then(function(r) { return r.json(); })
       .then(function(data) {
+        if (!data.ok) { return { BatchName: batchName, error: true, errorMsg: data.error || 'Not found' }; }
         data.BatchName = batchName;
         return data;
       })
       .catch(function() {
-        return { BatchName: batchName, error: true };
+        return { BatchName: batchName, error: true, errorMsg: 'Request failed' };
       });
   });
 
   Promise.all(promises).then(function(results) {
     document.getElementById('comparison-loading').style.display = 'none';
-    document.getElementById('comparison-results').style.display = 'block';
-    renderBatchComparison(results.filter(function(r) { return !r.error; }));
+    var good = results.filter(function(r) { return !r.error; });
+    var bad  = results.filter(function(r) { return  r.error; });
+    if (good.length === 0) {
+      var emptyEl = document.getElementById('comparison-empty');
+      emptyEl.innerHTML = '<div style="font-size:2rem;margin-bottom:10px;">⚠️</div>' +
+        '<div style="color:#ef4444;">Could not load data for selected batch' + (bad.length > 1 ? 'es' : '') + ': ' +
+        bad.map(function(b){ return '<strong>' + b.BatchName + '</strong> (' + b.errorMsg + ')'; }).join(', ') + '</div>';
+      emptyEl.style.display = 'block';
+    } else {
+      document.getElementById('comparison-results').style.display = 'block';
+      document.getElementById('comparison-empty').style.display = 'none';
+      renderBatchComparison(good);
+    }
   });
 }
 
@@ -5945,7 +6203,7 @@ function initRetryPanel() {
   // Auto-refresh every 30 seconds when on retry panel
   retryRefreshInterval = setInterval(function() {
     var panel = document.getElementById('panel-retry');
-    if (panel && panel.style.display !== 'none') {
+    if (panel && panel.classList.contains('active')) {
       refreshRetryStatus();
     }
   }, 30000);
@@ -6060,6 +6318,8 @@ $(if($ListenerPort -gt 0){
     <div class='watch-stat'><span class='wl'>Mailboxes</span><span class='wv' id='wCount'>&#x2014;</span></div>
 
     <div class='watch-stat'><span class='wl'>Scope</span><span class='wv' id='wScope' style='max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap'>&#x2014;</span></div>
+
+    <div class='watch-stat' id='wPausedRow' style='display:none'><span class='wl'>Status</span><span class='wv' style='color:#f59e0b;font-weight:700'>&#x23F8; PAUSED</span></div>
 
     <div class='watch-prog'><div class='watch-prog-fill' id='wProg' style='width:0%'></div></div>
 
@@ -6241,6 +6501,15 @@ $(if($ListenerPort -gt 0){
 })
 
 <script>
+  // Cohort data embedded at report-generation time (used in static report mode)
+  var COHORT_STATIC_DATA = $( if ($Summary.CohortAnalysis -and @($Summary.CohortAnalysis).Count -gt 0) { @($Summary.CohortAnalysis) | ConvertTo-Json -Depth 4 -Compress } else { '[]' } );
+  // In static report mode, pre-load cohort data so it's ready when the tab is opened
+  document.addEventListener('DOMContentLoaded', function() {
+    if (!window.WATCH_API_BASE && typeof loadCohortData === 'function') { loadCohortData(); }
+  });
+</script>
+
+<script>
 // ═══════════════════════════════════════════════════════════════════
 // WATCH MODE API CLIENT
 // ═══════════════════════════════════════════════════════════════════
@@ -6354,11 +6623,13 @@ $(if($ListenerPort -gt 0){
   function pollStatus() {
     apiCall('/api/status').then(function(data) {
       if (!data.ok) { setDot('err'); return; }
-      setDot(data.isRefreshing ? 'stale' : 'ok');
+      setDot(data.isRefreshing ? 'stale' : (data.isPaused ? 'stale' : 'ok'));
       setText('wLastRefresh', data.lastRefresh || '--');
       setText('wIter',  data.iteration || '--');
       setText('wCount', data.mailboxCount || '--');
       setText('wScope', data.currentScope || 'All');
+      var pausedRow = document.getElementById('wPausedRow');
+      if (pausedRow) pausedRow.style.display = data.isPaused ? '' : 'none';
 
       if (!data.isRefreshing && data.nextIn > 0) {
         var pct = ((watchInterval - data.nextIn) / watchInterval) * 100;
@@ -6368,17 +6639,33 @@ $(if($ListenerPort -gt 0){
     }).catch(function() { setDot('err'); });
   }
 
+  var _loadedBatchCount = 0;
   function loadBatches() {
     apiCall('/api/batches').then(function(batches) {
       var container = document.getElementById('wBatchItems');
-      if (!container || !batches || !batches.length) return;
+      if (!container || !batches) return;
+      // Normalize: PS ConvertTo-Json returns object (not array) for single item
+      if (!Array.isArray(batches)) batches = [batches];
+      if (!batches.length) return;
+      // Only re-render if batch count changed (avoids resetting user selections)
+      if (batches.length === _loadedBatchCount) return;
+      _loadedBatchCount = batches.length;
+      // Preserve currently checked values
+      var checked = {};
+      container.querySelectorAll('.batch-cb:checked').forEach(function(cb){ checked[cb.value] = true; });
       container.innerHTML = '';
       batches.forEach(function(b) {
+        // Handle both PascalCase (PS hashtable) and lowercase (PS PSCustomObject) keys
+        var name  = b.Name  || b.name  || '';
+        var count = b.Count || b.count || 0;
+        if (!name) return;
         var label = document.createElement('label');
         label.className = 'batch-checkbox-item';
-        label.innerHTML = '<input type="checkbox" class="batch-cb" value="' + b.Name + '" onchange="updateBatchSelection()"> ' + b.Name + ' <span style="color:#64748b;">(' + b.Count + ')</span>';
+        label.innerHTML = '<input type="checkbox" class="batch-cb" value="' + name + '" onchange="updateBatchSelection()"> ' + name + ' <span style="color:#64748b;">(' + count + ')</span>';
+        if (checked[name]) label.querySelector('input').checked = true;
         container.appendChild(label);
       });
+      updateBatchLabel();
     }).catch(function(){});
   }
 
@@ -6720,6 +7007,7 @@ $(if($ListenerPort -gt 0){
     setInterval(pollStatus, 3000);         // status poll every 3s
     setInterval(tickCountdown, 500);       // smooth progress every 0.5s
     setInterval(syncPanelState, 10000);    // sync panel state every 10s
+    setInterval(loadBatches, 15000);       // refresh batch list every 15s (picks up new batches)
   });
 })();
 </script>
@@ -7026,16 +7314,10 @@ function Start-WatchListener {
                     elseif ($path -eq '/api/batches') {
                         $contentType = 'application/json; charset=utf-8'
                         try {
-                            $cachedMailboxes = $State['CachedMailboxes']
-                            if ($cachedMailboxes -and $cachedMailboxes.Count -gt 0) {
-                                $batchGroups = $cachedMailboxes | Group-Object -Property BatchName | Where-Object { $_.Name } | Sort-Object Name
-                                $batchList = @($batchGroups | ForEach-Object { @{ Name = $_.Name; Count = $_.Count } })
-                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes(($batchList | ConvertTo-Json -Compress))
-                            } else {
-                                $b = $State['Batches']
-                                $json = if ($b -and $b.Count -gt 0) { $b | ConvertTo-Json -Compress } else { '[]' }
-                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
-                            }
+                            # Always return tenant-wide batch list (not scoped to current filter)
+                            $b = $State['Batches']
+                            $json = if ($b -and $b.Count -gt 0) { @($b) | ConvertTo-Json -Compress } else { '[]' }
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
                         } catch {
                             $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('[]')
                         }
@@ -7089,17 +7371,27 @@ function Start-WatchListener {
                                 $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"Missing name parameter"}')
                             } else {
                                 $includeDetail = $State['IncludeDetailReport']
-                                $trendCache = $State['MailboxTrendCache']
                                 if (-not $includeDetail) {
                                     $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"IncludeDetailReport not enabled","needsDetailReport":true}')
-                                } elseif (-not $trendCache) {
-                                    $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true,"data":[],"message":"No trend data cached yet. Wait for next refresh."}')
-                                } elseif ($trendCache.ContainsKey($mailboxName)) {
-                                    $data = $trendCache[$mailboxName]
-                                    $json = @{ ok = $true; data = $data } | ConvertTo-Json -Depth 5 -Compress
-                                    $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
                                 } else {
-                                    $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true,"data":[],"message":"No trend data for this mailbox"}')
+                                    # Prefer rich trend cache (from Get-MigrationTrend); fall back to
+                                    # lightweight per-refresh history collected without -IncludeReport
+                                    $trendCache   = $State['MailboxTrendCache']
+                                    $trendHistory = $State['MailboxTrendHistory']
+                                    $data = $null
+
+                                    if ($trendCache -and $trendCache.ContainsKey($mailboxName)) {
+                                        $data = $trendCache[$mailboxName]
+                                    } elseif ($trendHistory -and $trendHistory.ContainsKey($mailboxName)) {
+                                        $data = $trendHistory[$mailboxName]
+                                    }
+
+                                    if ($data -and $data.Count -gt 0) {
+                                        $json = @{ ok = $true; data = $data } | ConvertTo-Json -Depth 5 -Compress
+                                        $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+                                    } else {
+                                        $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true,"data":[],"message":"No trend data for this mailbox yet"}')
+                                    }
                                 }
                             }
                         } catch {
@@ -7115,15 +7407,22 @@ function Start-WatchListener {
                             $trendCache = $State['MailboxTrendCache']
                             $cachedMailboxes = $State['CachedMailboxes']
 
-                            if (-not $includeDetail) {
+                            $trendHistory = $State['MailboxTrendHistory']
+                            $hasCacheData   = $trendCache   -and @($trendCache.Keys).Count   -gt 0
+                            $hasHistoryData = $trendHistory -and @($trendHistory.Keys).Count -gt 0
+
+                            if (-not $includeDetail -and -not $hasHistoryData) {
                                 $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"IncludeDetailReport not enabled. Run with -IncludeDetailReport to enable trend tracking.","needsDetailReport":true}')
-                            } elseif ($null -eq $trendCache -or @($trendCache.Keys).Count -eq 0) {
+                            } elseif (-not $hasCacheData -and -not $hasHistoryData) {
                                 $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true,"data":[],"message":"No trend data cached yet. Wait for multiple refresh cycles."}')
                             } else {
+                                # Prefer rich cache; fall back to lightweight per-refresh history
+                                $sourceKeys = if ($hasCacheData) { @($trendCache.Keys) } else { @($trendHistory.Keys) }
+
                                 # Build list of mailboxes with trend data
                                 $mailboxList = @()
-                                foreach ($mbxName in @($trendCache.Keys)) {
-                                    $trendData = $trendCache[$mbxName]
+                                foreach ($mbxName in $sourceKeys) {
+                                    $trendData  = if ($hasCacheData) { $trendCache[$mbxName] } else { $trendHistory[$mbxName] }
                                     $dataPoints = if ($trendData) { @($trendData).Count } else { 0 }
 
                                     # Get current status from cached mailboxes
@@ -7147,9 +7446,10 @@ function Start-WatchListener {
                                         if ($latestPoint.PercentComplete) {
                                             $pctComplete = [int]$latestPoint.PercentComplete
                                         }
-                                        # Derive status from latest anchor stage if still unknown
-                                        if (-not $status -and $latestPoint.Stage) {
-                                            $status = $latestPoint.Stage
+                                        # Derive status from latest point (cache uses Stage; history uses Status)
+                                        if (-not $status) {
+                                            if ($latestPoint.Stage)  { $status = $latestPoint.Stage }
+                                            elseif ($latestPoint.Status) { $status = $latestPoint.Status }
                                         }
                                     }
                                     if (-not $status) { $status = 'Unknown' }
@@ -7189,7 +7489,9 @@ function Start-WatchListener {
                                 # Get batch statistics from cached data
                                 $cachedMailboxes = $State['CachedMailboxes']
                                 if ($cachedMailboxes -and $cachedMailboxes.Count -gt 0) {
-                                    $batchMailboxes = $cachedMailboxes | Where-Object { $_.BatchName -eq $batchName }
+                                    $batchMailboxes = $cachedMailboxes | Where-Object {
+                                    ($_.BatchName -replace '^MigrationService:','') -eq $batchName
+                                }
 
                                     if ($batchMailboxes -and @($batchMailboxes).Count -gt 0) {
                                         $batchArray = @($batchMailboxes)
@@ -7237,6 +7539,53 @@ function Start-WatchListener {
                             }
                         } catch {
                             $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"Failed to get batch stats"}')
+                        }
+                    }
+                    elseif ($path -eq '/api/cohort-stats') {
+                        $contentType = 'application/json; charset=utf-8'
+                        try {
+                            $cachedMailboxes = $State['CachedMailboxes']
+                            if ($null -eq $cachedMailboxes -or @($cachedMailboxes).Count -eq 0) {
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true,"data":[],"message":"No mailbox data yet. Wait for first refresh."}')
+                            } else {
+                                $cohortDefs = @(
+                                    @{ Label = '0–1 GB';  Min = 0;  Max = 1  }
+                                    @{ Label = '1–5 GB';  Min = 1;  Max = 5  }
+                                    @{ Label = '5–10 GB'; Min = 5;  Max = 10 }
+                                    @{ Label = '10 GB+';  Min = 10; Max = [double]::MaxValue }
+                                )
+                                $cohortData = foreach ($bucket in $cohortDefs) {
+                                    $members = @($cachedMailboxes | Where-Object {
+                                        [double]$_.MailboxSizeGB -ge $bucket.Min -and [double]$_.MailboxSizeGB -lt $bucket.Max
+                                    })
+                                    if ($members.Count -eq 0) { continue }
+                                    $completed = @($members | Where-Object { $_.Status -in @('Completed','CompletedWithWarning','CompletedWithSkippedItems','Synced') })
+                                    $failed    = @($members | Where-Object { $_.Status -eq 'Failed' })
+                                    $active    = @($members | Where-Object { $_.Status -in @('InProgress','AutoSuspended','Suspended','Queued') })
+                                    $rates     = @($members | Where-Object { [double]$_.TransferRateGBph -gt 0 } | ForEach-Object { [double]$_.TransferRateGBph })
+                                    $avgRate   = if ($rates.Count -gt 0) { [math]::Round(($rates | Measure-Object -Sum).Sum / $rates.Count, 4) } else { 0 }
+                                    $avgPct    = [math]::Round(($members | Measure-Object -Property PercentComplete -Average).Average, 1)
+                                    $avgSizeGB = [math]::Round(($members | Measure-Object -Property MailboxSizeGB  -Average).Average, 2)
+                                    [PSCustomObject]@{
+                                        Bucket               = $bucket.Label
+                                        Count                = $members.Count
+                                        Completed            = $completed.Count
+                                        Failed               = $failed.Count
+                                        Active               = $active.Count
+                                        CompletionRate       = if ($members.Count -gt 0) { [math]::Round($completed.Count / $members.Count * 100, 1) } else { 0 }
+                                        FailureRate          = if ($members.Count -gt 0) { [math]::Round($failed.Count    / $members.Count * 100, 1) } else { 0 }
+                                        AvgTransferRateGBph  = $avgRate
+                                        AvgTransferRateMBmin = [math]::Round($avgRate * 1024 / 60, 2)
+                                        AvgPercentComplete   = $avgPct
+                                        AvgSizeGB            = $avgSizeGB
+                                    }
+                                }
+                                $json = @{ ok = $true; data = @($cohortData) } | ConvertTo-Json -Depth 4 -Compress
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+                            }
+                        } catch {
+                            $errMsg = $_.Exception.Message -replace '"', "'"
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"ok`":false,`"error`":`"Failed to get cohort stats: $errMsg`"}")
                         }
                     }
                     elseif ($path -eq '/api/retry-status') {
@@ -7868,6 +8217,19 @@ if ($MyInvocation.InvocationName -ne '.') {
                     $watchState['MailboxCount'] = $result.MailboxCount
                     $watchState['Throughput'] = $result.TotalThroughputGBPerHour
                     $watchState['CachedMailboxes'] = $result.PerMailboxDetail
+                    # Refresh tenant-wide batch list from EXO so new batches appear in browser selector
+                    try {
+                        $allMovesForBatches = Get-MoveRequest -ErrorAction Stop
+                        $watchState['Batches'] = @(
+                            $allMovesForBatches |
+                                Group-Object { "$($_.BatchName)" -replace '^MigrationService:','' } |
+                                Where-Object { $_.Name } |
+                                Sort-Object Name |
+                                ForEach-Object { @{ Name = $_.Name; Count = $_.Count } }
+                        )
+                    } catch {
+                        Write-Console "Could not refresh batch list: $_" -Level Warn -NoTimestamp
+                    }
                     # Cache raw stats for trend extraction (when IncludeDetailReport is enabled)
                     if ($result.RawStats) {
                         $watchState['CachedRawStats'] = $result.RawStats
@@ -7908,7 +8270,11 @@ if ($MyInvocation.InvocationName -ne '.') {
                 # ── Update next scheduled report time ────────────────────────────────────
                 if ($scheduleConfig.Enabled) {
                     $now = Get-Date
-                    $targetTime = [datetime]::ParseExact($scheduleConfig.ReportTime, 'H:mm', $null)
+                    $targetTime = $null
+                    foreach ($fmt in @('H:mm','HH:mm','h:mm tt','hh:mm tt')) {
+                        try { $targetTime = [datetime]::ParseExact($scheduleConfig.ReportTime, $fmt, $null); break } catch {}
+                    }
+                    if (-not $targetTime) { $targetTime = $now }
                     $nextReport = $now.Date.AddHours($targetTime.Hour).AddMinutes($targetTime.Minute)
 
                     if ($scheduleConfig.Schedule -eq 'Hourly') {
@@ -8049,7 +8415,7 @@ if ($MyInvocation.InvocationName -ne '.') {
                     while ($watchState['IsPaused']) {
                         Write-Progress -Activity "Watch Mode [PAUSED]" `
                                        -Status "Paused at ${i}s  |  Iter $iteration  |  $($watchState['CurrentScope'])  |  API $apiUrl" `
-                                       -PercentComplete ([math]::Round((($RefreshIntervalSeconds - $i) / $RefreshIntervalSeconds) * 100))
+                                       -PercentComplete ([math]::Max(0, [math]::Min(100, [math]::Round((($RefreshIntervalSeconds - $i) / [math]::Max(1,$RefreshIntervalSeconds)) * 100))))
                         Start-Sleep -Seconds 1
 
                         # Check for commands while paused
@@ -8075,7 +8441,7 @@ if ($MyInvocation.InvocationName -ne '.') {
 
                     Write-Progress -Activity "Watch Mode" `
                                    -Status "Next refresh in ${i}s  |  Iter $iteration  |  $($watchState['CurrentScope'])  |  API $apiUrl" `
-                                   -PercentComplete ([math]::Round((($RefreshIntervalSeconds - $i) / $RefreshIntervalSeconds) * 100))
+                                   -PercentComplete ([math]::Max(0, [math]::Min(100, [math]::Round((($RefreshIntervalSeconds - $i) / [math]::Max(1,$RefreshIntervalSeconds)) * 100))))
                     Start-Sleep -Seconds 1
 
                     # Check for commands from browser API (process all queued commands)
