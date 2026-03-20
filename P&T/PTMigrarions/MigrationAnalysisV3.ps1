@@ -902,6 +902,193 @@ function Invoke-MigrationRetry {
     }
 }
 
+function Invoke-BatchStatsRefresh {
+    <#
+    .SYNOPSIS
+        Fetches MigrationBatch data and caches it in watch state.
+        Must be called from the main loop (has EXO session).
+        Listener runspace reads from $watchState['BatchStatsCache'] — no EXO in runspace.
+    .PARAMETER WatchState
+        The synchronized hashtable shared with the listener runspace.
+    .PARAMETER CachedMailboxes
+        Per-mailbox detail array used to supplement with rate/size data.
+    .PARAMETER BatchNames
+        If specified, fetches ONLY these batches using Get-MigrationBatch -Identity -IncludeReport.
+        If omitted, fetches ALL batches without -IncludeReport (lightweight startup cache).
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.Hashtable]$WatchState,
+        [object[]]$CachedMailboxes,
+        [string[]]$BatchNames
+    )
+
+    $onDemand = $BatchNames -and $BatchNames.Count -gt 0
+
+    if ($onDemand) {
+        # Fetch only the requested batches with full report data
+        $allBatches = foreach ($name in $BatchNames) {
+            try { Get-MigrationBatch -Identity $name -IncludeReport -ErrorAction Stop }
+            catch { Write-Console "BatchStatsRefresh: could not fetch batch '$name' — $_" -Level Warn -NoTimestamp }
+        }
+    } else {
+        # Startup: fetch all batches, no -IncludeReport (fast, basic counts only)
+        try { $allBatches = Get-MigrationBatch -ErrorAction Stop }
+        catch {
+            Write-Console "BatchStatsRefresh: Get-MigrationBatch failed — $_" -Level Warn -NoTimestamp
+            return
+        }
+    }
+
+    if (-not $allBatches) { return }
+
+    # Index CachedMailboxes by batch name for fast supplement lookups
+    $mbxByBatch = @{}
+    if ($CachedMailboxes) {
+        foreach ($mbx in $CachedMailboxes) {
+            $key = ("$($mbx.BatchName)" -replace '^MigrationService:','')
+            if (-not $mbxByBatch.ContainsKey($key)) { $mbxByBatch[$key] = [System.Collections.ArrayList]@() }
+            [void]$mbxByBatch[$key].Add($mbx)
+        }
+    }
+
+    # Preserve existing cache — only overwrite entries we just fetched
+    $cache = $WatchState['BatchStatsCache']
+    if (-not $cache) { $cache = @{} }
+
+    foreach ($mb in @($allBatches)) {
+        if (-not $mb) { continue }
+        $batchName = ("$($mb.Identity)" -replace '^MigrationService:','')
+        if (-not $batchName) { continue }
+
+        $startDt      = if ($mb.StartDateTime)      { $mb.StartDateTime.ToString('yyyy-MM-ddTHH:mm:ss') }      else { '' }
+        $lastSyncedDt = if ($mb.LastSyncedDateTime) { $mb.LastSyncedDateTime.ToString('yyyy-MM-ddTHH:mm:ss') } else { '' }
+        $durationHours = 0
+        if ($mb.StartDateTime) {
+            $durationHours = [math]::Round(((Get-Date) - $mb.StartDateTime).TotalHours, 1)
+        }
+
+        # Report URL — only present when fetched with -IncludeReport
+        # EXO V3 (REST): Reports items may serialize as strings "Migration Report was created: DATE; Migration Report URL: URL"
+        # Try property access first; fall back to regex parse of the string representation.
+        $latestReportUrl  = ''
+        $latestReportTime = ''
+        if ($mb.Reports -and @($mb.Reports).Count -gt 0) {
+            # Sort by CreationTimeUTC if available, otherwise keep last element (most recent appended last)
+            $rptItems = @($mb.Reports)
+            $latestRpt = $rptItems | Sort-Object {
+                if ($_.CreationTimeUTC) { $_.CreationTimeUTC }
+                elseif ("$_" -match 'created:\s*(\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}:\d{2}\s+[AP]M)') {
+                    try { [datetime]::Parse($Matches[1]) } catch { [datetime]::MinValue }
+                } else { [datetime]::MinValue }
+            } -Descending | Select-Object -First 1
+
+            # Try proper object properties (SOAP/deserialized PSObject)
+            $latestReportUrl  = "$($latestRpt.ReportUrl)"
+            $latestReportTime = if ($latestRpt.CreationTimeUTC) {
+                $latestRpt.CreationTimeUTC.ToString('yyyy-MM-ddTHH:mm:ss')
+            } else { '' }
+
+            # Fallback: parse from ToString() format "Migration Report was created: DATE; Migration Report URL: URL"
+            if (-not $latestReportUrl) {
+                $rptStr = "$latestRpt"
+                if ($rptStr -match 'Migration Report URL:\s*(https?://\S+)') {
+                    $latestReportUrl = $Matches[1]
+                }
+                if (-not $latestReportTime -and $rptStr -match 'created:\s*(\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}:\d{2}\s+[AP]M)') {
+                    try { $latestReportTime = [datetime]::Parse($Matches[1]).ToString('yyyy-MM-ddTHH:mm:ss') } catch {}
+                }
+            }
+        }
+
+        # Supplement with rate/size from CachedMailboxes if available
+        $totalSourceGB = 0; $totalTransferredGB = 0; $avgRateMBph = 0; $moveEfficiency = 0
+        $dataSource    = 'batch'
+        if ($mbxByBatch.ContainsKey($batchName) -and $mbxByBatch[$batchName].Count -gt 0) {
+            $bm = @($mbxByBatch[$batchName])
+            $totalSourceGB      = [math]::Round(($bm | Measure-Object -Property MailboxSizeGB -Sum).Sum, 2)
+            $totalTransferredGB = [math]::Round(($bm | Measure-Object -Property TransferredGB -Sum).Sum, 2)
+            $avgRateGBph        = ($bm | Where-Object { $_.TransferRateGBph -gt 0 } | Measure-Object -Property TransferRateGBph -Average).Average
+            $avgRateMBph        = [math]::Round($avgRateGBph * 1024, 2)
+            $moveEfficiency     = if ($totalSourceGB -gt 0) { [math]::Round($totalTransferredGB / $totalSourceGB * 100, 1) } else { 0 }
+            $dataSource         = 'full'
+        }
+
+        $cache[$batchName] = @{
+            ok                        = $true
+            BatchName                 = $batchName
+            Status                    = "$($mb.Status)"
+            State                     = "$($mb.State)"
+            DataConsistencyScore      = "$($mb.DataConsistencyScore)"
+            TotalCount                = [int]$mb.TotalCount
+            ActiveCount               = [int]$mb.ActiveCount
+            SyncedCount               = [int]$mb.SyncedCount
+            FinalizedCount            = [int]$mb.FinalizedCount
+            FailedCount               = [int]$mb.FailedCount
+            CompletedWithWarningCount = [int]$mb.CompletedWithWarningCount
+            PendingCount              = [int]$mb.PendingCount
+            StoppedCount              = [int]$mb.StoppedCount
+            StartDateTime             = $startDt
+            LastSyncedDateTime        = $lastSyncedDt
+            DurationHours             = $durationHours
+            SubmittedByUser           = "$($mb.SubmittedByUser)"
+            LatestReportUrl           = $latestReportUrl
+            LatestReportTime          = $latestReportTime
+            TotalSourceSizeGB         = $totalSourceGB
+            TotalTransferredGB        = $totalTransferredGB
+            AvgTransferRateMBPerHour  = $avgRateMBph
+            MoveEfficiency            = $moveEfficiency
+            DataSource                = $dataSource
+            CachedAt                  = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss')
+            # Migration content/item filters — null means not explicitly configured (use Exchange default)
+            SkipMail                  = if ($null -ne $mb.SkipMail      -and "$($mb.SkipMail)"      -ne '') { [bool]$mb.SkipMail }      else { $null }
+            SkipCalendar              = if ($null -ne $mb.SkipCalendar  -and "$($mb.SkipCalendar)"  -ne '') { [bool]$mb.SkipCalendar }  else { $null }
+            SkipContacts              = if ($null -ne $mb.SkipContacts  -and "$($mb.SkipContacts)"  -ne '') { [bool]$mb.SkipContacts }  else { $null }
+            SkipRules                 = if ($null -ne $mb.SkipRules     -and "$($mb.SkipRules)"     -ne '') { [bool]$mb.SkipRules }     else { $null }
+            SkipDelegates             = if ($null -ne $mb.SkipDelegates -and "$($mb.SkipDelegates)" -ne '') { [bool]$mb.SkipDelegates } else { $null }
+            # Migration limits and direction — empty BadItemLimit/LargeItemLimit means Exchange default (0 / Unlimited)
+            BatchDirection            = "$($mb.BatchDirection)"
+            BadItemLimit              = if ("$($mb.BadItemLimit)"   -ne '') { "$($mb.BadItemLimit)" }   else { '' }
+            LargeItemLimit            = if ("$($mb.LargeItemLimit)" -ne '') { "$($mb.LargeItemLimit)" } else { '' }
+        }
+    }
+
+    $WatchState['BatchStatsCache'] = $cache
+
+    # ── Trend snapshot collection ─────────────────────────────────────────────
+    # Capture a time-series point for each fetched batch so the browser can plot progress over time.
+    if (-not $script:BatchTrendHistory) { $script:BatchTrendHistory = @{} }
+    foreach ($mb in @($allBatches)) {
+        if (-not $mb) { continue }
+        $bn = ("$($mb.Identity)" -replace '^MigrationService:','')
+        if (-not $bn) { continue }
+        if (-not $script:BatchTrendHistory.ContainsKey($bn)) {
+            $script:BatchTrendHistory[$bn] = [System.Collections.ArrayList]@()
+        }
+        $snap = @{
+            Timestamp                 = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss')
+            SyncedCount               = [int]$mb.SyncedCount
+            FinalizedCount            = [int]$mb.FinalizedCount
+            ActiveCount               = [int]$mb.ActiveCount
+            PendingCount              = [int]$mb.PendingCount
+            StoppedCount              = [int]$mb.StoppedCount
+            FailedCount               = [int]$mb.FailedCount
+            CompletedWithWarningCount = [int]$mb.CompletedWithWarningCount
+            TotalCount                = [int]$mb.TotalCount
+        }
+        # Only append if timestamp is different from last entry (avoid dups on rapid calls)
+        $last = if ($script:BatchTrendHistory[$bn].Count -gt 0) { $script:BatchTrendHistory[$bn][$script:BatchTrendHistory[$bn].Count - 1] } else { $null }
+        if (-not $last -or $last.Timestamp -ne $snap.Timestamp) {
+            [void]$script:BatchTrendHistory[$bn].Add($snap)
+            while ($script:BatchTrendHistory[$bn].Count -gt 100) { $script:BatchTrendHistory[$bn].RemoveAt(0) }
+        }
+    }
+    $WatchState['BatchTrendHistory'] = $script:BatchTrendHistory
+
+    $label = if ($onDemand) { ($BatchNames -join ', ') } else { "all ($(@($allBatches).Count))" }
+    Write-Console "BatchStatsRefresh: cached stats for $label batch(es)." -Level Info -NoTimestamp
+}
+
 function Get-MigrationTrend {
     [CmdletBinding()]
     param(
@@ -3508,6 +3695,11 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
   <div class="card" id="trend-charts-card" style="display:none;max-height:520px;overflow:hidden;">
     <h2>📈 Historical Trends</h2>
     <p class="section-note">Real-time tracking of migration progress over time. Data collected every refresh cycle in watch mode.</p>
+    <div id="trend-charts-empty" style="display:none;text-align:center;padding:40px 20px;color:#94a3b8;">
+      <div style="font-size:2.5rem;margin-bottom:12px;">⏳</div>
+      <div style="font-size:.9rem;font-weight:600;color:#64748b;margin-bottom:6px;">Waiting for trend data</div>
+      <div style="font-size:.82rem;">Charts will populate after multiple refresh cycles.<br>Each cycle adds one data point.</div>
+    </div>
     <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px;">
       <div style="height:180px;">
         <div style="font-size:.8rem;font-weight:600;color:#64748b;margin-bottom:8px;">Transfer Rate (GB/h)</div>
@@ -3827,16 +4019,13 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
         <!-- Left: Batch list -->
         <div style="background:#f8fafc;border-right:1px solid #e2e8f0;display:flex;flex-direction:column;">
           <div style="padding:16px;border-bottom:1px solid #e2e8f0;">
-            <div style="font-weight:700;font-size:1rem;color:#1e293b;margin-bottom:4px;">📋 Batch Comparison</div>
-            <div style="font-size:.75rem;color:#64748b;">Select 2+ batches then click Compare</div>
+            <div style="font-weight:700;font-size:1rem;color:#1e293b;margin-bottom:8px;">📋 Batch Comparison</div>
+            <button class="ent-btn" onclick="loadBatchComparison()" style="width:100%;justify-content:center;">🔄 Analyze / Compare Selected</button>
+            <div id="compare-selection-hint" style="font-size:.75rem;color:#94a3b8;text-align:center;margin-top:6px;">0 batches selected</div>
           </div>
           <div style="padding:12px;flex:1;overflow-y:auto;">
             <div id="batch-selector" style="display:flex;flex-direction:column;gap:6px;"></div>
             <div id="compare-loading-batches" style="color:#94a3b8;font-size:.82rem;padding:8px 0;">Loading batches…</div>
-          </div>
-          <div style="padding:12px;border-top:1px solid #e2e8f0;">
-            <button class="ent-btn" onclick="loadBatchComparison()" style="width:100%;justify-content:center;">🔄 Compare Selected</button>
-            <div id="compare-selection-hint" style="font-size:.75rem;color:#94a3b8;text-align:center;margin-top:6px;">0 batches selected</div>
           </div>
         </div>
 
@@ -3850,7 +4039,7 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
           <div id="comparison-results" style="display:none;">
             <!-- Fixed slot for scope warning — populated by JS, never grows the layout -->
             <div id="compare-raw-note" style="display:none;margin-bottom:14px;padding:10px 14px;background:#fffbeb;border:1px solid #fcd34d;border-radius:8px;font-size:.82rem;color:#92400e;">
-              ⚠ One or more batches are outside the current watch scope. Status and % complete are shown from the live batch list — transfer rate, size, and throughput are only available for mailboxes in the active scope.
+              ⚠ One or more batches are outside the current watch scope. Status counts come directly from Exchange (authoritative) — transfer rate, size, and efficiency are only available for mailboxes loaded in the active scope.
             </div>
             <div style="margin-bottom:24px;">
               <div style="font-size:.85rem;font-weight:600;color:#64748b;margin-bottom:12px;">Performance Comparison</div>
@@ -3865,11 +4054,19 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
                 <tbody id="comparison-tbody"></tbody>
               </table>
             </div>
+            <!-- Batch trend over time -->
+            <div id="batch-trend-section" style="margin-top:28px;">
+              <div style="font-size:.85rem;font-weight:600;color:#64748b;margin-bottom:12px;">📈 Batch Progress Over Time</div>
+              <div id="batch-trend-empty" style="display:none;color:#94a3b8;font-size:.82rem;padding:20px 0;text-align:center;">No trend data yet — data points are collected each refresh cycle.</div>
+              <div style="position:relative;height:260px;">
+                <canvas id="chart-batch-trend"></canvas>
+              </div>
+            </div>
           </div>
 
           <div id="comparison-empty" style="text-align:center;padding:60px;color:#94a3b8;">
             <div style="font-size:3rem;margin-bottom:10px;">📊</div>
-            <div>Select 2 or more batches from the list on the left, then click <strong>Compare Selected</strong>.</div>
+            <div>Select 1 or more batches from the list on the left, then click <strong>Analyze / Compare Selected</strong>.</div>
           </div>
         </div>
 
@@ -5656,7 +5853,22 @@ function fetchTrendData() {
   fetch(apiBase + '/api/trends')
     .then(function(r) { return r.json(); })
     .then(function(data) {
-      if (!data || !Array.isArray(data) || data.length === 0) return;
+      var emptyEl = document.getElementById('trend-charts-empty');
+      if (!data || !Array.isArray(data) || data.length === 0) {
+        // Show empty state message — hide charts, show placeholder
+        ['chart-rate','chart-progress','chart-transferred','chart-status'].forEach(function(id) {
+          var c = document.getElementById(id);
+          if (c) c.style.visibility = 'hidden';
+        });
+        if (emptyEl) emptyEl.style.display = '';
+        return;
+      }
+      // Data available — restore charts
+      ['chart-rate','chart-progress','chart-transferred','chart-status'].forEach(function(id) {
+        var c = document.getElementById(id);
+        if (c) c.style.visibility = '';
+      });
+      if (emptyEl) emptyEl.style.display = 'none';
       updateTrendCharts(data);
     })
     .catch(function(e) { console.log('Trend fetch error:', e); });
@@ -5696,6 +5908,7 @@ function updateTrendCharts(data) {
 // BATCH COMPARISON
 // ══════════════════════════════════════════════════════════════════
 var batchCompareChart = null;
+var batchTrendChart   = null;
 var selectedBatches = [];
 var batchDataCache = {};
 
@@ -5746,13 +5959,13 @@ function updateSelectedBatches() {
     hint.textContent = selectedBatches.length === 0
       ? '0 batches selected'
       : selectedBatches.length + ' batch' + (selectedBatches.length > 1 ? 'es' : '') + ' selected';
-    hint.style.color = selectedBatches.length >= 2 ? '#3b82f6' : '#94a3b8';
+    hint.style.color = selectedBatches.length >= 1 ? '#3b82f6' : '#94a3b8';
   }
 }
 
 function loadBatchComparison() {
-  if (selectedBatches.length < 2) {
-    alert('Please select at least 2 batches to compare.');
+  if (selectedBatches.length < 1) {
+    alert('Please select at least 1 batch to analyze.');
     return;
   }
 
@@ -5762,36 +5975,76 @@ function loadBatchComparison() {
   document.getElementById('comparison-empty').style.display = 'none';
   document.getElementById('comparison-results').style.display = 'none';
   document.getElementById('comparison-loading').style.display = 'block';
+  document.getElementById('comparison-loading').innerHTML =
+    '<div style="font-size:2rem;margin-bottom:10px;">⏳</div>Requesting batch data from Exchange…';
 
-  // Fetch data for each selected batch
-  var promises = selectedBatches.map(function(batchName) {
-    return fetch(apiBase + '/api/batch-stats?batch=' + encodeURIComponent(batchName))
-      .then(function(r) { return r.json(); })
-      .then(function(data) {
-        if (!data.ok) { return { BatchName: batchName, error: true, errorMsg: data.error || 'Not found' }; }
-        data.BatchName = batchName;
-        return data;
-      })
-      .catch(function() {
-        return { BatchName: batchName, error: true, errorMsg: 'Request failed' };
-      });
-  });
-
-  Promise.all(promises).then(function(results) {
-    document.getElementById('comparison-loading').style.display = 'none';
-    var good = results.filter(function(r) { return !r.error; });
-    var bad  = results.filter(function(r) { return  r.error; });
-    if (good.length === 0) {
-      var emptyEl = document.getElementById('comparison-empty');
-      emptyEl.innerHTML = '<div style="font-size:2rem;margin-bottom:10px;">⚠️</div>' +
-        '<div style="color:#ef4444;">Could not load data for selected batch' + (bad.length > 1 ? 'es' : '') + ': ' +
-        bad.map(function(b){ return '<strong>' + b.BatchName + '</strong> (' + b.errorMsg + ')'; }).join(', ') + '</div>';
-      emptyEl.style.display = 'block';
-    } else {
-      document.getElementById('comparison-results').style.display = 'block';
-      document.getElementById('comparison-empty').style.display = 'none';
-      renderBatchComparison(good);
+  // Step 1 — trigger on-demand fetch in main loop for selected batches only
+  fetch(apiBase + '/api/fetch-batch-stats', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ batches: selectedBatches })
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(res) {
+    if (!res.ok && !res.pending) {
+      throw new Error(res.error || 'Fetch trigger failed');
     }
+    // Step 2 — poll /api/batch-stats for each batch until all are ready (max 30s)
+    var deadline = Date.now() + 30000;
+    var batchesToFetch = selectedBatches.slice();
+
+    function pollAll() {
+      if (Date.now() > deadline) {
+        document.getElementById('comparison-loading').style.display = 'none';
+        var emptyEl = document.getElementById('comparison-empty');
+        emptyEl.innerHTML = '<div style="font-size:2rem;margin-bottom:10px;">⏱️</div>' +
+          '<div style="color:#ef4444;">Timed out waiting for batch data. The main loop may be busy — try again.</div>';
+        emptyEl.style.display = 'block';
+        return;
+      }
+
+      var promises = batchesToFetch.map(function(batchName) {
+        return fetch(apiBase + '/api/batch-stats?batch=' + encodeURIComponent(batchName))
+          .then(function(r) { return r.json(); })
+          .then(function(data) { return { batchName: batchName, data: data }; })
+          .catch(function() { return { batchName: batchName, data: { ok: false, error: 'Request failed' } }; });
+      });
+
+      Promise.all(promises).then(function(results) {
+        var ready   = results.filter(function(r) { return r.data.ok; });
+        var pending = results.filter(function(r) { return !r.data.ok && !r.data.error; });
+        var failed  = results.filter(function(r) { return !r.data.ok && r.data.error; });
+
+        // Check if all resolved (ready + failed, no more pending)
+        if (pending.length === 0 || ready.length + failed.length === batchesToFetch.length) {
+          document.getElementById('comparison-loading').style.display = 'none';
+          if (ready.length === 0) {
+            var emptyEl = document.getElementById('comparison-empty');
+            emptyEl.innerHTML = '<div style="font-size:2rem;margin-bottom:10px;">⚠️</div>' +
+              '<div style="color:#ef4444;">Could not load data: ' +
+              failed.map(function(r) { return '<strong>' + r.batchName + '</strong> (' + (r.data.error || 'not found') + ')'; }).join(', ') + '</div>';
+            emptyEl.style.display = 'block';
+          } else {
+            document.getElementById('comparison-results').style.display = 'block';
+            renderBatchComparison(ready.map(function(r) { r.data.BatchName = r.batchName; return r.data; }));
+            loadBatchTrend(selectedBatches);
+          }
+        } else {
+          // Some still pending — wait and retry
+          setTimeout(pollAll, 1000);
+        }
+      });
+    }
+
+    // Small initial delay to give main loop time to process the command
+    setTimeout(pollAll, 800);
+  })
+  .catch(function(err) {
+    document.getElementById('comparison-loading').style.display = 'none';
+    var emptyEl = document.getElementById('comparison-empty');
+    emptyEl.innerHTML = '<div style="font-size:2rem;margin-bottom:10px;">⚠️</div>' +
+      '<div style="color:#ef4444;">Failed to request batch data: ' + err + '</div>';
+    emptyEl.style.display = 'block';
   });
 }
 
@@ -5802,44 +6055,112 @@ function renderBatchComparison(batches) {
     return;
   }
 
-  // Update table headers — mark raw-data batches
+  // Update table headers
   var thead = document.querySelector('#comparison-table thead tr');
   thead.innerHTML = '<th>Metric</th>' + batches.map(function(b) {
-    var note = b.DataSource === 'raw' ? ' <span title="Outside current scope — rate data unavailable" style="color:#f59e0b;font-size:.75rem;">⚠ partial</span>' : '';
+    var note = b.DataSource === 'batch' ? ' <span title="Rate/size data not in current scope" style="color:#f59e0b;font-size:.75rem;">⚠ no rate</span>' : '';
     return '<th>' + b.BatchName + note + '</th>';
   }).join('');
 
   // Show/hide the fixed scope-warning note
-  var hasRaw = batches.some(function(b){ return b.DataSource === 'raw'; });
+  var hasPartial = batches.some(function(b){ return b.DataSource === 'batch'; });
   var rawNote = document.getElementById('compare-raw-note');
-  if (rawNote) rawNote.style.display = hasRaw ? '' : 'none';
+  if (rawNote) rawNote.style.display = hasPartial ? '' : 'none';
 
-  // Metrics to compare
+  // Helper: format datetime string as local date+time
+  function fmtDt(s) {
+    if (!s) return '—';
+    try { return new Date(s).toLocaleString(); } catch(e) { return s; }
+  }
+  // Helper: format duration in hours
+  function fmtDur(h) {
+    if (!h && h !== 0) return '—';
+    if (h < 24) return h.toFixed(1) + 'h';
+    return Math.floor(h / 24) + 'd ' + (h % 24).toFixed(0) + 'h';
+  }
+  // Helper: DCS badge color
+  function dcsColor(v) {
+    if (!v) return '#64748b';
+    var s = v.toLowerCase();
+    if (s === 'perfect')     return '#22c55e';
+    if (s === 'good')        return '#3b82f6';
+    if (s === 'investigate') return '#f59e0b';
+    if (s === 'poor')        return '#ef4444';
+    return '#64748b';
+  }
+
   var metrics = [
-    { key: 'MailboxCount', label: 'Mailboxes', format: function(v) { return v || 0; } },
-    { key: 'PercentComplete', label: '% Complete', format: function(v) { return (v || 0) + '%'; } },
-    { key: 'TotalSourceSizeGB', label: 'Total Size (GB)', format: function(v, b) { return b.DataSource==='raw' ? '—' : (v||0).toFixed(2); } },
-    { key: 'TotalTransferredGB', label: 'Transferred (GB)', format: function(v, b) { return b.DataSource==='raw' ? '—' : (v||0).toFixed(2); } },
-    { key: 'TotalThroughputGBPerHour', label: 'Throughput (GB/h)', format: function(v) { return (v || 0).toFixed(2); } },
-    { key: 'AvgTransferRateMBPerHour', label: 'Avg Rate (MB/h)', format: function(v, b) { return b.DataSource==='raw' ? '—' : (v||0).toFixed(2); } },
-    { key: 'MoveEfficiency', label: 'Move Efficiency', format: function(v, b) { return b.DataSource==='raw' ? '—' : (v||0)+'%'; } },
-    { key: 'CompletedCount', label: 'Completed', format: function(v) { return v || 0; } },
-    { key: 'InProgressCount', label: 'In Progress', format: function(v) { return v || 0; } },
-    { key: 'FailedCount', label: 'Failed', format: function(v) { return v || 0; }, highlight: true }
+    // ── Batch status ──────────────────────────────────────────────
+    { label: 'Status',              section: true },
+    { key: 'Status',                label: 'Batch Status',          format: function(v) { return v || '—'; } },
+    { key: 'State',                 label: 'Batch State',           format: function(v) { return v || '—'; } },
+    { key: 'DataConsistencyScore',  label: 'Data Consistency',
+      format: function(v) { return v ? '<span style="font-weight:600;color:' + dcsColor(v) + ';">' + v + '</span>' : '—'; } },
+    // ── Mailbox counts ───────────────────────────────────────────
+    { label: 'Mailbox Counts',      section: true },
+    { key: 'TotalCount',            label: 'Total Mailboxes',       format: function(v) { return v || 0; } },
+    { key: 'SyncedCount',           label: 'Synced',                format: function(v) { return v || 0; } },
+    { key: 'FinalizedCount',        label: 'Finalized',             format: function(v) { return v || 0; } },
+    { key: 'ActiveCount',           label: 'Active',                format: function(v) { return v || 0; } },
+    { key: 'PendingCount',          label: 'Pending',               format: function(v) { return v || 0; } },
+    { key: 'StoppedCount',          label: 'Stopped',               format: function(v) { return v || 0; } },
+    { key: 'CompletedWithWarningCount', label: 'Completed w/ Warning', format: function(v) { return v || 0; } },
+    { key: 'FailedCount',           label: 'Failed',                format: function(v) { return v || 0; }, highlight: true },
+    // ── Timing ───────────────────────────────────────────────────
+    { label: 'Timing',              section: true },
+    { key: 'StartDateTime',         label: 'Start Time',            format: function(v) { return fmtDt(v); } },
+    { key: 'LastSyncedDateTime',    label: 'Last Synced',           format: function(v) { return fmtDt(v); } },
+    { key: 'DurationHours',         label: 'Running Duration',      format: function(v) { return fmtDur(v); } },
+    // ── Admin ────────────────────────────────────────────────────
+    { key: 'SubmittedByUser',       label: 'Submitted By',
+      format: function(v) { return v ? '<span style="font-size:.8rem;">' + v + '</span>' : '—'; } },
+    // ── Performance (from scope data) ────────────────────────────
+    { label: 'Performance',         section: true },
+    { key: 'TotalSourceSizeGB',     label: 'Total Mailbox Size (GB)',
+      format: function(v, b) { return b.DataSource === 'batch' ? '—' : (v||0).toFixed(2); } },
+    { key: 'TotalTransferredGB',    label: 'Transferred (GB)',
+      format: function(v, b) { return b.DataSource === 'batch' ? '—' : (v||0).toFixed(2); } },
+    { key: 'AvgTransferRateMBPerHour', label: 'Avg Transfer Rate (MB/h)',
+      format: function(v, b) { return b.DataSource === 'batch' ? '—' : (v||0).toFixed(0); } },
+    { key: 'MoveEfficiency',        label: 'Move Efficiency',
+      format: function(v, b) { return b.DataSource === 'batch' ? '—' : (v||0) + '%'; } },
+    // ── Report link ──────────────────────────────────────────────
+    { label: 'Report',              section: true },
+    { key: 'LatestReportTime',      label: 'Latest Report',
+      format: function(v, b) {
+        if (!v) return '—';
+        var url = b.LatestReportUrl;
+        var timeStr = fmtDt(v);
+        return url ? '<a href="' + url + '" target="_blank" style="color:#3b82f6;text-decoration:underline;font-size:.8rem;">' + timeStr + ' ↗</a>' : timeStr;
+      }
+    },
+    // ── Configuration ────────────────────────────────────────────
+    { label: 'Configuration',       section: true },
+    { key: 'BatchDirection',        label: 'Direction',             format: function(v) { return v || '—'; } },
+    { key: 'BadItemLimit',          label: 'Bad Item Limit',        format: function(v) { return (v !== undefined && v !== null && v !== '') ? v : 'Default (0)'; } },
+    { key: 'LargeItemLimit',        label: 'Large Item Limit',      format: function(v) { return (v !== undefined && v !== null && v !== '') ? v : 'Default (Unlimited)'; } },
+    { key: 'SkipMail',              label: 'Skip Mail',             format: function(v) { return v === null || v === undefined ? '—' : (v ? '<span style="color:#f59e0b;font-weight:600;">Yes</span>' : 'No'); } },
+    { key: 'SkipCalendar',          label: 'Skip Calendar',         format: function(v) { return v === null || v === undefined ? '—' : (v ? '<span style="color:#f59e0b;font-weight:600;">Yes</span>' : 'No'); } },
+    { key: 'SkipContacts',          label: 'Skip Contacts',         format: function(v) { return v === null || v === undefined ? '—' : (v ? '<span style="color:#f59e0b;font-weight:600;">Yes</span>' : 'No'); } },
+    { key: 'SkipRules',             label: 'Skip Rules',            format: function(v) { return v === null || v === undefined ? '—' : (v ? '<span style="color:#f59e0b;font-weight:600;">Yes</span>' : 'No'); } },
+    { key: 'SkipDelegates',         label: 'Skip Delegates',        format: function(v) { return v === null || v === undefined ? '—' : (v ? '<span style="color:#f59e0b;font-weight:600;">Yes</span>' : 'No'); } }
   ];
 
   var tbody = document.getElementById('comparison-tbody');
   tbody.innerHTML = metrics.map(function(m) {
+    if (m.section) {
+      return '<tr style="background:#f1f5f9;"><td colspan="' + (batches.length + 1) + '" style="padding:6px 10px;font-size:.72rem;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.06em;">' + m.label + '</td></tr>';
+    }
     var cells = batches.map(function(b) {
       var val = b[m.key];
       var style = '';
       if (m.highlight && val > 0) style = 'color:#ef4444;font-weight:600;';
       return '<td style="' + style + '">' + m.format(val, b) + '</td>';
     }).join('');
-    return '<tr><td style="font-weight:600;">' + m.label + '</td>' + cells + '</tr>';
+    return '<tr><td style="font-weight:500;color:#374151;">' + m.label + '</td>' + cells + '</tr>';
   }).join('');
 
-  // Render comparison chart
+  // Render comparison chart — status breakdown stacked bar
   renderBatchCompareChart(batches);
 }
 
@@ -5853,26 +6174,40 @@ function renderBatchCompareChart(batches) {
     }
 
     var isDark = document.body.classList.contains('dark-mode');
-    var colors = ['#3b82f6', '#22c55e', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16'];
+    var labels = batches.map(function(b) { return b.BatchName; });
 
+    // Stacked bar — status breakdown per batch
     batchCompareChart = new Chart(ctx, {
       type: 'bar',
       data: {
-        labels: ['Throughput (GB/h)', 'Avg Rate (MB/h)', '% Complete', 'Efficiency %'],
-        datasets: batches.map(function(b, i) {
-          return {
-            label: b.BatchName,
-            data: [
-              b.TotalThroughputGBPerHour || 0,
-              (b.AvgTransferRateMBPerHour || 0) / 1000,
-              b.PercentComplete || 0,
-              b.MoveEfficiency || 0
-            ],
-            backgroundColor: colors[i % colors.length] + 'cc',
-            borderColor: colors[i % colors.length],
-            borderWidth: 1
-          };
-        })
+        labels: labels,
+        datasets: [
+          {
+            label: 'Synced / Finalized',
+            data: batches.map(function(b) { return (b.SyncedCount || 0) + (b.FinalizedCount || 0); }),
+            backgroundColor: '#22c55ecc', borderColor: '#22c55e', borderWidth: 1
+          },
+          {
+            label: 'Active',
+            data: batches.map(function(b) { return b.ActiveCount || 0; }),
+            backgroundColor: '#3b82f6cc', borderColor: '#3b82f6', borderWidth: 1
+          },
+          {
+            label: 'Pending / Stopped',
+            data: batches.map(function(b) { return (b.PendingCount || 0) + (b.StoppedCount || 0); }),
+            backgroundColor: '#f59e0bcc', borderColor: '#f59e0b', borderWidth: 1
+          },
+          {
+            label: 'Failed',
+            data: batches.map(function(b) { return b.FailedCount || 0; }),
+            backgroundColor: '#ef4444cc', borderColor: '#ef4444', borderWidth: 1
+          },
+          {
+            label: 'Completed w/ Warning',
+            data: batches.map(function(b) { return b.CompletedWithWarningCount || 0; }),
+            backgroundColor: '#8b5cf6cc', borderColor: '#8b5cf6', borderWidth: 1
+          }
+        ]
       },
       options: {
         responsive: true,
@@ -5880,18 +6215,30 @@ function renderBatchCompareChart(batches) {
         plugins: {
           legend: {
             position: 'bottom',
-            labels: { color: isDark ? '#94a3b8' : '#64748b', boxWidth: 12 }
+            labels: { color: isDark ? '#94a3b8' : '#64748b', boxWidth: 12, font: { size: 11 } }
+          },
+          tooltip: {
+            callbacks: {
+              footer: function(items) {
+                var total = items.reduce(function(s, i) { return s + i.raw; }, 0);
+                var batchTotal = batches[items[0].dataIndex].TotalCount || 0;
+                return 'Total: ' + batchTotal;
+              }
+            }
           }
         },
         scales: {
           x: {
+            stacked: true,
             grid: { color: isDark ? 'rgba(148,163,184,0.2)' : 'rgba(0,0,0,0.1)' },
             ticks: { color: isDark ? '#94a3b8' : '#64748b' }
           },
           y: {
+            stacked: true,
             grid: { color: isDark ? 'rgba(148,163,184,0.2)' : 'rgba(0,0,0,0.1)' },
-            ticks: { color: isDark ? '#94a3b8' : '#64748b' },
-            beginAtZero: true
+            ticks: { color: isDark ? '#94a3b8' : '#64748b', stepSize: 1 },
+            beginAtZero: true,
+            title: { display: true, text: 'Mailboxes', color: isDark ? '#94a3b8' : '#64748b', font: { size: 11 } }
           }
         }
       }
@@ -5902,8 +6249,127 @@ function renderBatchCompareChart(batches) {
 // ══════════════════════════════════════════════════════════════════
 // MIGRATION TRENDS PANEL
 // ══════════════════════════════════════════════════════════════════
-var trendMailboxList = [];
 var selectedTrendMailbox = null;
+
+function loadBatchTrend(batchNames) {
+  var apiBase = window.WATCH_API_BASE;
+  if (!apiBase || !batchNames || batchNames.length === 0) return;
+
+  var emptyEl  = document.getElementById('batch-trend-empty');
+  var chartDiv = document.querySelector('#batch-trend-section > div[style*="relative"]');
+
+  var url = apiBase + '/api/batch-trend?' +
+    batchNames.map(function(b) { return 'batch=' + encodeURIComponent(b); }).join('&');
+
+  fetch(url)
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var hasData = false;
+      Object.keys(data).forEach(function(k) {
+        if (data[k] && data[k].length > 1) hasData = true;
+      });
+      if (!hasData) {
+        if (emptyEl) { emptyEl.style.display = ''; }
+        if (chartDiv) { chartDiv.style.visibility = 'hidden'; }
+        return;
+      }
+      if (emptyEl)  { emptyEl.style.display = 'none'; }
+      if (chartDiv) { chartDiv.style.visibility = ''; }
+      renderBatchTrendChart(data);
+    })
+    .catch(function(e) { console.log('loadBatchTrend error:', e); });
+}
+
+function renderBatchTrendChart(trendData) {
+  loadChartJs(function() {
+    var ctx = document.getElementById('chart-batch-trend');
+    if (!ctx) return;
+    if (batchTrendChart) { batchTrendChart.destroy(); batchTrendChart = null; }
+
+    var isDark  = document.body.classList.contains('dark-mode');
+    var bNames  = Object.keys(trendData);
+    var palette = ['#3b82f6','#22c55e','#f59e0b','#ef4444','#8b5cf6','#06b6d4','#f97316'];
+
+    if (bNames.length === 1) {
+      // Single batch: stacked area by status breakdown
+      var bn  = bNames[0];
+      var pts = trendData[bn];
+      var labels = pts.map(function(p) { return p.Timestamp ? p.Timestamp.replace('T',' ').slice(0,16) : ''; });
+      batchTrendChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: labels,
+          datasets: [
+            { label: 'Synced / Finalized',
+              data: pts.map(function(p) { return (p.SyncedCount||0) + (p.FinalizedCount||0); }),
+              backgroundColor: 'rgba(34,197,94,0.25)', borderColor: '#22c55e', fill: true, tension: 0.3, borderWidth: 2, pointRadius: 2 },
+            { label: 'Active',
+              data: pts.map(function(p) { return p.ActiveCount || 0; }),
+              backgroundColor: 'rgba(59,130,246,0.2)', borderColor: '#3b82f6', fill: true, tension: 0.3, borderWidth: 2, pointRadius: 2 },
+            { label: 'Pending / Stopped',
+              data: pts.map(function(p) { return (p.PendingCount||0) + (p.StoppedCount||0); }),
+              backgroundColor: 'rgba(245,158,11,0.2)', borderColor: '#f59e0b', fill: true, tension: 0.3, borderWidth: 2, pointRadius: 2 },
+            { label: 'Failed',
+              data: pts.map(function(p) { return p.FailedCount || 0; }),
+              backgroundColor: 'rgba(239,68,68,0.2)', borderColor: '#ef4444', fill: true, tension: 0.3, borderWidth: 2, pointRadius: 2 }
+          ]
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          plugins: {
+            legend: { position: 'bottom', labels: { color: isDark ? '#94a3b8' : '#64748b', boxWidth: 12, font: { size: 11 } } },
+            title:  { display: true, text: bn + ' \u2014 Mailbox Status Over Time', color: isDark ? '#e2e8f0' : '#1e293b', font: { size: 12, weight: '600' } }
+          },
+          scales: {
+            x: { stacked: true, ticks: { color: isDark ? '#94a3b8' : '#64748b', maxTicksLimit: 8, maxRotation: 30 },
+                 grid: { color: isDark ? 'rgba(148,163,184,0.15)' : 'rgba(0,0,0,0.08)' } },
+            y: { stacked: true, beginAtZero: true, ticks: { color: isDark ? '#94a3b8' : '#64748b', stepSize: 1 },
+                 grid: { color: isDark ? 'rgba(148,163,184,0.15)' : 'rgba(0,0,0,0.08)' },
+                 title: { display: true, text: 'Mailboxes', color: isDark ? '#94a3b8' : '#64748b', font: { size: 11 } } }
+          }
+        }
+      });
+    } else {
+      // Multiple batches: one Active line per batch
+      var allTs = [];
+      bNames.forEach(function(bn) {
+        (trendData[bn] || []).forEach(function(p) {
+          if (p.Timestamp && allTs.indexOf(p.Timestamp) === -1) allTs.push(p.Timestamp);
+        });
+      });
+      allTs.sort();
+      var labels = allTs.map(function(t) { return t.replace('T',' ').slice(0,16); });
+      var datasets = bNames.map(function(bn, idx) {
+        var ptMap = {};
+        (trendData[bn] || []).forEach(function(p) { if (p.Timestamp) ptMap[p.Timestamp] = p; });
+        return {
+          label: bn,
+          data: allTs.map(function(t) { return ptMap[t] ? (ptMap[t].ActiveCount || 0) : null; }),
+          borderColor: palette[idx % palette.length], backgroundColor: 'transparent',
+          spanGaps: true, tension: 0.3, borderWidth: 2, pointRadius: 2
+        };
+      });
+      batchTrendChart = new Chart(ctx, {
+        type: 'line',
+        data: { labels: labels, datasets: datasets },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          plugins: {
+            legend: { position: 'bottom', labels: { color: isDark ? '#94a3b8' : '#64748b', boxWidth: 12, font: { size: 11 } } },
+            title:  { display: true, text: 'Active Mailboxes Over Time \u2014 Batch Comparison', color: isDark ? '#e2e8f0' : '#1e293b', font: { size: 12, weight: '600' } }
+          },
+          scales: {
+            x: { ticks: { color: isDark ? '#94a3b8' : '#64748b', maxTicksLimit: 8, maxRotation: 30 },
+                 grid: { color: isDark ? 'rgba(148,163,184,0.15)' : 'rgba(0,0,0,0.08)' } },
+            y: { beginAtZero: true, ticks: { color: isDark ? '#94a3b8' : '#64748b', stepSize: 1 },
+                 grid: { color: isDark ? 'rgba(148,163,184,0.15)' : 'rgba(0,0,0,0.08)' },
+                 title: { display: true, text: 'Active Mailboxes', color: isDark ? '#94a3b8' : '#64748b', font: { size: 11 } } }
+          }
+        }
+      });
+    }
+  });
+}
 
 function exportTrendsCSV() {
   var apiBase = window.WATCH_API_BASE;
@@ -7642,7 +8108,6 @@ function Start-WatchListener {
                     elseif ($path -eq '/api/batch-stats') {
                         $contentType = 'application/json; charset=utf-8'
                         try {
-                            # Parse batch name from query string
                             $batchName = $null
                             if ($req.Url.Query) {
                                 $queryParams = [System.Web.HttpUtility]::ParseQueryString($req.Url.Query)
@@ -7652,90 +8117,67 @@ function Start-WatchListener {
                             if (-not $batchName) {
                                 $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"Missing batch parameter"}')
                             } else {
-                                # Get batch statistics from cached data
-                                $cachedMailboxes = $State['CachedMailboxes']
-                                if ($cachedMailboxes -and $cachedMailboxes.Count -gt 0) {
-                                    $batchMailboxes = $cachedMailboxes | Where-Object {
-                                    ($_.BatchName -replace '^MigrationService:','') -eq $batchName
-                                }
-
-                                    if ($batchMailboxes -and @($batchMailboxes).Count -gt 0) {
-                                        $batchArray = @($batchMailboxes)
-                                        $completedCount = @($batchArray | Where-Object { $_.Status -eq 'Completed' -or $_.Status -eq 'CompletedWithWarning' -or $_.Status -eq 'CompletedWithSkippedItems' }).Count
-                                        $inProgressCount = @($batchArray | Where-Object { $_.Status -eq 'InProgress' }).Count
-                                        $failedCount = @($batchArray | Where-Object { $_.Status -eq 'Failed' }).Count
-
-                                        $totalSourceGB = ($batchArray | Measure-Object -Property MailboxSizeGB -Sum).Sum
-                                        $totalTransferredGB = ($batchArray | Measure-Object -Property TransferredGB -Sum).Sum
-                                        $avgPercent = ($batchArray | Measure-Object -Property PercentComplete -Average).Average
-                                        $avgTransferRateGBph = ($batchArray | Where-Object { $_.TransferRateGBph -gt 0 } | Measure-Object -Property TransferRateGBph -Average).Average
-
-                                        # Calculate throughput using InProgressDuration (TimeSpan)
-                                        $totalThroughput = 0
-                                        if ($totalSourceGB -gt 0 -and $avgPercent -gt 0) {
-                                            $avgDurationHours = ($batchArray | Where-Object { $_.InProgressDuration -and $_.InProgressDuration.TotalHours -gt 0 } | ForEach-Object { $_.InProgressDuration.TotalHours } | Measure-Object -Average).Average
-                                            if ($avgDurationHours -gt 0) {
-                                                $totalThroughput = [math]::Round($totalTransferredGB / $avgDurationHours, 2)
-                                            }
-                                        }
-
-                                        $moveEfficiency = if ($totalSourceGB -gt 0) { [math]::Round(($totalTransferredGB / $totalSourceGB) * 100, 1) } else { 0 }
-
-                                        $batchStats = @{
-                                            ok = $true
-                                            BatchName = $batchName
-                                            MailboxCount = $batchArray.Count
-                                            PercentComplete = [math]::Round($avgPercent, 1)
-                                            TotalSourceSizeGB = [math]::Round($totalSourceGB, 2)
-                                            TotalTransferredGB = [math]::Round($totalTransferredGB, 2)
-                                            TotalThroughputGBPerHour = $totalThroughput
-                                            AvgTransferRateMBPerHour = [math]::Round($avgTransferRateGBph * 1024, 2)
-                                            MoveEfficiency = $moveEfficiency
-                                            CompletedCount = $completedCount
-                                            InProgressCount = $inProgressCount
-                                            FailedCount = $failedCount
-                                        }
-                                        $responseBytes = [System.Text.Encoding]::UTF8.GetBytes(($batchStats | ConvertTo-Json -Compress))
-                                    } else {
-                                        # ── Fallback: compute basic stats from raw Get-MoveRequest data ──
-                                        # CachedMailboxes is scope-filtered; AllRawMoves is tenant-wide.
-                                        $rawMoves = $State['AllRawMoves']
-                                        $rawBatch = if ($rawMoves) {
-                                            @($rawMoves | Where-Object { ("$($_.BatchName)" -replace '^MigrationService:','') -eq $batchName })
-                                        } else { @() }
-
-                                        if ($rawBatch.Count -gt 0) {
-                                            $completedCount  = @($rawBatch | Where-Object { "$($_.Status)" -in @('Completed','CompletedWithWarning','CompletedWithSkippedItems','Synced') }).Count
-                                            $inProgressCount = @($rawBatch | Where-Object { "$($_.Status)" -eq 'InProgress' }).Count
-                                            $failedCount     = @($rawBatch | Where-Object { "$($_.Status)" -eq 'Failed' }).Count
-                                            $avgPercent      = [math]::Round(($rawBatch | Measure-Object -Property PercentComplete -Average).Average, 1)
-
-                                            $batchStats = @{
-                                                ok = $true
-                                                BatchName            = $batchName
-                                                MailboxCount         = $rawBatch.Count
-                                                PercentComplete      = $avgPercent
-                                                TotalSourceSizeGB    = 0
-                                                TotalTransferredGB   = 0
-                                                TotalThroughputGBPerHour = 0
-                                                AvgTransferRateMBPerHour = 0
-                                                MoveEfficiency       = 0
-                                                CompletedCount       = $completedCount
-                                                InProgressCount      = $inProgressCount
-                                                FailedCount          = $failedCount
-                                                DataSource           = 'raw'  # signals JS that rate data is unavailable
-                                            }
-                                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes(($batchStats | ConvertTo-Json -Compress))
-                                        } else {
-                                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"Batch not found"}')
-                                        }
-                                    }
+                                $cache = $State['BatchStatsCache']
+                                if ($cache -and $cache.ContainsKey($batchName)) {
+                                    $responseBytes = [System.Text.Encoding]::UTF8.GetBytes(($cache[$batchName] | ConvertTo-Json -Compress))
                                 } else {
-                                    $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"No cached data available"}')
+                                    $responseBytes = [System.Text.Encoding]::UTF8.GetBytes(("{`"ok`":false,`"error`":`"Batch not found: $($batchName -replace '"','')`"}"))
                                 }
                             }
                         } catch {
-                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"Failed to get batch stats"}')
+                            $errMsg = "$_" -replace '"',''
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"ok`":false,`"error`":`"$errMsg`"}")
+                        }
+                    }
+                    elseif ($path -eq '/api/fetch-batch-stats') {
+                        # Browser calls this POST to trigger on-demand batch stat fetching for selected batches.
+                        # Main loop picks up the command, calls Invoke-BatchStatsRefresh -BatchNames,
+                        # then browser polls /api/batch-stats?batch=X until cache is populated.
+                        $contentType = 'application/json; charset=utf-8'
+                        try {
+                            $body = $null
+                            if ($req.HasEntityBody) {
+                                $reader = New-Object System.IO.StreamReader($req.InputStream, [System.Text.Encoding]::UTF8)
+                                $bodyText = $reader.ReadToEnd()
+                                $reader.Close()
+                                $body = $bodyText | ConvertFrom-Json -ErrorAction SilentlyContinue
+                            }
+                            $batches = if ($body -and $body.batches) { @($body.batches) } else { @() }
+                            if ($batches.Count -eq 0) {
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"No batches specified"}')
+                            } else {
+                                [void]$State['PendingCommands'].Add(@{ Action = 'fetchBatchStats'; Batches = $batches })
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true,"pending":true}')
+                            }
+                        } catch {
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"Bad request"}')
+                        }
+                    }
+                    elseif ($path -eq '/api/batch-trend') {
+                        # Returns time-series trend data for one or more batches.
+                        # Query: ?batch=BatchName  or  ?batch=A&batch=B  (multiple allowed)
+                        $contentType = 'application/json; charset=utf-8'
+                        try {
+                            $queryBatches = @($req.QueryString.GetValues('batch')) | Where-Object { $_ }
+                            $trendHist = $State['BatchTrendHistory']
+                            if (-not $queryBatches -or $queryBatches.Count -eq 0) {
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"No batch specified"}')
+                            } elseif (-not $trendHist -or $trendHist.Count -eq 0) {
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true,"data":{}}')
+                            } else {
+                                $result = @{}
+                                foreach ($qb in $queryBatches) {
+                                    if ($trendHist.ContainsKey($qb)) {
+                                        $result[$qb] = @($trendHist[$qb])
+                                    } else {
+                                        $result[$qb] = @()
+                                    }
+                                }
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes(($result | ConvertTo-Json -Depth 5 -Compress))
+                            }
+                        } catch {
+                            $errMsg = ($_.Exception.Message -replace '"',"'") -replace '[\r\n]',' '
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"ok`":false,`"error`":`"$errMsg`"}")
                         }
                     }
                     elseif ($path -eq '/api/cohort-stats') {
@@ -8308,6 +8750,7 @@ if ($MyInvocation.InvocationName -ne '.') {
         # ── Historical trend data collection ────────────────────────────────────
         $script:TrendHistory = [System.Collections.ArrayList]@()
         $script:MailboxTrendHistory = @{}  # Per-mailbox trend data keyed by DisplayName
+        $script:BatchTrendHistory   = @{}  # Per-batch trend snapshots keyed by batch name
         $script:MailboxFailureHistory = @{}  # Last 5 failure entries per mailbox keyed by DisplayName
 
 
@@ -8402,6 +8845,9 @@ if ($MyInvocation.InvocationName -ne '.') {
         } catch {
             Write-Console "Could not pre-load batch list: $_" -Level Warn -NoTimestamp
         }
+
+        # ── Initial batch stats cache (no CachedMailboxes yet — rate data on next cycle) ──
+        Invoke-BatchStatsRefresh -WatchState $watchState
 
         $iteration = 0
 
@@ -8648,6 +9094,40 @@ if ($MyInvocation.InvocationName -ne '.') {
                         }
                         $watchState['MailboxFailureHistory'] = $script:MailboxFailureHistory
                     }
+
+                    # ── Collect lightweight per-batch trend snapshots every cycle ─────────────
+                    if (-not $script:BatchTrendHistory) { $script:BatchTrendHistory = @{} }
+                    try {
+                        $batchesSnap = Get-MigrationBatch -ErrorAction Stop
+                        foreach ($mbSnap in @($batchesSnap)) {
+                            if (-not $mbSnap) { continue }
+                            $bnSnap = ("$($mbSnap.Identity)" -replace '^MigrationService:','')
+                            if (-not $bnSnap) { continue }
+                            if (-not $script:BatchTrendHistory.ContainsKey($bnSnap)) {
+                                $script:BatchTrendHistory[$bnSnap] = [System.Collections.ArrayList]@()
+                            }
+                            $bSnap = @{
+                                Timestamp                 = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss')
+                                SyncedCount               = [int]$mbSnap.SyncedCount
+                                FinalizedCount            = [int]$mbSnap.FinalizedCount
+                                ActiveCount               = [int]$mbSnap.ActiveCount
+                                PendingCount              = [int]$mbSnap.PendingCount
+                                StoppedCount              = [int]$mbSnap.StoppedCount
+                                FailedCount               = [int]$mbSnap.FailedCount
+                                CompletedWithWarningCount = [int]$mbSnap.CompletedWithWarningCount
+                                TotalCount                = [int]$mbSnap.TotalCount
+                            }
+                            $lastBSnap = if ($script:BatchTrendHistory[$bnSnap].Count -gt 0) { $script:BatchTrendHistory[$bnSnap][$script:BatchTrendHistory[$bnSnap].Count - 1] } else { $null }
+                            if (-not $lastBSnap -or $lastBSnap.Timestamp -ne $bSnap.Timestamp) {
+                                [void]$script:BatchTrendHistory[$bnSnap].Add($bSnap)
+                                while ($script:BatchTrendHistory[$bnSnap].Count -gt 100) { $script:BatchTrendHistory[$bnSnap].RemoveAt(0) }
+                            }
+                        }
+                        $watchState['BatchTrendHistory'] = $script:BatchTrendHistory
+                    } catch {
+                        Write-Console "Warning: could not collect batch trend snapshots — $_" -Level Warn -NoTimestamp
+                    }
+
                 }
 
                 # ── Check for scheduled report ───────────────────────────────────────────
@@ -8777,6 +9257,13 @@ if ($MyInvocation.InvocationName -ne '.') {
                         }
                         elseif ($cmd.Action -eq 'refresh') {
                             Write-Console "Manual refresh requested" -Level API -NoTimestamp
+                        }
+                        elseif ($cmd.Action -eq 'fetchBatchStats') {
+                            # On-demand fetch for selected batches only — uses Get-MigrationBatch -Identity -IncludeReport
+                            if ($cmd.Batches -and @($cmd.Batches).Count -gt 0) {
+                                Write-Console "Fetching batch stats for: $($cmd.Batches -join ', ')" -Level API -NoTimestamp
+                                Invoke-BatchStatsRefresh -WatchState $watchState -BatchNames @($cmd.Batches) -CachedMailboxes $watchState['CachedMailboxes']
+                            }
                         }
                         elseif ($cmd.Action -eq 'UpdateInterval') {
                             $RefreshIntervalSeconds = $cmd.Interval
