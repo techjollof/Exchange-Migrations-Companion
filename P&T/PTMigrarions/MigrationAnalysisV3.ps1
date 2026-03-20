@@ -3469,12 +3469,12 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
       <div class="value">$($Summary.TotalThroughputGBPerHour)</div>
       <div class="sub">GB/h wall-clock rate</div>
     </div>
-    <div class="kpi green">
+    <div class="kpi green" onclick="drilldownKpi('rate')" style="cursor:pointer">
       <div class="label">Avg Transfer Rate</div>
       <div class="value">$($Summary.AvgPerMoveTransferRateGBPerHour)</div>
       <div class="sub">GB/h per mailbox (≥0.5)</div>
     </div>
-    <div class="kpi $(if ($Summary.MoveEfficiencyPercent -ge 75){'green'}elseif($Summary.MoveEfficiencyPercent-ge60){'amber'}else{'red'})">
+    <div class="kpi $(if ($Summary.MoveEfficiencyPercent -ge 75){'green'}elseif($Summary.MoveEfficiencyPercent-ge60){'amber'}else{'red'})" onclick="drilldownKpi('eff')" style="cursor:pointer">
       <div class="label">Move Efficiency</div>
       <div class="value">$($Summary.MoveEfficiencyPercent)%</div>
       <div class="sub">Healthy 75–100%</div>
@@ -3782,7 +3782,10 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
         <!-- Left: Mailbox List -->
         <div style="background:#f8fafc;border-right:1px solid #e2e8f0;display:flex;flex-direction:column;">
           <div style="padding:16px;border-bottom:1px solid #e2e8f0;">
-            <div style="font-weight:700;font-size:1rem;color:#1e293b;margin-bottom:12px;">📈 Migration Trends</div>
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+              <div style="font-weight:700;font-size:1rem;color:#1e293b;">📈 Migration Trends</div>
+              <button onclick="exportTrendsCSV()" style="background:#f1f5f9;border:1px solid #e2e8f0;border-radius:6px;padding:4px 10px;font-size:.75rem;cursor:pointer;color:#475569;" title="Export trend history to CSV">📥 CSV</button>
+            </div>
             <input type="text" id="trend-search" placeholder="🔍 Search mailbox..."
                    style="width:100%;padding:8px 12px;border:1px solid #e2e8f0;border-radius:6px;font-size:.85rem;"
                    oninput="filterTrendMailboxes(this.value)">
@@ -3845,9 +3848,16 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
           </div>
 
           <div id="comparison-results" style="display:none;">
+            <!-- Fixed slot for scope warning — populated by JS, never grows the layout -->
+            <div id="compare-raw-note" style="display:none;margin-bottom:14px;padding:10px 14px;background:#fffbeb;border:1px solid #fcd34d;border-radius:8px;font-size:.82rem;color:#92400e;">
+              ⚠ One or more batches are outside the current watch scope. Status and % complete are shown from the live batch list — transfer rate, size, and throughput are only available for mailboxes in the active scope.
+            </div>
             <div style="margin-bottom:24px;">
               <div style="font-size:.85rem;font-weight:600;color:#64748b;margin-bottom:12px;">Performance Comparison</div>
-              <canvas id="chart-batch-compare" height="220"></canvas>
+              <!-- Fixed-height wrapper prevents Chart.js growing the canvas on each redraw -->
+              <div style="position:relative;height:220px;">
+                <canvas id="chart-batch-compare"></canvas>
+              </div>
             </div>
             <div class="tbl-wrap">
               <table id="comparison-table" style="width:100%">
@@ -4157,6 +4167,100 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
   });
 })();
 
+  // ── KPI Drill-Down ────────────────────────────────────────────────────
+  var _kpiDrillChart = null;
+
+  function closeKpiDrill() {
+    document.getElementById('kpiDrillModal').style.display = 'none';
+  }
+
+  function drilldownKpi(metric) {
+    var data = (typeof KPI_DIST_DATA !== 'undefined') ? KPI_DIST_DATA : [];
+    // In watch mode, data in KPI_DIST_DATA may be stale — try CachedMailboxes via WATCH_API_BASE
+    // but for simplicity use the embedded snapshot (always available)
+    if (!data.length) {
+      alert('No per-mailbox data available for drill-down.');
+      return;
+    }
+    var isRate = (metric === 'rate');
+    var values = data.map(function(m){ return isRate ? m.rate : m.eff; }).filter(function(v){ return v > 0; });
+    values.sort(function(a,b){ return a-b; });
+    var n = values.length;
+    function pct(p){ return values[Math.max(0,Math.min(n-1,Math.round((p/100)*n)-1))]; }
+    var p10=pct(10), p25=pct(25), p50=pct(50), p75=pct(75), p90=pct(90);
+    var avg = values.reduce(function(s,v){return s+v;},0)/Math.max(1,n);
+
+    // Title/sub
+    document.getElementById('kpiDrillTitle').textContent = isRate ? 'Transfer Rate Distribution' : 'Move Efficiency Distribution';
+    document.getElementById('kpiDrillSub').textContent   = n + ' mailboxes · per-mailbox ' + (isRate ? 'rate (GB/h)' : 'efficiency (%)');
+
+    // Percentile stat cards
+    var statsHtml = [['p10',p10],['p25',p25],['p50 (med)',p50],['p75',p75],['p90',p90]].map(function(s){
+      return '<div style="background:#f8fafc;border-radius:8px;padding:10px;text-align:center;">' +
+        '<div style="font-size:.7rem;color:#64748b;text-transform:uppercase;letter-spacing:.04em;margin-bottom:3px;">'+s[0]+'</div>' +
+        '<div style="font-size:1.1rem;font-weight:700;color:#1e293b;">'+(isRate?s[1].toFixed(3):s[1].toFixed(1))+(isRate?' GB/h':'%')+'</div>' +
+      '</div>';
+    }).join('');
+    document.getElementById('kpiDrillStats').innerHTML = statsHtml;
+
+    // Histogram buckets
+    var bucketCount = Math.min(20, Math.max(5, Math.round(Math.sqrt(n))));
+    var minV = values[0], maxV = values[n-1];
+    var step = (maxV - minV) / bucketCount || 1;
+    var buckets = [];
+    for(var i=0;i<bucketCount;i++){
+      var lo=minV+i*step, hi=lo+step;
+      var cnt=values.filter(function(v){return v>=lo&&(i===bucketCount-1?v<=hi:v<hi);}).length;
+      buckets.push({ lo:lo, hi:hi, cnt:cnt });
+    }
+    var labels  = buckets.map(function(b){ return (isRate?b.lo.toFixed(2):b.lo.toFixed(0))+'–'+(isRate?b.hi.toFixed(2):b.hi.toFixed(0)); });
+    var counts  = buckets.map(function(b){ return b.cnt; });
+    var bgColors = buckets.map(function(b){
+      var mid=(b.lo+b.hi)/2;
+      if(isRate){ return mid>=0.5?'rgba(34,197,94,.7)':mid>=0.3?'rgba(245,158,11,.7)':'rgba(239,68,68,.7)'; }
+      else      { return mid>=75?'rgba(34,197,94,.7)':mid>=60?'rgba(245,158,11,.7)':'rgba(239,68,68,.7)'; }
+    });
+
+    loadChartJs(function(){
+      var ctx = document.getElementById('kpiDrillChart');
+      if(!ctx) return;
+      if(_kpiDrillChart){ _kpiDrillChart.destroy(); }
+      _kpiDrillChart = new Chart(ctx, {
+        type:'bar',
+        data:{ labels:labels, datasets:[{ label:'Mailboxes', data:counts, backgroundColor:bgColors, borderWidth:0, borderRadius:3 }] },
+        options:{
+          responsive:true,
+          plugins:{ legend:{display:false},
+            annotation:{ annotations:{
+              avg:{ type:'line', scaleID:'x', value: function(){
+                // find bucket containing avg
+                var idx=0; buckets.forEach(function(b,i){ if(avg>=b.lo) idx=i; }); return idx;
+              }(), borderColor:'#3b82f6', borderWidth:2, borderDash:[4,3],
+                label:{content:'Avg: '+(isRate?avg.toFixed(3):avg.toFixed(1)),display:true,position:'end',font:{size:11},color:'#3b82f6',backgroundColor:'rgba(255,255,255,.8)'} }
+            }}
+          },
+          scales:{ x:{ticks:{font:{size:10}}}, y:{beginAtZero:true,title:{display:true,text:'# Mailboxes',font:{size:11}}} }
+        }
+      });
+    });
+
+    // Recommendation
+    var rec = '';
+    if(isRate){
+      if(p50>=0.5) rec='✅ Median transfer rate is healthy (≥0.5 GB/h). No action needed.';
+      else if(p50>=0.3) rec='⚠️ Median transfer rate is below 0.5 GB/h. Check for throttling or network congestion. Consider reviewing stall breakdown on individual mailboxes.';
+      else rec='🔴 Median transfer rate is critically low (<0.3 GB/h). Likely throttling, network issue, or proxy problems. Review stall breakdowns and check EXO service health.';
+    } else {
+      if(p50>=75) rec='✅ Median move efficiency is healthy (≥75%). Mailboxes are spending most time in productive transfer.';
+      else if(p50>=60) rec='⚠️ Median efficiency 60–75%. Some stall time detected. Check CI, HA, and throttle stall metrics.';
+      else rec='🔴 Median efficiency below 60%. Significant stall time. Check Content Indexing and HA stalls — these are the most common cause.';
+    }
+    document.getElementById('kpiDrillRec').innerHTML = rec;
+
+    var modal = document.getElementById('kpiDrillModal');
+    modal.style.display = 'flex';
+  }
+
   // ── Main tab switcher ────────────────────────────────────────────────────
   function switchMain(id, btn) {
     document.querySelectorAll('.main-panel').forEach(function(p){ p.classList.remove('active'); });
@@ -4300,6 +4404,22 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
   }
 </script>
 
+
+<!-- ── KPI Drill-Down Modal ─────────────────────────────────── -->
+<div id="kpiDrillModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:1100;align-items:center;justify-content:center;" onclick="if(event.target===this)closeKpiDrill()">
+  <div style="background:#fff;border-radius:14px;padding:28px 30px;width:min(700px,96vw);max-height:88vh;overflow-y:auto;box-shadow:0 8px 40px rgba(0,0,0,.25);">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+      <div>
+        <div id="kpiDrillTitle" style="font-size:1.1rem;font-weight:700;color:#1e293b;"></div>
+        <div id="kpiDrillSub"   style="font-size:.8rem;color:#64748b;margin-top:2px;"></div>
+      </div>
+      <button onclick="closeKpiDrill()" style="background:none;border:none;font-size:1.5rem;cursor:pointer;color:#94a3b8;line-height:1;">×</button>
+    </div>
+    <div id="kpiDrillStats" style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:18px;"></div>
+    <canvas id="kpiDrillChart" height="200"></canvas>
+    <div id="kpiDrillRec" style="margin-top:14px;padding:12px 14px;background:#f8fafc;border-radius:8px;font-size:.82rem;color:#475569;border-left:3px solid #3b82f6;"></div>
+  </div>
+</div>
 
 <!-- ── Mailbox Detail Modal ─────────────────────────────────────────── -->
 <style>
@@ -4566,11 +4686,11 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
       body += "</div>";
     }
 
-    // ── Last Failure ───────────────────────────────────────────────────
+    // ── Failure History ────────────────────────────────────────────────
     if(d.lastfail && d.lastfail.trim()){
-      body += "<div class='mbx-section' style='background:#fff1f2;border-radius:10px;padding:14px 16px;'>";
-      body += "<div class='mbx-section-title'>Last Failure</div>";
-      body += "<div class='mbx-failbox'>"+d.lastfail+"</div>";
+      body += "<div class='mbx-section' id='mdFailureSection' style='background:#fff1f2;border-radius:10px;padding:14px 16px;'>";
+      body += "<div class='mbx-section-title'>Failure History <span id='mdFailureHistBadge' style='font-size:.72rem;color:#94a3b8;font-weight:400;'>(loading…)</span></div>";
+      body += "<div id='mdFailureHistList'><div class='mbx-failbox'>"+d.lastfail+"</div></div>";
       body += "</div>";
     }
 
@@ -4585,6 +4705,7 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     updateNavButtons();
     // Fetch and render trend data
     fetchMailboxTrend(d.dn || d.alias);
+    if(d.lastfail && d.lastfail.trim()) { fetchFailureHistory(d.dn || d.alias); }
   }
 
   // ── Mailbox Navigation ──────────────────────────────────────────────
@@ -4619,6 +4740,34 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
 
   // ── Mailbox Trend Chart ─────────────────────────────────────────────
   var mbxTrendChart = null;
+
+  function fetchFailureHistory(mailboxName) {
+    var apiBase = window.WATCH_API_BASE;
+    if (!apiBase) return;  // static mode: only LastFailure from data attribute
+    fetch(apiBase + '/api/failure-history?mailbox=' + encodeURIComponent(mailboxName))
+      .then(function(r){ return r.json(); })
+      .then(function(res) {
+        var badgeEl = document.getElementById('mdFailureHistBadge');
+        var listEl  = document.getElementById('mdFailureHistList');
+        if (!badgeEl || !listEl) return;
+        var hist = res.history || [];
+        if (!hist.length) {
+          badgeEl.textContent = '(no recorded history)';
+          return;
+        }
+        badgeEl.textContent = '(' + hist.length + ' recorded)';
+        // Render newest-first
+        var items = hist.slice().reverse().map(function(h, i) {
+          var ts = h.Timestamp ? h.Timestamp.replace('T',' ') : '—';
+          return '<div style="margin-bottom:' + (i < hist.length-1 ? '8' : '0') + 'px;padding-bottom:' + (i < hist.length-1 ? '8' : '0') + 'px;' + (i < hist.length-1 ? 'border-bottom:1px solid rgba(0,0,0,.08);' : '') + '">' +
+            '<div style="font-size:.72rem;color:#94a3b8;margin-bottom:3px;">' + ts + ' · ' + h.PercentComplete + '% done</div>' +
+            '<div class="mbx-failbox" style="margin:0;">' + h.Message + '</div>' +
+          '</div>';
+        });
+        listEl.innerHTML = items.join('');
+      })
+      .catch(function(){});  // silently ignore failures
+  }
 
   function fetchMailboxTrend(mailboxName) {
     var trendContainer = document.getElementById('mdTrendSection');
@@ -5653,21 +5802,27 @@ function renderBatchComparison(batches) {
     return;
   }
 
-  // Update table headers
+  // Update table headers — mark raw-data batches
   var thead = document.querySelector('#comparison-table thead tr');
   thead.innerHTML = '<th>Metric</th>' + batches.map(function(b) {
-    return '<th>' + b.BatchName + '</th>';
+    var note = b.DataSource === 'raw' ? ' <span title="Outside current scope — rate data unavailable" style="color:#f59e0b;font-size:.75rem;">⚠ partial</span>' : '';
+    return '<th>' + b.BatchName + note + '</th>';
   }).join('');
+
+  // Show/hide the fixed scope-warning note
+  var hasRaw = batches.some(function(b){ return b.DataSource === 'raw'; });
+  var rawNote = document.getElementById('compare-raw-note');
+  if (rawNote) rawNote.style.display = hasRaw ? '' : 'none';
 
   // Metrics to compare
   var metrics = [
     { key: 'MailboxCount', label: 'Mailboxes', format: function(v) { return v || 0; } },
     { key: 'PercentComplete', label: '% Complete', format: function(v) { return (v || 0) + '%'; } },
-    { key: 'TotalSourceSizeGB', label: 'Total Size (GB)', format: function(v) { return (v || 0).toFixed(2); } },
-    { key: 'TotalTransferredGB', label: 'Transferred (GB)', format: function(v) { return (v || 0).toFixed(2); } },
+    { key: 'TotalSourceSizeGB', label: 'Total Size (GB)', format: function(v, b) { return b.DataSource==='raw' ? '—' : (v||0).toFixed(2); } },
+    { key: 'TotalTransferredGB', label: 'Transferred (GB)', format: function(v, b) { return b.DataSource==='raw' ? '—' : (v||0).toFixed(2); } },
     { key: 'TotalThroughputGBPerHour', label: 'Throughput (GB/h)', format: function(v) { return (v || 0).toFixed(2); } },
-    { key: 'AvgTransferRateMBPerHour', label: 'Avg Rate (MB/h)', format: function(v) { return (v || 0).toFixed(2); } },
-    { key: 'MoveEfficiency', label: 'Move Efficiency', format: function(v) { return (v || 0) + '%'; } },
+    { key: 'AvgTransferRateMBPerHour', label: 'Avg Rate (MB/h)', format: function(v, b) { return b.DataSource==='raw' ? '—' : (v||0).toFixed(2); } },
+    { key: 'MoveEfficiency', label: 'Move Efficiency', format: function(v, b) { return b.DataSource==='raw' ? '—' : (v||0)+'%'; } },
     { key: 'CompletedCount', label: 'Completed', format: function(v) { return v || 0; } },
     { key: 'InProgressCount', label: 'In Progress', format: function(v) { return v || 0; } },
     { key: 'FailedCount', label: 'Failed', format: function(v) { return v || 0; }, highlight: true }
@@ -5679,7 +5834,7 @@ function renderBatchComparison(batches) {
       var val = b[m.key];
       var style = '';
       if (m.highlight && val > 0) style = 'color:#ef4444;font-weight:600;';
-      return '<td style="' + style + '">' + m.format(val) + '</td>';
+      return '<td style="' + style + '">' + m.format(val, b) + '</td>';
     }).join('');
     return '<tr><td style="font-weight:600;">' + m.label + '</td>' + cells + '</tr>';
   }).join('');
@@ -5749,6 +5904,28 @@ function renderBatchCompareChart(batches) {
 // ══════════════════════════════════════════════════════════════════
 var trendMailboxList = [];
 var selectedTrendMailbox = null;
+
+function exportTrendsCSV() {
+  var apiBase = window.WATCH_API_BASE;
+  if (!apiBase) { alert('CSV export is only available in watch mode.'); return; }
+  fetch(apiBase + '/api/export-trends')
+    .then(function(r) {
+      if (!r.ok) { return r.json().then(function(j){ throw new Error(j.error || 'Export failed'); }); }
+      return r.text();
+    })
+    .then(function(csv) {
+      var blob = new Blob([csv], { type: 'text/csv' });
+      var url  = URL.createObjectURL(blob);
+      var a    = document.createElement('a');
+      a.href = url;
+      a.download = 'MigrationTrends_' + new Date().toISOString().slice(0,10) + '.csv';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    })
+    .catch(function(e) { alert('Export failed: ' + e.message); });
+}
 
 function initTrendsPanel() {
   var apiBase = window.WATCH_API_BASE;
@@ -6503,6 +6680,14 @@ $(if($ListenerPort -gt 0){
 <script>
   // Cohort data embedded at report-generation time (used in static report mode)
   var COHORT_STATIC_DATA = $( if ($Summary.CohortAnalysis -and @($Summary.CohortAnalysis).Count -gt 0) { @($Summary.CohortAnalysis) | ConvertTo-Json -Depth 4 -Compress } else { '[]' } );
+  var KPI_DIST_DATA = $(
+    if ($Summary.PerMailboxDetail -and @($Summary.PerMailboxDetail).Count -gt 0) {
+        $dist = @($Summary.PerMailboxDetail) | ForEach-Object {
+            @{ dn = "$($_.DisplayName)"; rate = [double]$_.TransferRateGBph; eff = [double]$_.EfficiencyPct; size = [double]$_.MailboxSizeGB }
+        }
+        $dist | ConvertTo-Json -Depth 2 -Compress
+    } else { '[]' }
+  );
   // In static report mode, pre-load cohort data so it's ready when the tab is opened
   document.addEventListener('DOMContentLoaded', function() {
     if (!window.WATCH_API_BASE && typeof loadCohortData === 'function') { loadCohortData(); }
@@ -7114,51 +7299,32 @@ function Start-WatchListener {
     )
 
     if (-not $NoPortKill) {
-        # Kill any existing process using this port
+        # Kill any existing process using this port.
+        # Run in a background job with a 5-second timeout so a hung netstat/netsh
+        # never blocks the main script from starting.
         Write-Host "  Checking for processes using port $Port..." -ForegroundColor DarkGray
-        try {
-            # Method 1: Use Get-NetTCPConnection (more reliable on Windows)
-            $connections = Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue
-            foreach ($conn in $connections) {
-                if ($conn.OwningProcess -and $conn.OwningProcess -ne 0) {
-                    try {
-                        $proc = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
-                        if ($proc) {
-                            Write-Host "  Killing process '$($proc.ProcessName)' (PID $($conn.OwningProcess)) using port $Port" -ForegroundColor Yellow
-                            Stop-Process -Id $conn.OwningProcess -Force -ErrorAction SilentlyContinue
-                            Start-Sleep -Milliseconds 500
-                        }
-                    } catch {}
-                }
-            }
-        } catch {
-            # Method 2: Fallback to netstat if Get-NetTCPConnection fails
+        $killJob = Start-Job -ScriptBlock {
+            param([int]$Port)
             try {
-                $netstat = netstat -ano 2>$null | Select-String "[:.]$Port\s" | ForEach-Object {
-                    if ($_ -match '\s+(\d+)\s*$') { $Matches[1] }
-                } | Where-Object { $_ -and $_ -ne '0' } | Select-Object -Unique
-
-                foreach ($procId in $netstat) {
-                    try {
-                        $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
-                        if ($proc) {
-                            Write-Host "  Killing process '$($proc.ProcessName)' (PID $procId) using port $Port" -ForegroundColor Yellow
-                            Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
-                            Start-Sleep -Milliseconds 500
-                        }
-                    } catch {}
+                # Use netstat — avoids Get-NetTCPConnection which can hang in TIME_WAIT states
+                $pids = netstat -ano 2>$null |
+                    Select-String ":$Port\s" |
+                    ForEach-Object { if ($_ -match '\s+(\d+)\s*$') { $Matches[1] } } |
+                    Where-Object { $_ -and $_ -ne '0' } |
+                    Select-Object -Unique
+                foreach ($procId in $pids) {
+                    try { Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue } catch {}
                 }
             } catch {}
-        }
+            try { netsh http delete urlacl url="http://127.0.0.1:$Port/" 2>&1 | Out-Null } catch {}
+            try { netsh http delete urlacl url="http://localhost:$Port/"  2>&1 | Out-Null } catch {}
+            try { netsh http delete urlacl url="http://+:$Port/"          2>&1 | Out-Null } catch {}
+        } -ArgumentList $Port
 
-        # Also try to delete any HTTP URL reservation that might be blocking
-        try {
-            $null = netsh http delete urlacl url="http://127.0.0.1:$Port/" 2>$null
-            $null = netsh http delete urlacl url="http://localhost:$Port/" 2>$null
-            $null = netsh http delete urlacl url="http://+:$Port/" 2>$null
-        } catch {}
+        # Wait up to 5 seconds — abandon silently if it takes longer
+        $null = Wait-Job $killJob -Timeout 5
+        Remove-Job $killJob -Force -ErrorAction SilentlyContinue
 
-        # Small delay to ensure port is released
         Start-Sleep -Milliseconds 300
     }
 
@@ -7531,7 +7697,38 @@ function Start-WatchListener {
                                         }
                                         $responseBytes = [System.Text.Encoding]::UTF8.GetBytes(($batchStats | ConvertTo-Json -Compress))
                                     } else {
-                                        $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"Batch not found"}')
+                                        # ── Fallback: compute basic stats from raw Get-MoveRequest data ──
+                                        # CachedMailboxes is scope-filtered; AllRawMoves is tenant-wide.
+                                        $rawMoves = $State['AllRawMoves']
+                                        $rawBatch = if ($rawMoves) {
+                                            @($rawMoves | Where-Object { ("$($_.BatchName)" -replace '^MigrationService:','') -eq $batchName })
+                                        } else { @() }
+
+                                        if ($rawBatch.Count -gt 0) {
+                                            $completedCount  = @($rawBatch | Where-Object { "$($_.Status)" -in @('Completed','CompletedWithWarning','CompletedWithSkippedItems','Synced') }).Count
+                                            $inProgressCount = @($rawBatch | Where-Object { "$($_.Status)" -eq 'InProgress' }).Count
+                                            $failedCount     = @($rawBatch | Where-Object { "$($_.Status)" -eq 'Failed' }).Count
+                                            $avgPercent      = [math]::Round(($rawBatch | Measure-Object -Property PercentComplete -Average).Average, 1)
+
+                                            $batchStats = @{
+                                                ok = $true
+                                                BatchName            = $batchName
+                                                MailboxCount         = $rawBatch.Count
+                                                PercentComplete      = $avgPercent
+                                                TotalSourceSizeGB    = 0
+                                                TotalTransferredGB   = 0
+                                                TotalThroughputGBPerHour = 0
+                                                AvgTransferRateMBPerHour = 0
+                                                MoveEfficiency       = 0
+                                                CompletedCount       = $completedCount
+                                                InProgressCount      = $inProgressCount
+                                                FailedCount          = $failedCount
+                                                DataSource           = 'raw'  # signals JS that rate data is unavailable
+                                            }
+                                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes(($batchStats | ConvertTo-Json -Compress))
+                                        } else {
+                                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"Batch not found"}')
+                                        }
                                     }
                                 } else {
                                     $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"No cached data available"}')
@@ -7586,6 +7783,63 @@ function Start-WatchListener {
                         } catch {
                             $errMsg = $_.Exception.Message -replace '"', "'"
                             $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"ok`":false,`"error`":`"Failed to get cohort stats: $errMsg`"}")
+                        }
+                    }
+                    elseif ($path -eq '/api/export-trends') {
+                        $contentType = 'text/csv; charset=utf-8'
+                        try {
+                            $trendHist = $State['MailboxTrendHistory']
+                            if ($null -eq $trendHist -or $trendHist.Count -eq 0) {
+                                $contentType = 'application/json; charset=utf-8'
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"No trend history yet. Wait for multiple refresh cycles."}')
+                            } else {
+                                $csvLines = [System.Collections.ArrayList]@()
+                                [void]$csvLines.Add('Mailbox,Status,TransferRateGBh,EfficiencyPct,TransferredGB,PercentComplete,Timestamp')
+                                foreach ($mbxName in @($trendHist.Keys | Sort-Object)) {
+                                    foreach ($pt in @($trendHist[$mbxName])) {
+                                        $safeName = if ($mbxName -match '[,"]') { '"' + $mbxName.Replace('"','""') + '"' } else { $mbxName }
+                                        $line = $safeName + ',' +
+                                                "$($pt.Status)" + ',' +
+                                                [math]::Round([double]$pt.TransferRateGBh, 4) + ',' +
+                                                [math]::Round([double]$pt.EfficiencyPct,   1) + ',' +
+                                                [math]::Round([double]$pt.TransferredGB,   3) + ',' +
+                                                [math]::Round([double]$pt.PercentComplete, 1) + ',' +
+                                                "$($pt.Timestamp)"
+                                        [void]$csvLines.Add($line)
+                                    }
+                                }
+                                $csv = $csvLines -join "`r`n"
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($csv)
+                            }
+                        } catch {
+                            $contentType = 'application/json; charset=utf-8'
+                            $errMsg = $_.Exception.Message -replace '"', "'"
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"ok`":false,`"error`":`"Export failed: $errMsg`"}")
+                        }
+                    }
+                    elseif ($path -eq '/api/failure-history') {
+                        $contentType = 'application/json; charset=utf-8'
+                        try {
+                            $mbxName = $null
+                            if ($req.Url.Query) {
+                                $queryParams = [System.Web.HttpUtility]::ParseQueryString($req.Url.Query)
+                                $mbxName = $queryParams['mailbox']
+                            }
+                            if (-not $mbxName) {
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"Missing mailbox parameter"}')
+                            } else {
+                                $failHist = $State['MailboxFailureHistory']
+                                if ($failHist -and $failHist.ContainsKey($mbxName)) {
+                                    $entries = @($failHist[$mbxName])
+                                    $json = @{ ok = $true; mailbox = $mbxName; history = @($entries) } | ConvertTo-Json -Depth 4 -Compress
+                                    $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+                                } else {
+                                    $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true,"mailbox":"' + ($mbxName -replace '"','\"') + '","history":[]}')
+                                }
+                            }
+                        } catch {
+                            $errMsg = $_.Exception.Message -replace '"', "'"
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"ok`":false,`"error`":`"Failed to get failure history: $errMsg`"}")
                         }
                     }
                     elseif ($path -eq '/api/retry-status') {
@@ -8054,6 +8308,7 @@ if ($MyInvocation.InvocationName -ne '.') {
         # ── Historical trend data collection ────────────────────────────────────
         $script:TrendHistory = [System.Collections.ArrayList]@()
         $script:MailboxTrendHistory = @{}  # Per-mailbox trend data keyed by DisplayName
+        $script:MailboxFailureHistory = @{}  # Last 5 failure entries per mailbox keyed by DisplayName
 
 
         # ── Shared state for listener <-> main loop communication ─────────────
@@ -8142,6 +8397,7 @@ if ($MyInvocation.InvocationName -ne '.') {
                     Sort-Object Name |
                     ForEach-Object { @{ Name=$_.Name; Count=$_.Count } }
             )
+            $watchState['AllRawMoves'] = @($allMoves)
             Write-Console "Loaded $($watchState['Batches'].Count) batch(es) for browser control panel." -Level Info -NoTimestamp
         } catch {
             Write-Console "Could not pre-load batch list: $_" -Level Warn -NoTimestamp
@@ -8227,6 +8483,7 @@ if ($MyInvocation.InvocationName -ne '.') {
                                 Sort-Object Name |
                                 ForEach-Object { @{ Name = $_.Name; Count = $_.Count } }
                         )
+                        $watchState['AllRawMoves'] = @($allMovesForBatches)
                     } catch {
                         Write-Console "Could not refresh batch list: $_" -Level Warn -NoTimestamp
                     }
@@ -8366,6 +8623,30 @@ if ($MyInvocation.InvocationName -ne '.') {
                             }
                         }
                         $watchState['MailboxTrendHistory'] = $script:MailboxTrendHistory
+                    }
+
+                    # ── Track per-mailbox failure history (always, no -IncludeDetailReport needed) ──
+                    if ($result.PerMailboxDetail) {
+                        $fhTimestamp = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss')
+                        foreach ($mbx in $result.PerMailboxDetail) {
+                            if ($mbx.Status -eq 'Failed' -and $mbx.LastFailure) {
+                                $mbxKey = $mbx.DisplayName
+                                if (-not $script:MailboxFailureHistory.ContainsKey($mbxKey)) {
+                                    $script:MailboxFailureHistory[$mbxKey] = [System.Collections.ArrayList]@()
+                                }
+                                $hist = $script:MailboxFailureHistory[$mbxKey]
+                                $lastEntry = if ($hist.Count -gt 0) { $hist[$hist.Count - 1] } else { $null }
+                                if (-not $lastEntry -or $lastEntry.Message -ne $mbx.LastFailure) {
+                                    [void]$hist.Add(@{
+                                        Timestamp       = $fhTimestamp
+                                        Message         = $mbx.LastFailure
+                                        PercentComplete = [math]::Round([double]$mbx.PercentComplete, 1)
+                                    })
+                                    while ($hist.Count -gt 5) { $hist.RemoveAt(0) }
+                                }
+                            }
+                        }
+                        $watchState['MailboxFailureHistory'] = $script:MailboxFailureHistory
                     }
                 }
 
