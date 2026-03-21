@@ -1089,6 +1089,216 @@ function Invoke-BatchStatsRefresh {
     Write-Console "BatchStatsRefresh: cached stats for $label batch(es)." -Level Info -NoTimestamp
 }
 
+# ── MRS Explorer Functions ──────────────────────────────────────────────────
+
+function ConvertTo-MRSStatisticsJson {
+    param([Parameter(Mandatory)] $Stats)
+
+    function SafeStr { param($v) if ($null -eq $v) { $null } else { "$v" } }
+    function SafeDate {
+        param($v)
+        if ($null -eq $v) { return $null }
+        try { return $v.ToUniversalTime().ToString('o') } catch { return "$v" }
+    }
+    function SafeInt   { param($v) $n = 0;   if ([int]::TryParse("$v", [ref]$n))   { $n } else { 0 } }
+    function SafeInt64 { param($v) $n = 0L;  if ([int64]::TryParse("$v", [ref]$n)) { $n } else { 0 } }
+
+    # Build Report section
+    $reportObj = [ordered]@{ TotalEntries = 0; FailureCount = 0; WarningCount = 0; Entries = @() }
+    try {
+        if ($Stats.Report -and $Stats.Report.Entries) {
+            $entries = @($Stats.Report.Entries)
+            $reportEntries = [System.Collections.ArrayList]@()
+            $failCount = 0
+            $warnCount = 0
+            foreach ($e in $entries) {
+                try {
+                    $lvl = SafeStr $e.Level
+                    $msgRaw = "$($e.Message)"
+                    $msg = if ($msgRaw.Length -gt 2000) { $msgRaw.Substring(0,2000) + '...' } else { $msgRaw }
+                    [void]$reportEntries.Add([ordered]@{
+                        CreationTime = SafeDate $e.CreationTime
+                        Level        = $lvl
+                        Type         = SafeStr $e.Type
+                        Message      = $msg
+                        Duration     = SafeStr $e.Duration
+                    })
+                    if ($lvl -eq 'Error' -or $lvl -eq 'Failure') { $failCount++ }
+                    elseif ($lvl -eq 'Warning')                   { $warnCount++ }
+                } catch {}
+            }
+            $reportObj = [ordered]@{
+                TotalEntries = $reportEntries.Count
+                FailureCount = $failCount
+                WarningCount = $warnCount
+                Entries      = @($reportEntries)
+            }
+        }
+    } catch {}
+
+    $obj = [ordered]@{
+        Identity = [ordered]@{
+            Identity        = SafeStr $Stats.Identity
+            DisplayName     = SafeStr $Stats.DisplayName
+            Alias           = SafeStr $Stats.Alias
+            ExchangeGuid    = SafeStr $Stats.ExchangeGuid
+            MailboxIdentity = SafeStr $Stats.MailboxIdentity
+        }
+        Status = [ordered]@{
+            Status       = SafeStr $Stats.Status
+            StatusDetail = SafeStr $Stats.StatusDetail
+            SyncStage    = SafeStr $Stats.SyncStage
+            Flags        = SafeStr $Stats.Flags
+            Direction    = SafeStr $Stats.Direction
+        }
+        Progress = [ordered]@{
+            PercentComplete       = SafeInt   $Stats.PercentComplete
+            BytesTransferred      = SafeStr   $Stats.BytesTransferred
+            TotalMailboxSize      = SafeStr   $Stats.TotalMailboxSize
+            TotalMailboxItemCount = SafeInt64 $Stats.TotalMailboxItemCount
+            ItemsTransferred      = SafeInt64 $Stats.ItemsTransferred
+        }
+        Quality = [ordered]@{
+            BadItemCount         = SafeInt $Stats.BadItemCount
+            LargeItemCount       = SafeInt $Stats.LargeItemCount
+            BadItemLimit         = SafeStr $Stats.BadItemLimit
+            LargeItemLimit       = SafeStr $Stats.LargeItemLimit
+            DataConsistencyScore = SafeStr $Stats.DataConsistencyScore
+        }
+        Timing = [ordered]@{
+            QueuedTimestamp                  = SafeDate $Stats.QueuedTimestamp
+            StartTimestamp                   = SafeDate $Stats.StartTimestamp
+            InitialSeedingCompletedTimestamp = SafeDate $Stats.InitialSeedingCompletedTimestamp
+            FinalSyncTimestamp               = SafeDate $Stats.FinalSyncTimestamp
+            CompletionTimestamp              = SafeDate $Stats.CompletionTimestamp
+            TotalInProgressDuration          = SafeStr  $Stats.TotalInProgressDuration
+        }
+        Target = [ordered]@{
+            TargetServer          = SafeStr $Stats.TargetServer
+            TargetDatabase        = SafeStr $Stats.TargetDatabase
+            TargetArchiveDatabase = SafeStr $Stats.TargetArchiveDatabase
+            RemoteHostName        = SafeStr $Stats.RemoteHostName
+            TargetDeliveryDomain  = SafeStr $Stats.TargetDeliveryDomain
+        }
+        Failures = [ordered]@{
+            FailureSide = SafeStr $Stats.FailureSide
+            FailureType = SafeStr $Stats.FailureType
+            FailureCode = SafeStr $Stats.FailureCode
+            Message     = SafeStr $Stats.Message
+            LastFailure = SafeDate $Stats.FailureTimestamp
+        }
+        Report = $reportObj
+    }
+    return $obj | ConvertTo-Json -Depth 6 -Compress
+}
+
+function Invoke-MRSMoveRequestRefresh {
+    param([Parameter(Mandatory)][hashtable]$WatchState)
+    try {
+        $moves = @(Get-MoveRequest -ResultSize Unlimited | Select-Object Name, DisplayName, Alias, BatchName, RemoteHostName, Flags, TargetDatabase, Status, ExchangeGuid)
+        $serialized = @($moves | ForEach-Object {
+            [ordered]@{
+                Name           = "$($_.Name)"
+                DisplayName    = "$($_.DisplayName)"
+                Alias          = "$($_.Alias)"
+                BatchName      = "$($_.BatchName)"
+                RemoteHostName = "$($_.RemoteHostName)"
+                Flags          = "$($_.Flags)"
+                TargetDatabase = "$($_.TargetDatabase)"
+                Status         = "$($_.Status)"
+                ExchangeGuid   = "$($_.ExchangeGuid)"
+            }
+        })
+        $WatchState['MRSMoveRequestCache']     = $serialized
+        $WatchState['MRSMoveRequestCacheTime'] = (Get-Date).ToUniversalTime().ToString('o')
+        Write-Console "MRSMoveRequestRefresh: cached $($serialized.Count) move requests." -Level Info -NoTimestamp
+    } catch {
+        Write-Console "MRSMoveRequestRefresh failed: $($_.Exception.Message)" -Level Warn -NoTimestamp
+    }
+}
+
+function Resolve-MRSIdentity {
+    param([hashtable]$WatchState, [string]$Alias)
+    # Prefer ExchangeGuid from cache to avoid "matches multiple entries" when a mailbox
+    # has more than one move request (e.g. a completed/soft-deleted one alongside an active one).
+    $cached = $WatchState['MRSMoveRequestCache']
+    if ($cached) {
+        $match = @($cached | Where-Object { $_.Alias -eq $Alias -and $_.ExchangeGuid -and $_.ExchangeGuid -ne '' })[0]
+        if ($match) { return $match.ExchangeGuid }
+    }
+    return $Alias
+}
+
+function Invoke-MRSStatisticsRefresh {
+    param(
+        [Parameter(Mandatory)][hashtable]$WatchState,
+        [Parameter(Mandatory)][string]$Alias
+    )
+    try {
+        # Imported XML entries are already in the cache — no EXO call needed.
+        if ($Alias -like 'imported:*') {
+            Write-Console "MRSStatisticsRefresh: '$Alias' is an imported entry, skipping EXO fetch." -Level Info -NoTimestamp
+            return
+        }
+        $identity = Resolve-MRSIdentity -WatchState $WatchState -Alias $Alias
+        $stats = Get-MoveRequestStatistics $identity -IncludeReport
+        if ($null -eq $stats) { throw "Get-MoveRequestStatistics returned null for '$Alias'" }
+        $json = ConvertTo-MRSStatisticsJson -Stats $stats
+        $WatchState["MRSStatsJson_$Alias"] = $json
+        $WatchState["MRSStatsTime_$Alias"] = (Get-Date).ToUniversalTime().ToString('o')
+        Write-Console "MRSStatisticsRefresh: cached statistics for '$Alias'." -Level Info -NoTimestamp
+    } catch {
+        Write-Console "MRSStatisticsRefresh failed for '$Alias': $($_.Exception.Message)" -Level Warn -NoTimestamp
+    }
+}
+
+function Invoke-MRSXmlExport {
+    param(
+        [Parameter(Mandatory)][hashtable]$WatchState,
+        [Parameter(Mandatory)][string]$Alias
+    )
+    try {
+        if ($Alias -like 'imported:*') {
+            Write-Console "MRSXmlExport: '$Alias' is an imported entry — EXO export not applicable." -Level Warn -NoTimestamp
+            if ($null -eq $WatchState['MRSExportReady']) { $WatchState['MRSExportReady'] = @{} }
+            $WatchState['MRSExportReady'][$Alias] = 'ERROR'
+            return
+        }
+        $identity = Resolve-MRSIdentity -WatchState $WatchState -Alias $Alias
+        $safeName = $Alias -replace '[^A-Za-z0-9._-]','_'
+        $tempPath = Join-Path $env:TEMP "MRS_Export_${safeName}_$([datetime]::Now.ToString('yyyyMMddHHmmss')).xml"
+        $stats = Get-MoveRequestStatistics $identity -IncludeReport
+        $stats | Export-Clixml -Path $tempPath -Depth 6
+        if ($null -eq $WatchState['MRSExportReady']) { $WatchState['MRSExportReady'] = @{} }
+        $WatchState['MRSExportReady'][$Alias] = $tempPath
+        Write-Console "MRSXmlExport: exported '$Alias' to temp file." -Level Info -NoTimestamp
+    } catch {
+        Write-Console "MRSXmlExport failed for '$Alias': $($_.Exception.Message)" -Level Warn -NoTimestamp
+        if ($null -eq $WatchState['MRSExportReady']) { $WatchState['MRSExportReady'] = @{} }
+        $WatchState['MRSExportReady'][$Alias] = 'ERROR'
+    }
+}
+
+function Invoke-MRSXmlImport {
+    param(
+        [Parameter(Mandatory)][hashtable]$WatchState,
+        [Parameter(Mandatory)][string]$TempPath,
+        [Parameter(Mandatory)][string]$OriginalName
+    )
+    try {
+        $obj  = Import-Clixml -Path $TempPath
+        $json = ConvertTo-MRSStatisticsJson -Stats $obj
+        $key  = "imported:$OriginalName"
+        $WatchState["MRSStatsJson_$key"] = $json
+        $WatchState["MRSStatsTime_$key"] = (Get-Date).ToUniversalTime().ToString('o')
+        Write-Console "MRSXmlImport: imported '$OriginalName' -> key '$key'." -Level Info -NoTimestamp
+    } catch {
+        Write-Console "MRSXmlImport failed for '$OriginalName': $($_.Exception.Message)" -Level Warn -NoTimestamp
+    } finally {
+        if (Test-Path $TempPath) { Remove-Item $TempPath -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 function Get-MigrationTrend {
     [CmdletBinding()]
     param(
@@ -3610,12 +3820,13 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
 
   <!-- Main navigation tabs -->
   <div class="main-tab-bar">
-    <button class="main-tab active" onclick="switchMain('perf',this)">📊 Migration Performance Analysis</button>
-    <button class="main-tab"        onclick="switchMain('mbx', this)">📬 Mailbox Migration Detail</button>
+    <button class="main-tab active" onclick="switchMain('perf',this)">📊 Performance Analysis</button>
+    <button class="main-tab"        onclick="switchMain('mbx', this)">📬 Mailbox Detail</button>
     <button class="main-tab"        onclick="switchMain('trends', this)" id="tab-trends" style="display:none">📈 Migration Trends</button>
-    <button class="main-tab"        onclick="switchMain('compare', this)" id="tab-compare" style="display:none">📋 Batch Comparison</button>
+    <button class="main-tab"        onclick="switchMain('compare', this)" id="tab-compare" style="display:none">📋 Compare Batch </button>
     <button class="main-tab"        onclick="switchMain('retry', this)" id="tab-retry" style="display:none">🔄 Auto-Retry</button>
     <button class="main-tab"        onclick="switchMain('cohort', this)" id="tab-cohort">🪣 Cohort Analysis</button>
+    <button class="main-tab"        onclick="switchMain('mrs', this)"   id="tab-mrs">🔍 MRS Explorer</button>
   </div>
 
   <!-- Panel 1: Performance Analysis -->
@@ -4176,6 +4387,145 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     </div>
   </div><!-- /panel-cohort -->
 
+  <!-- Panel: MRS Explorer -->
+  <div id="panel-mrs" class="main-panel" style="display:none;padding:0;overflow:hidden;height:calc(100vh - 140px)">
+    <div style="display:flex;height:100%;gap:0">
+
+      <!-- Left column: search + move request list -->
+      <div style="width:300px;min-width:300px;max-width:300px;display:flex;flex-direction:column;border-right:1px solid #e2e8f0;background:#f8fafc">
+        <!-- Controls -->
+        <div style="padding:12px;border-bottom:1px solid #e2e8f0;display:flex;flex-direction:column;gap:6px">
+          <input type="text" id="mrs-search" placeholder="Name, Alias, or Batch"
+                 style="width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:.8rem"
+                 onkeydown="if(event.key==='Enter')mrsFetchList()">
+          <select id="mrs-status-filter"
+                  style="width:100%;padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:.8rem;background:#fff"
+                  onchange="mrsApplyFilter()">
+            <option value="All">All Statuses</option>
+            <option>AutoSuspended</option>
+            <option>Completed</option>
+            <option>CompletedWithWarning</option>
+            <option>CompletionInProgress</option>
+            <option>Failed</option>
+            <option>InProgress</option>
+            <option>Queued</option>
+            <option>Synced</option>
+            <option>Suspended</option>
+          </select>
+          <div style="display:flex;gap:4px">
+            <button class="ent-btn" onclick="mrsFetchList()" style="flex:1;justify-content:center;padding:5px 0;font-size:.78rem">Search</button>
+            <button class="ent-btn" onclick="mrsRefreshList()" style="flex:1;justify-content:center;padding:5px 0;font-size:.78rem">Refresh</button>
+            <button class="ent-btn" onclick="mrsResetList()" style="flex:0 0 auto;padding:5px 8px;font-size:.78rem;background:#fff;color:#475569;border-color:#cbd5e1">Reset</button>
+          </div>
+        </div>
+        <!-- Move request list -->
+        <div style="flex:1;overflow-y:auto">
+          <table id="mrs-move-request-table" style="width:100%;border-collapse:collapse;font-size:.75rem">
+            <thead>
+              <tr style="background:#f1f5f9;position:sticky;top:0">
+                <th style="padding:6px 8px;text-align:left;font-weight:600;color:#475569;border-bottom:1px solid #e2e8f0">Name</th>
+                <th style="padding:6px 8px;text-align:left;font-weight:600;color:#475569;border-bottom:1px solid #e2e8f0">Status</th>
+                <th style="padding:6px 8px;text-align:left;font-weight:600;color:#475569;border-bottom:1px solid #e2e8f0">Batch</th>
+              </tr>
+            </thead>
+            <tbody id="mrs-move-request-tbody">
+              <tr><td colspan="3" style="padding:20px;text-align:center;color:#94a3b8;font-size:.8rem">Click Search to load move requests</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div id="mrs-list-count" style="padding:6px 10px;font-size:.72rem;color:#64748b;border-top:1px solid #e2e8f0;background:#f8fafc"></div>
+        <!-- Bottom controls -->
+        <div style="padding:10px 12px;border-top:1px solid #e2e8f0;display:flex;flex-direction:column;gap:6px">
+          <input type="file" id="mrs-xml-file-input" accept=".xml" style="display:none" onchange="mrsImportXml(this)">
+          <button class="ent-btn" onclick="document.getElementById('mrs-xml-file-input').click()" style="width:100%;justify-content:center;font-size:.78rem">📂 Import XML Statistics</button>
+          <div id="mrs-import-label" style="font-size:.72rem;padding:2px 8px;color:#64748b;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title=""></div>
+          <div id="mrs-session-status" style="font-size:.72rem;padding:3px 8px;border-radius:10px;text-align:center;background:#dcfce7;color:#166534">Session Active</div>
+        </div>
+      </div>
+
+      <!-- Right area -->
+      <div style="flex:1;display:flex;flex-direction:column;overflow:hidden;background:#fff">
+
+        <!-- Empty state -->
+        <div id="mrs-empty-state" style="flex:1;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px;color:#94a3b8">
+          <div style="font-size:2.5rem">🔍</div>
+          <div style="font-size:1rem;font-weight:500">Select a mailbox from the list</div>
+          <div style="font-size:.85rem">or import an XML statistics file to view details</div>
+        </div>
+
+        <!-- 3-pane layout (shown when mailbox selected) -->
+        <div id="mrs-detail-area" style="display:none;flex:1;flex-direction:column;overflow:hidden">
+
+          <!-- Breadcrumb + export button -->
+          <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 14px;border-bottom:1px solid #e2e8f0;background:#f8fafc;flex-shrink:0">
+            <div id="mrs-node-path" style="font-size:.78rem;color:#475569;font-family:monospace;word-break:break-all">—</div>
+            <button id="mrs-btn-export-xml" class="ent-btn" onclick="mrsExportXml()" style="font-size:.75rem;padding:4px 10px;flex-shrink:0;margin-left:10px">⬇ Export XML</button>
+          </div>
+
+          <!-- Property tree + center pane -->
+          <div style="flex:1;display:flex;overflow:hidden">
+
+            <!-- Property tree (left) -->
+            <div style="width:220px;min-width:220px;border-right:1px solid #e2e8f0;overflow-y:auto;background:#f8fafc">
+              <ul id="mrs-property-tree" style="list-style:none;margin:0;padding:8px 0">
+                <li style="padding:12px 10px;color:#94a3b8;font-size:.8rem">No data loaded</li>
+              </ul>
+            </div>
+
+            <!-- Center pane (value / entries viewer) -->
+            <div style="flex:1;overflow-y:auto;padding:12px 14px;display:flex;flex-direction:column;gap:8px">
+              <div id="mrs-center-label" style="font-size:.78rem;font-weight:600;color:#475569"></div>
+              <div id="mrs-center-content" style="flex:1"></div>
+              <!-- Report entries log viewer (hidden by default) -->
+              <div id="mrs-report-viewer" style="display:none">
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+                  <select id="mrs-entries-level-filter" style="padding:4px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:.78rem" onchange="mrsFilterEntries()">
+                    <option value="All">All Levels</option>
+                    <option>Info</option>
+                    <option>Warning</option>
+                    <option>Error</option>
+                  </select>
+                  <select id="mrs-entries-type-filter" style="padding:4px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:.78rem" onchange="mrsFilterEntries()">
+                    <option value="All">All Types</option>
+                  </select>
+                  <input type="text" id="mrs-entries-search" placeholder="Search message…"
+                         style="flex:1;min-width:120px;padding:4px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:.78rem"
+                         oninput="mrsFilterEntries()">
+                  <button class="ent-btn" onclick="mrsExportEntriesCsv()" style="font-size:.75rem;padding:4px 8px">⬇ CSV</button>
+                </div>
+                <div style="overflow-x:auto">
+                  <table style="width:100%;border-collapse:collapse;font-size:.75rem">
+                    <thead>
+                      <tr style="background:#f1f5f9">
+                        <th style="padding:5px 8px;text-align:left;font-weight:600;color:#475569;white-space:nowrap;border-bottom:1px solid #e2e8f0">Timestamp</th>
+                        <th style="padding:5px 8px;text-align:left;font-weight:600;color:#475569;border-bottom:1px solid #e2e8f0">Level</th>
+                        <th style="padding:5px 8px;text-align:left;font-weight:600;color:#475569;border-bottom:1px solid #e2e8f0">Type</th>
+                        <th style="padding:5px 8px;text-align:left;font-weight:600;color:#475569;border-bottom:1px solid #e2e8f0">Message</th>
+                        <th style="padding:5px 8px;text-align:left;font-weight:600;color:#475569;border-bottom:1px solid #e2e8f0;white-space:nowrap">Duration</th>
+                      </tr>
+                    </thead>
+                    <tbody id="mrs-entries-tbody"></tbody>
+                  </table>
+                </div>
+                <div id="mrs-entries-count" style="font-size:.72rem;color:#64748b;margin-top:6px"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Entry detail panel (bottom) -->
+          <div id="mrs-entry-detail-panel" style="display:none;flex-shrink:0;border-top:1px solid #e2e8f0;background:#f8fafc;padding:8px 14px;max-height:180px;overflow-y:auto">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+              <div style="font-size:.72rem;font-weight:600;color:#475569">Detail</div>
+              <button class="ent-btn" onclick="mrsCopyDetail()" style="font-size:.7rem;padding:2px 8px">Copy</button>
+            </div>
+            <pre id="mrs-entry-detail" style="margin:0;font-size:.75rem;font-family:monospace;white-space:pre-wrap;word-break:break-word;color:#1e293b"></pre>
+          </div>
+
+        </div><!-- /mrs-detail-area -->
+      </div><!-- /right area -->
+    </div>
+  </div><!-- /panel-mrs -->
+
   <div class="footer">
     Exchange Migration Analyzer &nbsp;•&nbsp; Generated $($Summary.GeneratedAt.ToString("R"))
   </div>
@@ -4466,6 +4816,7 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     if (panel) { panel.style.display = ''; panel.classList.add('active'); }
     btn.classList.add('active');
     if (id === 'cohort') { loadCohortData(); }
+    if (id === 'mrs')    { mrsOnTabActivate(); }
   }
 
   // ── Cohort Analysis ───────────────────────────────────────────────────────
@@ -7663,6 +8014,585 @@ $(if($ListenerPort -gt 0){
 })();
 </script>
 
+<script>
+// ═══════════════════════════════════════════════════════════════════
+// MRS EXPLORER
+// ═══════════════════════════════════════════════════════════════════
+
+// Script-level helper so MRS functions can reach it regardless of IIFE scope.
+// The watch-mode IIFE has its own private apiCall; this one is for MRS.
+function apiCall(endpoint, method, body) {
+  var base = window.WATCH_API_BASE || '';
+  var url = base ? (base + endpoint) : endpoint;
+  return fetch(url, {
+    method: method || 'GET',
+    headers: {'Content-Type':'application/json'},
+    body: body ? JSON.stringify(body) : undefined
+  }).then(function(r){ return r.json(); });
+}
+
+(function () {
+  'use strict';
+
+  var mrsState = {
+    currentAlias    : null,   // alias or 'imported:filename' key of selected item
+    currentStats    : null,   // parsed JSON stats object
+    allEntries      : [],     // full Report.Entries array for current selection
+    filteredEntries : [],     // entries after filter
+    listItems       : [],     // cached move request list
+    lastFetchTime   : 0,      // ms timestamp of last successful list load (0 = never)
+    pollTimer       : null
+  };
+  // ── Status badge colours ────────────────────────────────────────
+  function mrsStatusColor(s) {
+    if (!s) return '#94a3b8';
+    var m = s.toLowerCase();
+    if (m === 'inprogress')                return '#3b82f6';
+    if (m === 'completed')                 return '#22c55e';
+    if (m === 'completedwithwarning')      return '#22c55e';
+    if (m === 'failed')                    return '#ef4444';
+    if (m === 'synced' || m === 'autosuspended') return '#f59e0b';
+    if (m === 'queued')                    return '#94a3b8';
+    if (m === 'suspended')                 return '#f97316';
+    return '#64748b';
+  }
+
+  function mrsLevelColor(lvl) {
+    if (!lvl) return '#64748b';
+    var l = lvl.toLowerCase();
+    if (l === 'info')    return '#3b82f6';
+    if (l === 'warning') return '#f59e0b';
+    if (l === 'error' || l === 'failure') return '#ef4444';
+    return '#64748b';
+  }
+
+  // ── On tab activate ─────────────────────────────────────────────
+  function mrsOnTabActivate() {
+    console.log('[MRS] tab activated. lastFetchTime=', mrsState.lastFetchTime,
+      'stale=', mrsState.lastFetchTime ? Math.round((Date.now() - mrsState.lastFetchTime)/1000) + 's' : 'never');
+    mrsUpdateSessionBadge();
+    // Auto-load if never loaded or stale (> 5 minutes)
+    var FIVE_MIN = 5 * 60 * 1000;
+    if (!mrsState.lastFetchTime || (Date.now() - mrsState.lastFetchTime) > FIVE_MIN) {
+      mrsFetchList();
+    }
+  }
+  window.mrsOnTabActivate = mrsOnTabActivate;
+
+  function mrsUpdateSessionBadge() {
+    apiCall('/api/status', 'GET', null).then(function(data) {
+      var badge = document.getElementById('mrs-session-status');
+      if (data && data.ok) {
+        badge.style.background = '#dcfce7';
+        badge.style.color = '#166534';
+        badge.textContent = 'Session Active';
+      } else {
+        badge.style.background = '#fee2e2';
+        badge.style.color = '#991b1b';
+        badge.textContent = 'Session Offline';
+      }
+    }).catch(function() {
+      var badge = document.getElementById('mrs-session-status');
+      badge.style.background = '#fee2e2';
+      badge.style.color = '#991b1b';
+      badge.textContent = 'Session Offline';
+    });
+  }
+
+  // ── Fetch move request list ─────────────────────────────────────
+  function mrsFetchList() {
+    console.log('[MRS] mrsFetchList called');
+    var tbody = document.getElementById('mrs-move-request-tbody');
+    tbody.innerHTML = '<tr><td colspan="3" style="padding:16px;text-align:center;color:#94a3b8">Loading…</td></tr>';
+    var pollSince = Date.now();
+    apiCall('/api/mrs/fetch-move-requests', 'POST', null).then(function(resp) {
+      console.log('[MRS] fetch-move-requests response:', resp);
+      if (resp && resp.status === 'queued') {
+        mrsPollList(Date.now(), pollSince);
+      }
+    }).catch(function(err) {
+      console.error('[MRS] fetch-move-requests error:', err);
+      tbody.innerHTML = '<tr><td colspan="3" style="padding:16px;text-align:center;color:#ef4444">Error contacting server.</td></tr>';
+    });
+  }
+  window.mrsFetchList = mrsFetchList;
+
+  function mrsPollList(startTime, pollSince) {
+    if (Date.now() - startTime > 60000) {
+      console.warn('[MRS] mrsPollList timed out');
+      var tbody = document.getElementById('mrs-move-request-tbody');
+      tbody.innerHTML = '<tr><td colspan="3" style="padding:16px;text-align:center;color:#ef4444">Timed out. Try again.</td></tr>';
+      return;
+    }
+    var search = encodeURIComponent(document.getElementById('mrs-search').value || '');
+    var status = encodeURIComponent(document.getElementById('mrs-status-filter').value || 'All');
+    var url = '/api/mrs/move-requests?search=' + search + '&status=' + status;
+    apiCall(url, 'GET', null).then(function(resp) {
+      // Wait until cacheTime is set AND is newer than when we posted (avoids stale data on Refresh)
+      var cacheMs = resp && resp.cacheTime ? new Date(resp.cacheTime).getTime() : 0;
+      console.log('[MRS] mrsPollList: cacheMs=', cacheMs, 'pollSince=', pollSince, 'diff=', cacheMs - pollSince, 'items=', resp && resp.items ? resp.items.length : 'n/a');
+      if (!resp || !resp.cacheTime || cacheMs < pollSince) {
+        setTimeout(function() { mrsPollList(startTime, pollSince); }, 1500);
+        return;
+      }
+      mrsState.listItems = resp.items || [];
+      console.log('[MRS] mrsPollList: resolved', mrsState.listItems.length, 'items');
+      mrsRenderList(mrsState.listItems);
+    }).catch(function(err) {
+      console.error('[MRS] mrsPollList error:', err);
+      setTimeout(function() { mrsPollList(startTime, pollSince); }, 2000);
+    });
+  }
+
+  function mrsRefreshList() { mrsFetchList(); }
+  window.mrsRefreshList = mrsRefreshList;
+
+  function mrsResetList() {
+    document.getElementById('mrs-search').value = '';
+    document.getElementById('mrs-status-filter').value = 'All';
+    mrsApplyFilter();
+  }
+  window.mrsResetList = mrsResetList;
+
+  function mrsRenderList(items) {
+    var tbody = document.getElementById('mrs-move-request-tbody');
+    var count = document.getElementById('mrs-list-count');
+    if (!items || items.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="3" style="padding:16px;text-align:center;color:#94a3b8">No results</td></tr>';
+      if (count) count.textContent = 'No results';
+      return;
+    }
+    var rows = items.map(function(item) {
+      var col = mrsStatusColor(item.Status);
+      var badge = '<span style="background:' + col + ';color:#fff;padding:1px 6px;border-radius:8px;font-size:.68rem;white-space:nowrap">' + (item.Status || '—') + '</span>';
+      var name  = (item.DisplayName || item.Name || item.Alias || '').replace(/</g,'&lt;');
+      var batch = (item.BatchName || '').replace(/^MigrationService:/i,'').replace(/</g,'&lt;');
+      var alias = (item.Alias || '').replace(/"/g,'&quot;');
+      return '<tr style="cursor:pointer;border-bottom:1px solid #f1f5f9" onclick="mrsSelectMailbox(\'' + alias + '\')" id="mrs-row-' + alias + '">' +
+             '<td style="padding:5px 8px;font-size:.74rem;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + name + '">' + name + '</td>' +
+             '<td style="padding:5px 8px">' + badge + '</td>' +
+             '<td style="padding:5px 8px;font-size:.72rem;color:#64748b;max-width:90px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + batch + '">' + batch + '</td>' +
+             '</tr>';
+    }).join('');
+    tbody.innerHTML = rows;
+    if (count) count.textContent = 'Showing ' + items.length + ' mailbox' + (items.length !== 1 ? 'es' : '');
+    // Re-apply selected row highlight if applicable
+    if (mrsState.currentAlias) {
+      var row = document.getElementById('mrs-row-' + mrsState.currentAlias);
+      if (row) row.style.background = '#eff6ff';
+    }
+    mrsState.lastFetchTime = Date.now();
+  }
+
+  // ── Apply filter to already-cached list (no EXO re-fetch) ──────
+  function mrsApplyFilter() {
+    var search = encodeURIComponent(document.getElementById('mrs-search').value || '');
+    var status = encodeURIComponent(document.getElementById('mrs-status-filter').value || 'All');
+    apiCall('/api/mrs/move-requests?search=' + search + '&status=' + status, 'GET', null).then(function(resp) {
+      if (resp && resp.items) {
+        mrsRenderList(resp.items);
+      }
+    }).catch(function(){});
+  }
+  window.mrsApplyFilter = mrsApplyFilter;
+
+  // ── Select a mailbox and fetch statistics ───────────────────────
+  function mrsSelectMailbox(alias) {
+    console.log('[MRS] mrsSelectMailbox:', alias);
+    // Highlight selected row
+    document.querySelectorAll('#mrs-move-request-tbody tr').forEach(function(r){
+      r.style.background = '';
+    });
+    var row = document.getElementById('mrs-row-' + alias);
+    if (row) row.style.background = '#eff6ff';
+
+    mrsState.currentAlias = alias;
+    mrsSetImportLabel(alias);
+
+    // Show detail area immediately with a loading state so the breadcrumb is visible
+    mrsShowDetailArea(true);
+    document.getElementById('mrs-property-tree').innerHTML =
+      '<li style="padding:12px 10px;color:#94a3b8;font-size:.8rem">Fetching statistics…</li>';
+    mrsSetNodePath(alias + ' > contacting server…');
+
+    var pollSince = Date.now() - 2000;  // 2 s tolerance for clock skew between client and server
+    console.log('[MRS] posting fetch-statistics for', alias, 'pollSince=', pollSince);
+    apiCall('/api/mrs/fetch-statistics', 'POST', { alias: alias }).then(function(resp) {
+      console.log('[MRS] fetch-statistics response:', resp);
+      if (resp && resp.status === 'queued') {
+        mrsSetNodePath(alias + ' > queued, waiting for data…');
+        mrsPollStats(alias, Date.now(), pollSince);
+      } else {
+        var errMsg = (resp && resp.error) ? resp.error : 'unexpected server response';
+        console.warn('[MRS] fetch-statistics unexpected response:', resp);
+        mrsSetNodePath(alias + ' > Error: ' + errMsg);
+        mrsSetImportLabel('Error: ' + errMsg);
+      }
+    }).catch(function(err) {
+      console.error('[MRS] fetch-statistics network error:', err);
+      mrsSetNodePath(alias + ' > Error: could not contact server');
+      mrsSetImportLabel('Error: could not contact server');
+    });
+  }
+  window.mrsSelectMailbox = mrsSelectMailbox;
+
+  function mrsPollStats(alias, startTime, pollSince) {
+    if (Date.now() - startTime > 180000) {
+      console.warn('[MRS] mrsPollStats timed out for', alias);
+      mrsSetNodePath(alias + ' > Error: timed out waiting for statistics');
+      mrsSetImportLabel('Timed out — try clicking again');
+      return;
+    }
+    apiCall('/api/mrs/statistics?alias=' + encodeURIComponent(alias), 'GET', null).then(function(resp) {
+      var cacheMs = resp && resp.cacheTime ? new Date(resp.cacheTime).getTime() : 0;
+      console.log('[MRS] poll stats:', alias, '| ok=', resp && resp.ok, '| cacheTime=', resp && resp.cacheTime,
+        '| cacheMs=', cacheMs, '| pollSince=', pollSince, '| diff=', cacheMs - pollSince,
+        '| dataKeys=', resp && resp.data ? Object.keys(resp.data) : 'none',
+        '| error=', resp && resp.error, '| availableKeys=', resp && resp.availableKeys);
+      if (!resp || !resp.ok) {
+        mrsSetNodePath(alias + ' > waiting for server cache…');
+        setTimeout(function() { mrsPollStats(alias, startTime, pollSince); }, 1500);
+        return;
+      }
+      if (cacheMs < pollSince) {
+        mrsSetNodePath(alias + ' > waiting for fresh data… (' + Math.round((pollSince - cacheMs)/1000) + 's stale)');
+        setTimeout(function() { mrsPollStats(alias, startTime, pollSince); }, 1500);
+        return;
+      }
+      console.log('[MRS] poll stats success for', alias, '— rendering property tree');
+      mrsState.currentStats = resp.data;
+      try {
+        mrsRenderPropertyTree(resp.data);
+        mrsSetNodePath(alias);
+        console.log('[MRS] render complete for', alias);
+      } catch(e) {
+        console.error('[MRS] mrsRenderPropertyTree threw:', e);
+        mrsSetNodePath(alias + ' > Render error: ' + (e && e.message ? e.message : String(e)));
+        mrsSetImportLabel('Render error — check breadcrumb');
+      }
+    }).catch(function(err) {
+      console.error('[MRS] mrsPollStats network error:', err);
+      mrsSetNodePath(alias + ' > network error, retrying…');
+      setTimeout(function() { mrsPollStats(alias, startTime, pollSince); }, 2000);
+    });
+  }
+
+  // ── Show/hide detail area ───────────────────────────────────────
+  function mrsShowDetailArea(show) {
+    console.log('[MRS] mrsShowDetailArea:', show);
+    document.getElementById('mrs-empty-state').style.display   = show ? 'none'  : 'flex';
+    document.getElementById('mrs-detail-area').style.display   = show ? 'flex'  : 'none';
+    document.getElementById('mrs-entry-detail-panel').style.display = 'none';
+    document.getElementById('mrs-report-viewer').style.display = 'none';
+    document.getElementById('mrs-center-label').textContent   = '';
+    document.getElementById('mrs-center-content').innerHTML   = '';
+  }
+
+  // ── Breadcrumb path ─────────────────────────────────────────────
+  function mrsSetNodePath(path) {
+    document.getElementById('mrs-node-path').textContent = path || '—';
+  }
+
+  // ── Property tree ────────────────────────────────────────────────
+  var _mrsCategories = [
+    { key: 'Identity', label: 'Identity',  props: ['Identity','DisplayName','Alias','ExchangeGuid','MailboxIdentity'] },
+    { key: 'Status',   label: 'Status',    props: ['Status','StatusDetail','SyncStage','Flags','Direction'] },
+    { key: 'Progress', label: 'Progress',  props: ['PercentComplete','BytesTransferred','TotalMailboxSize','TotalMailboxItemCount','ItemsTransferred'] },
+    { key: 'Quality',  label: 'Quality',   props: ['BadItemCount','LargeItemCount','BadItemLimit','LargeItemLimit','DataConsistencyScore'] },
+    { key: 'Timing',   label: 'Timing',    props: ['QueuedTimestamp','StartTimestamp','InitialSeedingCompletedTimestamp','FinalSyncTimestamp','CompletionTimestamp','TotalInProgressDuration'] },
+    { key: 'Target',   label: 'Target',    props: ['TargetServer','TargetDatabase','TargetArchiveDatabase','RemoteHostName','TargetDeliveryDomain'] },
+    { key: 'Failures', label: 'Failures',  props: ['FailureSide','FailureType','FailureCode','Message','LastFailure'] }
+  ];
+
+  function mrsRenderPropertyTree(stats) {
+    console.log('[MRS] mrsRenderPropertyTree called. stats type=', typeof stats,
+      'keys=', stats ? Object.keys(stats) : 'null/undefined');
+    var ul = document.getElementById('mrs-property-tree');
+    if (!ul) { console.error('[MRS] mrs-property-tree element not found!'); return; }
+    var html = '';
+    _mrsCategories.forEach(function(cat) {
+      var group = stats[cat.key] || {};
+      html += '<li style="padding:4px 10px 2px;font-size:.7rem;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;user-select:none">— ' + cat.label + ' —</li>';
+      cat.props.forEach(function(prop) {
+        var val = group[prop];
+        var display = (val === null || val === undefined || val === '') ? '—' : String(val);
+        if (display.length > 30) display = display.substring(0,30) + '…';
+        html += '<li class="mrs-tree-item" data-cat="' + cat.key + '" data-prop="' + prop + '"' +
+                ' onclick="mrsSelectProperty(\'' + cat.key + '\',\'' + prop + '\')"' +
+                ' style="padding:4px 10px 4px 16px;cursor:pointer;border-bottom:1px solid #f1f5f9;font-size:.76rem;display:flex;justify-content:space-between;gap:4px">' +
+                '<span style="color:#334155;font-weight:500">' + prop + '</span>' +
+                '<span style="color:#64748b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:110px" title="' + (val || '') + '">' + display + '</span>' +
+                '</li>';
+      });
+    });
+    // Report Entries special item
+    var rpt = stats.Report || {};
+    var rptLabel = 'Report Entries (' + (rpt.TotalEntries || 0) + ' total, ' + (rpt.WarningCount || 0) + ' warnings, ' + (rpt.FailureCount || 0) + ' errors)';
+    html += '<li style="padding:4px 10px 2px;font-size:.7rem;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;user-select:none">— Report —</li>';
+    html += '<li onclick="mrsOpenReportEntries()" style="padding:6px 10px 6px 16px;cursor:pointer;font-size:.76rem;color:#3b82f6;font-weight:600">' + rptLabel + '</li>';
+    ul.innerHTML = html;
+  }
+
+  // ── Import label (current data source display) ───────────────────
+  function mrsSetImportLabel(text) {
+    var el = document.getElementById('mrs-import-label');
+    if (!el) return;
+    el.textContent = text || '';
+    el.title = text || '';
+  }
+
+  // ── Select a property and show its value ─────────────────────────
+  function renderMRSScalar(propName, val) {
+    var content = document.getElementById('mrs-center-content');
+    document.getElementById('mrs-report-viewer').style.display = 'none';
+    if (val === null || val === undefined || val === '') {
+      content.innerHTML = '<span style="color:#94a3b8;font-style:italic">— not set —</span>';
+    } else if (typeof val === 'number') {
+      content.innerHTML = '<div style="font-size:1.4rem;font-weight:600;color:#1e293b">' + val + '</div>';
+    } else {
+      content.innerHTML = '<div style="font-size:1rem;color:#1e293b;word-break:break-word">' + String(val).replace(/</g,'&lt;') + '</div>';
+    }
+    mrsShowEntryDetail(String(val !== null && val !== undefined ? val : ''));
+  }
+  window.renderMRSScalar = renderMRSScalar;
+
+  function renderMRSCollection(propName, items) {
+    var content = document.getElementById('mrs-center-content');
+    document.getElementById('mrs-report-viewer').style.display = 'none';
+    if (!items || items.length === 0) {
+      content.innerHTML = '<span style="color:#94a3b8;font-style:italic">(empty collection)</span>';
+      mrsShowEntryDetail('');
+      return;
+    }
+    var html = '<div style="font-size:.78rem;color:#475569;margin-bottom:6px">' + propName + ' (' + items.length + ' items)</div>';
+    html += items.map(function(v, i) {
+      var display = String(v).replace(/</g,'&lt;');
+      return '<div class="mrs-collection-item" data-index="' + i + '" ' +
+             'onclick="mrsShowEntryDetail(' + JSON.stringify(String(v)) + ')" ' +
+             'style="padding:4px 8px;cursor:pointer;border-bottom:1px solid #f1f5f9;font-size:.76rem;font-family:monospace">' +
+             '<span style="color:#94a3b8;margin-right:8px">[' + i + ']</span>' + display + '</div>';
+    }).join('');
+    content.innerHTML = html;
+    mrsShowEntryDetail(String(items[0]));
+  }
+  window.renderMRSCollection = renderMRSCollection;
+
+  function mrsSelectProperty(cat, prop) {
+    if (!mrsState.currentStats) return;
+    document.querySelectorAll('.mrs-tree-item').forEach(function(li){ li.style.background = ''; });
+    var item = document.querySelector('.mrs-tree-item[data-cat="' + cat + '"][data-prop="' + prop + '"]');
+    if (item) item.style.background = '#eff6ff';
+
+    var group = mrsState.currentStats[cat] || {};
+    var val   = group[prop];
+    document.getElementById('mrs-center-label').textContent = prop;
+    mrsSetNodePath(mrsState.currentAlias + ' > ' + cat + ' > ' + prop);
+
+    if (Array.isArray(val)) {
+      renderMRSCollection(prop, val);
+    } else if (val !== null && val !== undefined && typeof val === 'object') {
+      renderMRSCollection(prop, Object.entries(val).map(function(e){ return e[0] + ': ' + e[1]; }));
+    } else {
+      renderMRSScalar(prop, val);
+    }
+  }
+  window.mrsSelectProperty = mrsSelectProperty;
+
+  // ── Entry detail panel ───────────────────────────────────────────
+  function mrsShowEntryDetail(text) {
+    var panel = document.getElementById('mrs-entry-detail-panel');
+    var pre   = document.getElementById('mrs-entry-detail');
+    pre.textContent = text;
+    panel.style.display = text ? '' : 'none';
+  }
+
+  function mrsCopyDetail() {
+    var text = document.getElementById('mrs-entry-detail').textContent;
+    if (navigator.clipboard) { navigator.clipboard.writeText(text); }
+  }
+  window.mrsCopyDetail = mrsCopyDetail;
+
+  // ── Report Entries log viewer ────────────────────────────────────
+  function mrsOpenReportEntries() {
+    if (!mrsState.currentStats || !mrsState.currentStats.Report) return;
+    mrsState.allEntries = mrsState.currentStats.Report.Entries || [];
+
+    // Populate type filter with unique values
+    var typeFilter = document.getElementById('mrs-entries-type-filter');
+    var types = ['All'];
+    mrsState.allEntries.forEach(function(e) {
+      if (e.Type && types.indexOf(e.Type) === -1) types.push(e.Type);
+    });
+    typeFilter.innerHTML = types.map(function(t) {
+      return '<option value="' + t + '">' + t + '</option>';
+    }).join('');
+
+    document.getElementById('mrs-entries-level-filter').value = 'All';
+    document.getElementById('mrs-entries-search').value = '';
+    document.getElementById('mrs-center-label').textContent = 'Report Entries';
+    document.getElementById('mrs-center-content').innerHTML = '';
+    document.getElementById('mrs-report-viewer').style.display = '';
+    document.getElementById('mrs-entry-detail-panel').style.display = 'none';
+    mrsSetNodePath(mrsState.currentAlias + ' > Report > Entries');
+    mrsFilterEntries();
+  }
+  window.mrsOpenReportEntries = mrsOpenReportEntries;
+
+  function mrsFilterEntries() {
+    var lvlF  = document.getElementById('mrs-entries-level-filter').value;
+    var typF  = document.getElementById('mrs-entries-type-filter').value;
+    var srch  = (document.getElementById('mrs-entries-search').value || '').toLowerCase();
+    var filtered = mrsState.allEntries.filter(function(e) {
+      if (lvlF !== 'All' && e.Level !== lvlF) return false;
+      if (typF !== 'All' && e.Type  !== typF) return false;
+      if (srch && (e.Message || '').toLowerCase().indexOf(srch) === -1) return false;
+      return true;
+    });
+    mrsState.filteredEntries = filtered;
+    var tbody = document.getElementById('mrs-entries-tbody');
+    var html = filtered.map(function(e, idx) {
+      var col = mrsLevelColor(e.Level);
+      var badge = '<span style="background:' + col + ';color:#fff;padding:1px 6px;border-radius:8px;font-size:.68rem">' + (e.Level || '') + '</span>';
+      var ts  = e.CreationTime ? new Date(e.CreationTime).toLocaleString() : '';
+      var typ = ((e.Type || '').length > 22 ? (e.Type).substring(0,22) + '…' : (e.Type || ''));
+      var msg = ((e.Message || '').length > 80 ? (e.Message).substring(0,80) + '…' : (e.Message || '')).replace(/</g,'&lt;');
+      var dur = e.Duration || '';
+      return '<tr style="cursor:pointer;border-bottom:1px solid #f1f5f9" onclick="mrsSelectEntry(' + idx + ')">' +
+             '<td style="padding:4px 8px;font-size:.72rem;white-space:nowrap">' + ts + '</td>' +
+             '<td style="padding:4px 8px">' + badge + '</td>' +
+             '<td style="padding:4px 8px;font-size:.72rem" title="' + (e.Type||'').replace(/"/g,'') + '">' + typ + '</td>' +
+             '<td style="padding:4px 8px;font-size:.72rem">' + msg + '</td>' +
+             '<td style="padding:4px 8px;font-size:.72rem;white-space:nowrap">' + dur + '</td>' +
+             '</tr>';
+    }).join('');
+    tbody.innerHTML = html || '<tr><td colspan="5" style="padding:16px;text-align:center;color:#94a3b8">No entries match filters</td></tr>';
+    document.getElementById('mrs-entries-count').textContent = 'Showing ' + filtered.length + ' of ' + mrsState.allEntries.length + ' entries';
+  }
+  window.mrsFilterEntries = mrsFilterEntries;
+
+  function mrsSelectEntry(idx) {
+    var entry = mrsState.filteredEntries[idx];
+    if (!entry) return;
+    var detail = 'Timestamp: ' + (entry.CreationTime || '') + '\n' +
+                 'Level:     ' + (entry.Level || '') + '\n' +
+                 'Type:      ' + (entry.Type  || '') + '\n' +
+                 'Duration:  ' + (entry.Duration || '') + '\n' +
+                 '\n' + (entry.Message || '');
+    mrsShowEntryDetail(detail);
+    mrsSetNodePath(mrsState.currentAlias + ' > Report > Entries[' + idx + ']');
+  }
+  window.mrsSelectEntry = mrsSelectEntry;
+
+  // ── Export entries as CSV ────────────────────────────────────────
+  function mrsExportEntriesCsv() {
+    var rows = [['Timestamp','Level','Type','Message','Duration']];
+    mrsState.filteredEntries.forEach(function(e) {
+      function q(v) { v = String(v || ''); return v.indexOf(',') !== -1 || v.indexOf('"') !== -1 ? '"' + v.replace(/"/g,'""') + '"' : v; }
+      rows.push([q(e.CreationTime), q(e.Level), q(e.Type), q(e.Message), q(e.Duration)]);
+    });
+    var csv = rows.map(function(r){ return r.join(','); }).join('\r\n');
+    var blob = new Blob([csv], { type: 'text/csv' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = (mrsState.currentAlias || 'entries').replace(/[^A-Za-z0-9._-]/g,'_') + '_entries.csv';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+  window.mrsExportEntriesCsv = mrsExportEntriesCsv;
+
+  // ── Export XML ───────────────────────────────────────────────────
+  function mrsExportXml() {
+    if (!mrsState.currentAlias) return;
+    var alias = mrsState.currentAlias;
+    if (alias.indexOf('imported:') === 0) { alert('Cannot re-export imported XML. Use the original file.'); return; }
+    var btn = document.getElementById('mrs-btn-export-xml');
+    btn.textContent = '⏳ Exporting…';
+    btn.disabled = true;
+    var a = document.createElement('a');
+    a.href = '/api/mrs/export-xml?alias=' + encodeURIComponent(alias);
+    a.download = '';
+    a.click();
+    setTimeout(function() {
+      btn.textContent = '⬇ Export XML';
+      btn.disabled = false;
+    }, 5000);
+  }
+  window.mrsExportXml = mrsExportXml;
+
+  // ── Import XML ───────────────────────────────────────────────────
+  function mrsImportXml(input) {
+    if (!input.files || !input.files[0]) return;
+    var file = input.files[0];
+    console.log('[MRS] mrsImportXml: file=', file.name, 'size=', file.size);
+    var badge = document.getElementById('mrs-session-status');
+    badge.style.background = '#fef9c3';
+    badge.style.color = '#854d0e';
+    badge.textContent = 'Importing…';
+    var fd = new FormData();
+    fd.append('file', file, file.name);
+    fetch('/api/mrs/import-xml', { method: 'POST', body: fd })
+      .then(function(r) { return r.json(); })
+      .then(function(resp) {
+        console.log('[MRS] import-xml response:', resp);
+        if (resp.error) {
+          console.error('[MRS] import-xml server error:', resp.error);
+          badge.style.background = '#fee2e2';
+          badge.style.color = '#991b1b';
+          badge.textContent = 'Import failed';
+          return;
+        }
+        badge.textContent = 'Import queued…';
+        var key = resp.key;
+        console.log('[MRS] import queued with key:', key);
+        mrsPollImport(key, Date.now(), file.name);
+        // Add a virtual row in the list
+        mrsState.listItems.unshift({ Name: file.name, Alias: key, BatchName: 'Imported', Status: 'Imported' });
+        mrsRenderList(mrsState.listItems);
+      })
+      .catch(function(err) {
+        console.error('[MRS] import-xml network error:', err);
+        badge.style.background = '#fee2e2';
+        badge.style.color = '#991b1b';
+        badge.textContent = 'Import error';
+      });
+    input.value = '';
+  }
+  window.mrsImportXml = mrsImportXml;
+
+  function mrsPollImport(key, startTime, filename) {
+    if (Date.now() - startTime > 60000) {
+      console.warn('[MRS] mrsPollImport timed out for key:', key);
+      var badge = document.getElementById('mrs-session-status');
+      badge.style.background = '#fee2e2'; badge.style.color = '#991b1b';
+      badge.textContent = 'Import timed out';
+      return;
+    }
+    apiCall('/api/mrs/statistics?alias=' + encodeURIComponent(key), 'GET', null).then(function(resp) {
+      console.log('[MRS] mrsPollImport:', key, 'ok=', resp && resp.ok);
+      if (!resp || !resp.ok) {
+        setTimeout(function() { mrsPollImport(key, startTime, filename); }, 1500);
+        return;
+      }
+      console.log('[MRS] mrsPollImport: import ready for', key, '— auto-selecting');
+      var badge = document.getElementById('mrs-session-status');
+      badge.style.background = '#dcfce7'; badge.style.color = '#166534';
+      badge.textContent = 'Session Active';
+      // Auto-select the imported entry
+      mrsState.currentAlias = key;
+      mrsState.currentStats = resp.data;
+      mrsSetImportLabel(filename);
+      mrsShowDetailArea(true);
+      mrsRenderPropertyTree(resp.data);
+      mrsSetNodePath(key);
+    }).catch(function(err) {
+      console.error('[MRS] mrsPollImport network error:', err);
+      setTimeout(function() { mrsPollImport(key, startTime, filename); }, 2000);
+    });
+  }
+
+})();
+</script>
+
 </body>
 </html>
 "@
@@ -8284,6 +9214,151 @@ function Start-WatchListener {
                             $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"ok`":false,`"error`":`"Failed to get failure history: $errMsg`"}")
                         }
                     }
+                    # ── MRS Explorer API routes ──────────────────────────────────────────
+                    elseif ($path -eq '/api/mrs/fetch-move-requests' -and $req.HttpMethod -eq 'POST') {
+                        $contentType = 'application/json; charset=utf-8'
+                        [void]$State.PendingCommands.Add([hashtable]@{ Action = 'fetchMRSMoveRequests' })
+                        $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"status":"queued"}')
+                    }
+                    elseif ($path -eq '/api/mrs/move-requests') {
+                        $contentType = 'application/json; charset=utf-8'
+                        try {
+                            $cache     = $State['MRSMoveRequestCache']
+                            $cacheTime = $State['MRSMoveRequestCacheTime']
+                            $items     = @(if ($cache) { $cache } else { @() })
+                            $qs        = if ($req.Url.Query) { [System.Web.HttpUtility]::ParseQueryString($req.Url.Query) } else { $null }
+                            $searchVal = if ($qs) { $qs['search'] } else { $null }
+                            $statusVal = if ($qs) { $qs['status'] } else { $null }
+                            if ($searchVal) {
+                                $sv = $searchVal.ToLower()
+                                $items = @($items | Where-Object {
+                                    ("$($_.Name)".ToLower()      -like "*$sv*") -or
+                                    ("$($_.Alias)".ToLower()     -like "*$sv*") -or
+                                    ("$($_.BatchName)".ToLower() -like "*$sv*")
+                                })
+                            }
+                            if ($statusVal -and $statusVal -ne 'All') {
+                                $items = @($items | Where-Object { "$($_.Status)" -eq $statusVal })
+                            }
+                            $payload = @{ cacheTime = $cacheTime; items = $items } | ConvertTo-Json -Depth 3 -Compress
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+                        } catch {
+                            $errMsg = $_.Exception.Message -replace '"', "'"
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"error`":`"$errMsg`",`"cacheTime`":null,`"items`":[]}")
+                        }
+                    }
+                    elseif ($path -eq '/api/mrs/fetch-statistics' -and $req.HttpMethod -eq 'POST') {
+                        $contentType = 'application/json; charset=utf-8'
+                        try {
+                            $bodyBytes2 = [System.Byte[]]::new($req.ContentLength64)
+                            [void]$req.InputStream.Read($bodyBytes2, 0, $bodyBytes2.Length)
+                            $bodyObj = [System.Text.Encoding]::UTF8.GetString($bodyBytes2) | ConvertFrom-Json
+                            $alias   = "$($bodyObj.alias)"
+                            if ($alias) {
+                                [void]$State.PendingCommands.Add([hashtable]@{ Action = 'fetchMRSStatistics'; Alias = $alias })
+                                $safeAlias = $alias -replace '"','\"'
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"status`":`"queued`",`"alias`":`"$safeAlias`"}")
+                            } else {
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"error":"Missing alias"}')
+                            }
+                        } catch {
+                            $errMsg = $_.Exception.Message -replace '"', "'"
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"error`":`"$errMsg`"}")
+                        }
+                    }
+                    elseif ($path -eq '/api/mrs/statistics') {
+                        $contentType = 'application/json; charset=utf-8'
+                        try {
+                            # Use RawUrl (e.g. /api/mrs/statistics?alias=foo) to avoid Url.Query being empty on some hosts
+                            $alias = if ($req.RawUrl -match '[?&]alias=([^&]+)') { [System.Uri]::UnescapeDataString($Matches[1]) } else { $null }
+                            $innerJson    = if ($alias) { $State["MRSStatsJson_$alias"] } else { $null }
+                            $cacheTimeVal = if ($alias) { $State["MRSStatsTime_$alias"] } else { $null }
+                            if ($alias -and $innerJson) {
+                                $timeStr = if ($cacheTimeVal) { "`"$cacheTimeVal`"" } else { 'null' }
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"ok`":true,`"cacheTime`":$timeStr,`"data`":$innerJson}")
+                            } elseif ($alias) {
+                                $ctx.Response.StatusCode = 404
+                                $mrsKeys = ($State.Keys | Where-Object { $_ -like 'MRSStatsJson_*' }) -join ','
+                                $safeAlias = $alias -replace '"',"'"
+                                $safeKeys  = $mrsKeys -replace '"',"'"
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"ok`":false,`"error`":`"not found`",`"alias`":`"$safeAlias`",`"availableKeys`":`"$safeKeys`"}")
+                            } else {
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"Missing alias parameter"}')
+                            }
+                        } catch {
+                            $errMsg = $_.Exception.Message -replace '"', "'"
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"ok`":false,`"error`":`"$errMsg`"}")
+                        }
+                    }
+                    elseif ($path -eq '/api/mrs/export-xml') {
+                        try {
+                            $alias = if ($req.RawUrl -match '[?&]alias=([^&]+)') { [System.Uri]::UnescapeDataString($Matches[1]) } else { $null }
+                            if (-not $alias) {
+                                $contentType = 'application/json; charset=utf-8'
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"error":"Missing alias"}')
+                            } else {
+                                if ($null -eq $State['MRSExportReady']) { $State['MRSExportReady'] = @{} }
+                                $State['MRSExportReady'].Remove($alias)
+                                [void]$State.PendingCommands.Add([hashtable]@{ Action = 'exportMRSXml'; Alias = $alias })
+                                $deadline = [datetime]::UtcNow.AddSeconds(30)
+                                while ([datetime]::UtcNow -lt $deadline) {
+                                    $expPath = $State['MRSExportReady'][$alias]
+                                    if ($expPath) { break }
+                                    Start-Sleep -Milliseconds 500
+                                }
+                                $expPath = $State['MRSExportReady'][$alias]
+                                if (-not $expPath -or $expPath -eq 'ERROR') {
+                                    $contentType = 'application/json; charset=utf-8'
+                                    $ctx.Response.StatusCode = if ($expPath -eq 'ERROR') { 500 } else { 504 }
+                                    $msg = if ($expPath -eq 'ERROR') { 'Export failed on server' } else { 'Export timed out' }
+                                    $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"error`":`"$msg`"}")
+                                } else {
+                                    $fileBytes = [System.IO.File]::ReadAllBytes($expPath)
+                                    Remove-Item $expPath -Force -ErrorAction SilentlyContinue
+                                    $State['MRSExportReady'].Remove($alias)
+                                    $safeAlias = $alias -replace '[^A-Za-z0-9._-]','_'
+                                    $fname = "${safeAlias}_$([datetime]::Now.ToString('yyyyMMddHHmmss')).xml"
+                                    $contentType = 'application/octet-stream'
+                                    $ctx.Response.Headers.Set('Content-Disposition', "attachment; filename=`"$fname`"")
+                                    $responseBytes = $fileBytes
+                                }
+                            }
+                        } catch {
+                            $contentType = 'application/json; charset=utf-8'
+                            $errMsg = $_.Exception.Message -replace '"', "'"
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"error`":`"$errMsg`"}")
+                        }
+                    }
+                    elseif ($path -eq '/api/mrs/import-xml' -and $req.HttpMethod -eq 'POST') {
+                        $contentType = 'application/json; charset=utf-8'
+                        try {
+                            $bodyBytes3 = [System.Byte[]]::new($req.ContentLength64)
+                            [void]$req.InputStream.Read($bodyBytes3, 0, $bodyBytes3.Length)
+                            $bodyStr3 = [System.Text.Encoding]::UTF8.GetString($bodyBytes3)
+                            $origName = 'import.xml'
+                            if ($bodyStr3 -match 'filename="([^"]+)"') { $origName = $Matches[1] }
+                            $tempPath3  = Join-Path $env:TEMP "MRS_Import_$([guid]::NewGuid().ToString('N')).xml"
+                            $boundary3  = ''
+                            if ($req.ContentType -match 'boundary=(.+)') { $boundary3 = $Matches[1].Trim() }
+                            $headerEnd3 = $bodyStr3.IndexOf("`r`n`r`n")
+                            if ($headerEnd3 -lt 0) { $headerEnd3 = $bodyStr3.IndexOf("`n`n") + 1 }
+                            $dataStart3  = $headerEnd3 + 4
+                            $closeBound3 = "--$boundary3--"
+                            $dataEnd3    = $bodyStr3.LastIndexOf($closeBound3)
+                            if ($dataEnd3 -gt $dataStart3) {
+                                $xmlStr3 = $bodyStr3.Substring($dataStart3, $dataEnd3 - $dataStart3).TrimEnd("`r","`n")
+                                [System.IO.File]::WriteAllText($tempPath3, $xmlStr3, [System.Text.Encoding]::UTF8)
+                            } else {
+                                [System.IO.File]::WriteAllBytes($tempPath3, $bodyBytes3)
+                            }
+                            [void]$State.PendingCommands.Add([hashtable]@{ Action = 'importMRSXml'; TempPath = $tempPath3; OriginalName = $origName })
+                            $safeKey3 = "imported:$origName" -replace '"','\"'
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"status`":`"queued`",`"key`":`"$safeKey3`"}")
+                        } catch {
+                            $errMsg = $_.Exception.Message -replace '"', "'"
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"error`":`"$errMsg`"}")
+                        }
+                    }
                     elseif ($path -eq '/api/retry-status') {
                         # Return auto-retry status and log
                         $contentType = 'application/json; charset=utf-8'
@@ -8792,6 +9867,10 @@ if ($MyInvocation.InvocationName -ne '.') {
                 alertOnStall = $AlertOnStall.IsPresent
                 stallThreshold = $StallThresholdMinutes
             }
+            # MRS Explorer cache
+            MRSMoveRequestCache     = $null
+            MRSMoveRequestCacheTime = $null
+            MRSExportReady          = [System.Collections.Hashtable]::Synchronized(@{})
         })
 
         # ── Start HTTP listener in background runspace ────────────────────────
@@ -9265,6 +10344,24 @@ if ($MyInvocation.InvocationName -ne '.') {
                                 Invoke-BatchStatsRefresh -WatchState $watchState -BatchNames @($cmd.Batches) -CachedMailboxes $watchState['CachedMailboxes']
                             }
                         }
+                        elseif ($cmd.Action -eq 'fetchMRSMoveRequests') {
+                            Invoke-MRSMoveRequestRefresh -WatchState $watchState
+                        }
+                        elseif ($cmd.Action -eq 'fetchMRSStatistics') {
+                            if ($cmd.Alias) {
+                                Invoke-MRSStatisticsRefresh -WatchState $watchState -Alias $cmd.Alias
+                            }
+                        }
+                        elseif ($cmd.Action -eq 'exportMRSXml') {
+                            if ($cmd.Alias) {
+                                Invoke-MRSXmlExport -WatchState $watchState -Alias $cmd.Alias
+                            }
+                        }
+                        elseif ($cmd.Action -eq 'importMRSXml') {
+                            if ($cmd.TempPath -and $cmd.OriginalName) {
+                                Invoke-MRSXmlImport -WatchState $watchState -TempPath $cmd.TempPath -OriginalName $cmd.OriginalName
+                            }
+                        }
                         elseif ($cmd.Action -eq 'UpdateInterval') {
                             $RefreshIntervalSeconds = $cmd.Interval
                             $watchState['Interval'] = $cmd.Interval
@@ -9405,3 +10502,4 @@ if ($MyInvocation.InvocationName -ne '.') {
         Invoke-MigrationReport @invokeParams
     }
 }
+
