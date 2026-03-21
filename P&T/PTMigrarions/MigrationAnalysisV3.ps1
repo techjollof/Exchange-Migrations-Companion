@@ -8521,6 +8521,10 @@ function apiCall(endpoint, method, body) {
 
     // Show detail area immediately with a loading state so the breadcrumb is visible
     mrsShowDetailArea(true);
+    var detailTextLoading = document.getElementById('mrs-entry-detail');
+    if (detailTextLoading) {
+      detailTextLoading.textContent = 'Panel D - Entry Detail\nLoading mailbox statistics...';
+    }
     document.getElementById('mrs-property-tree').innerHTML =
       '<li style="padding:12px 10px;color:#94a3b8;font-size:.8rem">Fetching statistics…</li>';
     mrsSetNodePath(alias + ' > contacting server…');
@@ -8606,7 +8610,7 @@ function apiCall(endpoint, method, body) {
       if (!detailPanel.style.height || detailPanel.style.height === 'auto') {
         detailPanel.style.height = (mrsClamp(mrsLoadLayout().detailHeight, 120, 360)) + 'px';
       }
-      detailPanel.style.display = 'none';
+      detailPanel.style.display = '';
       center.innerHTML = '';
     } else {
       if (tree) {
