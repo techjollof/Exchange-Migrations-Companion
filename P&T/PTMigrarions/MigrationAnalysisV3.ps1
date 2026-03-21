@@ -8467,6 +8467,9 @@ function apiCall(endpoint, method, body) {
   function mrsRenderList(items) {
     var tbody = document.getElementById('mrs-move-request-tbody');
     var count = document.getElementById('mrs-list-count');
+    function mrsAliasRowId(alias) {
+      return 'mrs-row-' + String(alias || '').replace(/[^A-Za-z0-9_.-]/g, '_');
+    }
     if (!items || items.length === 0) {
       tbody.innerHTML = '<tr><td colspan="3" style="padding:16px;text-align:center;color:#94a3b8">No results</td></tr>';
       if (count) count.textContent = 'No results';
@@ -8477,8 +8480,10 @@ function apiCall(endpoint, method, body) {
       var badge = '<span style="background:' + col + ';color:#fff;padding:1px 6px;border-radius:8px;font-size:.68rem;white-space:nowrap">' + (item.Status || '—') + '</span>';
       var name  = (item.DisplayName || item.Name || item.Alias || '').replace(/</g,'&lt;');
       var batch = (item.BatchName || '').replace(/^MigrationService:/i,'').replace(/</g,'&lt;');
-      var alias = (item.Alias || '').replace(/"/g,'&quot;');
-      return '<tr style="cursor:pointer;border-bottom:1px solid #f1f5f9" onclick="mrsSelectMailbox(\'' + alias + '\')" id="mrs-row-' + alias + '">' +
+      var aliasRaw = String(item.Alias || '');
+      var aliasEnc = encodeURIComponent(aliasRaw);
+      var rowId    = mrsAliasRowId(aliasRaw);
+      return '<tr style="cursor:pointer;border-bottom:1px solid #f1f5f9" onclick="mrsSelectMailbox(decodeURIComponent(\'' + aliasEnc + '\'))" id="' + rowId + '">' +
              '<td style="padding:5px 8px;font-size:.74rem;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + name + '">' + name + '</td>' +
              '<td style="padding:5px 8px">' + badge + '</td>' +
              '<td style="padding:5px 8px;font-size:.72rem;color:#64748b;max-width:90px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + batch + '">' + batch + '</td>' +
@@ -8488,7 +8493,7 @@ function apiCall(endpoint, method, body) {
     if (count) count.textContent = 'Showing ' + items.length + ' mailbox' + (items.length !== 1 ? 'es' : '');
     // Re-apply selected row highlight if applicable
     if (mrsState.currentAlias) {
-      var row = document.getElementById('mrs-row-' + mrsState.currentAlias);
+      var row = document.getElementById(mrsAliasRowId(mrsState.currentAlias));
       if (row) row.style.background = '#eff6ff';
     }
     mrsState.lastFetchTime = Date.now();
@@ -8513,7 +8518,7 @@ function apiCall(endpoint, method, body) {
     document.querySelectorAll('#mrs-move-request-tbody tr').forEach(function(r){
       r.style.background = '';
     });
-    var row = document.getElementById('mrs-row-' + alias);
+    var row = document.getElementById('mrs-row-' + String(alias || '').replace(/[^A-Za-z0-9_.-]/g, '_'));
     if (row) row.style.background = '#eff6ff';
 
     mrsState.currentAlias = alias;
@@ -8659,8 +8664,9 @@ function apiCall(endpoint, method, body) {
       }
       var safeDisplay = display.replace(/</g,'&lt;');
       var safeTitle   = String(val !== null && val !== undefined ? val : '').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+      var propEnc     = encodeURIComponent(prop);
       html += '<li class="mrs-tree-item" data-prop="' + prop + '"' +
-              ' onclick="mrsSelectProperty(' + JSON.stringify(prop) + ')"' +
+              ' onclick="mrsSelectProperty(decodeURIComponent(\'' + propEnc + '\'))"' +
               ' style="padding:4px 10px 4px 16px;cursor:pointer;border-bottom:1px solid #f1f5f9;font-size:.76rem;display:flex;justify-content:space-between;gap:4px">' +
               '<span style="color:#334155;font-weight:500">' + prop + '</span>' +
               '<span style="color:#64748b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:110px" title="' + safeTitle + '">' + safeDisplay + '</span>' +
@@ -8689,8 +8695,10 @@ function apiCall(endpoint, method, body) {
           display = s.length > 30 ? s.substring(0,30) + '…' : s;
         }
         var safeDisplay = display.replace(/</g,'&lt;');
+        var reportPath  = 'Report.' + rk;
+        var reportEnc   = encodeURIComponent(reportPath);
         html += '<li class="mrs-tree-item" data-prop="Report.' + rk + '"' +
-                ' onclick="mrsSelectProperty(' + JSON.stringify('Report.' + rk) + ')"' +
+                ' onclick="mrsSelectProperty(decodeURIComponent(\'' + reportEnc + '\'))"' +
                 ' style="padding:4px 10px 4px 22px;cursor:pointer;border-bottom:1px solid #f1f5f9;font-size:.76rem;display:flex;justify-content:space-between;gap:4px">' +
                 '<span style="color:#475569">' + rk + '</span>' +
                 '<span style="color:#64748b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:110px">' + safeDisplay + '</span>' +
