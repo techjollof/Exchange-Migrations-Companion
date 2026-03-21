@@ -1094,102 +1094,114 @@ function Invoke-BatchStatsRefresh {
 function ConvertTo-MRSStatisticsJson {
     param([Parameter(Mandatory)] $Stats)
 
-    function SafeStr { param($v) if ($null -eq $v) { $null } else { "$v" } }
-    function SafeDate {
-        param($v)
-        if ($null -eq $v) { return $null }
-        try { return $v.ToUniversalTime().ToString('o') } catch { return "$v" }
+    # Serialize any value to a JSON-safe type. Max recursion depth = 3.
+    function SafeVal {
+        param($v, [int]$D)
+        if ($null -eq $v)    { return $null }
+        if ($D -gt 3)        { return "$v" }
+        if ($v -is [bool])   { return $v }
+        if ($v -is [byte[]]) { return "<binary: $($v.Length) bytes>" }
+        if ($v -is [int32] -or $v -is [int64] -or $v -is [double] -or $v -is [single]) { return $v }
+        if ($v -is [string]) { return $v }
+        $tn = $v.GetType().FullName
+        if ($tn -match 'DateTime|ExDateTime') {
+            try { return $v.ToUniversalTime().ToString('o') } catch { return "$v" }
+        }
+        if ($v -is [System.TimeSpan]) { return $v.ToString() }
+        if ($v -is [System.Guid])     { return $v.ToString() }
+        if ($v -is [System.Enum])     { return $v.ToString() }
+        if ($tn -match 'ByteQuantifiedSize|Unlimited|SmtpAddress|ProxyAddress') { return "$v" }
+        # Collections (not strings or byte arrays)
+        if (-not ($v -is [string]) -and -not ($v -is [byte[]]) -and
+            ($v -is [System.Collections.IList] -or ($v -is [System.Array]))) {
+            $cap = if ($v.Count -gt 5000) { 5000 } else { $v.Count }
+            $arr = [System.Collections.ArrayList]@()
+            for ($i = 0; $i -lt $cap; $i++) {
+                try   { [void]$arr.Add((SafeVal $v[$i] ($D + 1))) }
+                catch { [void]$arr.Add("$($v[$i])") }
+            }
+            if ($v.Count -gt 5000) { [void]$arr.Insert(0, "<truncated: first 5000 of $($v.Count) items>") }
+            return @($arr)
+        }
+        # Object — expand via Get-Member
+        try {
+            $members = @($v | Get-Member -MemberType Properties -ErrorAction SilentlyContinue |
+                         Where-Object { $_.Name -ne 'Length' })
+            if ($members.Count -gt 0 -and $members.Count -le 200) {
+                $nested = [ordered]@{}
+                foreach ($m in $members) {
+                    try   { $nested[$m.Name] = SafeVal $v.$($m.Name) ($D + 1) }
+                    catch { $nested[$m.Name] = $null }
+                }
+                return $nested
+            }
+        } catch {}
+        return "$v"
     }
-    function SafeInt   { param($v) $n = 0;   if ([int]::TryParse("$v", [ref]$n))   { $n } else { 0 } }
-    function SafeInt64 { param($v) $n = 0L;  if ([int64]::TryParse("$v", [ref]$n)) { $n } else { 0 } }
 
-    # Build Report section
-    $reportObj = [ordered]@{ TotalEntries = 0; FailureCount = 0; WarningCount = 0; Entries = @() }
-    try {
-        if ($Stats.Report -and $Stats.Report.Entries) {
-            $entries = @($Stats.Report.Entries)
-            $reportEntries = [System.Collections.ArrayList]@()
-            $failCount = 0
-            $warnCount = 0
-            foreach ($e in $entries) {
+    # Report.Entries — structured rows with clean schema + summary counts
+    function SafeEntries {
+        param($col)
+        $result = [System.Collections.ArrayList]@()
+        $failC = 0; $warnC = 0
+        if ($col) {
+            foreach ($e in $col) {
                 try {
-                    $lvl = SafeStr $e.Level
+                    $lvl    = "$($e.Level)"
                     $msgRaw = "$($e.Message)"
-                    $msg = if ($msgRaw.Length -gt 2000) { $msgRaw.Substring(0,2000) + '...' } else { $msgRaw }
-                    [void]$reportEntries.Add([ordered]@{
-                        CreationTime = SafeDate $e.CreationTime
+                    $msg    = if ($msgRaw.Length -gt 2000) { $msgRaw.Substring(0,2000) + '...' } else { $msgRaw }
+                    $ct     = if ($e.CreationTime) { try { $e.CreationTime.ToUniversalTime().ToString('o') } catch { "$($e.CreationTime)" } } else { $null }
+                    [void]$result.Add([ordered]@{
+                        CreationTime = $ct
                         Level        = $lvl
-                        Type         = SafeStr $e.Type
+                        Type         = "$($e.Type)"
                         Message      = $msg
-                        Duration     = SafeStr $e.Duration
+                        Duration     = "$($e.Duration)"
                     })
-                    if ($lvl -eq 'Error' -or $lvl -eq 'Failure') { $failCount++ }
-                    elseif ($lvl -eq 'Warning')                   { $warnCount++ }
+                    if ($lvl -eq 'Error' -or $lvl -eq 'Failure') { $failC++ }
+                    elseif ($lvl -eq 'Warning') { $warnC++ }
                 } catch {}
             }
-            $reportObj = [ordered]@{
-                TotalEntries = $reportEntries.Count
-                FailureCount = $failCount
-                WarningCount = $warnCount
-                Entries      = @($reportEntries)
-            }
         }
-    } catch {}
-
-    $obj = [ordered]@{
-        Identity = [ordered]@{
-            Identity        = SafeStr $Stats.Identity
-            DisplayName     = SafeStr $Stats.DisplayName
-            Alias           = SafeStr $Stats.Alias
-            ExchangeGuid    = SafeStr $Stats.ExchangeGuid
-            MailboxIdentity = SafeStr $Stats.MailboxIdentity
-        }
-        Status = [ordered]@{
-            Status       = SafeStr $Stats.Status
-            StatusDetail = SafeStr $Stats.StatusDetail
-            SyncStage    = SafeStr $Stats.SyncStage
-            Flags        = SafeStr $Stats.Flags
-            Direction    = SafeStr $Stats.Direction
-        }
-        Progress = [ordered]@{
-            PercentComplete       = SafeInt   $Stats.PercentComplete
-            BytesTransferred      = SafeStr   $Stats.BytesTransferred
-            TotalMailboxSize      = SafeStr   $Stats.TotalMailboxSize
-            TotalMailboxItemCount = SafeInt64 $Stats.TotalMailboxItemCount
-            ItemsTransferred      = SafeInt64 $Stats.ItemsTransferred
-        }
-        Quality = [ordered]@{
-            BadItemCount         = SafeInt $Stats.BadItemCount
-            LargeItemCount       = SafeInt $Stats.LargeItemCount
-            BadItemLimit         = SafeStr $Stats.BadItemLimit
-            LargeItemLimit       = SafeStr $Stats.LargeItemLimit
-            DataConsistencyScore = SafeStr $Stats.DataConsistencyScore
-        }
-        Timing = [ordered]@{
-            QueuedTimestamp                  = SafeDate $Stats.QueuedTimestamp
-            StartTimestamp                   = SafeDate $Stats.StartTimestamp
-            InitialSeedingCompletedTimestamp = SafeDate $Stats.InitialSeedingCompletedTimestamp
-            FinalSyncTimestamp               = SafeDate $Stats.FinalSyncTimestamp
-            CompletionTimestamp              = SafeDate $Stats.CompletionTimestamp
-            TotalInProgressDuration          = SafeStr  $Stats.TotalInProgressDuration
-        }
-        Target = [ordered]@{
-            TargetServer          = SafeStr $Stats.TargetServer
-            TargetDatabase        = SafeStr $Stats.TargetDatabase
-            TargetArchiveDatabase = SafeStr $Stats.TargetArchiveDatabase
-            RemoteHostName        = SafeStr $Stats.RemoteHostName
-            TargetDeliveryDomain  = SafeStr $Stats.TargetDeliveryDomain
-        }
-        Failures = [ordered]@{
-            FailureSide = SafeStr $Stats.FailureSide
-            FailureType = SafeStr $Stats.FailureType
-            FailureCode = SafeStr $Stats.FailureCode
-            Message     = SafeStr $Stats.Message
-            LastFailure = SafeDate $Stats.FailureTimestamp
-        }
-        Report = $reportObj
+        return @{ entries = @($result); failC = $failC; warnC = $warnC }
     }
-    return $obj | ConvertTo-Json -Depth 6 -Compress
+
+    # Reflect ALL top-level properties (sorted alphabetically like Get-Member output)
+    $allProps = @($Stats | Get-Member -MemberType Properties -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Name -ne 'Length' } | Sort-Object Name)
+
+    $obj = [ordered]@{}
+    foreach ($p in $allProps) {
+        try {
+            $val = $Stats.$($p.Name)
+            if ($p.Name -eq 'Report') {
+                # Report: expand all sub-properties; Entries gets structured serialization
+                if ($val) {
+                    $reportObj  = [ordered]@{}
+                    $rProps     = @($val | Get-Member -MemberType Properties -ErrorAction SilentlyContinue |
+                                   Where-Object { $_.Name -ne 'Length' -and $_.Name -ne 'Entries' } |
+                                   Sort-Object Name)
+                    foreach ($rp in $rProps) {
+                        try   { $reportObj[$rp.Name] = SafeVal $val.$($rp.Name) 1 }
+                        catch { $reportObj[$rp.Name] = $null }
+                    }
+                    $rpt = SafeEntries $val.Entries
+                    $reportObj['TotalEntries'] = $rpt.entries.Count
+                    $reportObj['FailureCount'] = $rpt.failC
+                    $reportObj['WarningCount'] = $rpt.warnC
+                    $reportObj['Entries']      = $rpt.entries
+                    $obj['Report'] = $reportObj
+                } else {
+                    $obj['Report'] = [ordered]@{ TotalEntries = 0; FailureCount = 0; WarningCount = 0; Entries = @() }
+                }
+            } else {
+                $obj[$p.Name] = SafeVal $val 0
+            }
+        } catch {
+            $obj[$p.Name] = $null
+        }
+    }
+    return $obj | ConvertTo-Json -Depth 8 -Compress
 }
 
 function Invoke-MRSMoveRequestRefresh {
@@ -3779,6 +3791,172 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
   body.dark-mode tr.pinned-row:hover { background:#4a2106 !important; }
   .pin-header { width:40px; text-align:center; }
 
+  /* MRS Explorer UI refresh */
+  .mrs-panel {
+    padding:8px !important;
+    overflow:hidden !important;
+    height:calc(100vh - 148px) !important;
+    min-height:620px;
+  }
+  .mrs-shell {
+    display:flex;
+    gap:0;
+    height:100%;
+    border:1px solid #dbe4ef;
+    border-radius:14px;
+    overflow:hidden;
+    background:linear-gradient(180deg,#f8fbff 0%,#f2f6fc 100%);
+    box-shadow:0 10px 28px rgba(15,23,42,.08);
+  }
+  .mrs-left-pane {
+    min-width:240px;
+    max-width:560px;
+    display:flex;
+    flex-direction:column;
+    border-right:1px solid #e2e8f0;
+    background:rgba(248,250,252,.95);
+    backdrop-filter:blur(4px);
+  }
+  .mrs-right-pane {
+    min-width:320px;
+    flex:1;
+    display:flex;
+    flex-direction:column;
+    overflow:hidden;
+    background:#fff;
+  }
+  .mrs-body-row {
+    flex:1;
+    display:flex;
+    min-height:0;
+    overflow:hidden;
+  }
+  .mrs-tree-pane {
+    min-width:170px;
+    max-width:480px;
+    border-right:1px solid #e2e8f0;
+    overflow-y:auto;
+    background:#f8fafc;
+  }
+  .mrs-center-pane {
+    min-width:260px;
+    flex:1;
+    overflow-y:auto;
+    padding:0;
+    display:flex;
+    flex-direction:column;
+    gap:0;
+  }
+  .mrs-splitter {
+    flex:0 0 auto;
+    position:relative;
+    z-index:5;
+    background:linear-gradient(180deg,#f8fafc 0%,#f1f5f9 100%);
+  }
+  .mrs-splitter-v {
+    width:8px;
+    cursor:col-resize;
+    border-left:1px solid #dbe4ef;
+    border-right:1px solid #dbe4ef;
+  }
+  .mrs-splitter-v::after {
+    content:'';
+    position:absolute;
+    top:50%;
+    left:50%;
+    width:2px;
+    height:36px;
+    border-radius:2px;
+    transform:translate(-50%,-50%);
+    background:#94a3b8;
+    box-shadow:-4px 0 0 #cbd5e1, 4px 0 0 #cbd5e1;
+  }
+  .mrs-splitter-v:hover { background:#eaf2ff; }
+  .mrs-splitter-h {
+    position:absolute;
+    left:0;
+    right:0;
+    top:0;
+    height:8px;
+    cursor:row-resize;
+    border-bottom:1px solid #dbe4ef;
+  }
+  .mrs-splitter-h::after {
+    content:'';
+    position:absolute;
+    top:2px;
+    left:50%;
+    width:46px;
+    height:2px;
+    border-radius:2px;
+    transform:translateX(-50%);
+    background:#94a3b8;
+  }
+  #mrs-entry-detail-panel { position:relative; padding-top:12px !important; }
+  #mrs-center-content {
+    border:none;
+    border-radius:0;
+    background:transparent;
+    padding:12px;
+    min-height:90px;
+  }
+  #mrs-report-viewer { padding:8px 12px 12px; }
+  .mrs-pane-head {
+    display:flex;
+    align-items:center;
+    gap:8px;
+    padding:8px 10px;
+    border-bottom:1px solid #e2e8f0;
+    background:#f8fafc;
+  }
+  .mrs-pane-tag {
+    display:inline-flex;
+    align-items:center;
+    justify-content:center;
+    min-width:64px;
+    height:20px;
+    padding:0 8px;
+    border-radius:999px;
+    font-size:.68rem;
+    font-weight:700;
+    color:#1e3a8a;
+    background:#dbeafe;
+    border:1px solid #bfdbfe;
+  }
+  .mrs-pane-name {
+    font-size:.76rem;
+    font-weight:700;
+    color:#334155;
+    letter-spacing:.03em;
+    text-transform:uppercase;
+  }
+  .mrs-pane-note {
+    font-size:.74rem;
+    color:#64748b;
+    margin-left:auto;
+  }
+  #mrs-move-request-table tbody tr { transition:background .15s ease; }
+  #mrs-move-request-table tbody tr:hover { background:#eef6ff; }
+  #mrs-property-tree .mrs-tree-item:hover { background:#f1f5f9; }
+  #panel-mrs input:focus,
+  #panel-mrs select:focus {
+    outline:none;
+    border-color:#93c5fd !important;
+    box-shadow:0 0 0 2px rgba(59,130,246,.15);
+  }
+  body.mrs-resizing, body.mrs-resizing * { user-select:none !important; cursor:col-resize !important; }
+  body.mrs-resizing-h, body.mrs-resizing-h * { user-select:none !important; cursor:row-resize !important; }
+
+  @media (max-width: 1100px) {
+    .mrs-panel { min-height:0; height:auto !important; }
+    .mrs-shell { flex-direction:column; height:auto; }
+    #mrs-splitter-main, #mrs-splitter-tree { display:none; }
+    .mrs-left-pane { width:auto !important; min-width:0; max-width:none; }
+    .mrs-right-pane { min-width:0; }
+    .mrs-body-row { flex-direction:column; }
+    .mrs-tree-pane { width:auto !important; min-width:0; max-width:none; max-height:220px; }
+  }
+
 </style>
 </head>
 <body>
@@ -4388,11 +4566,16 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
   </div><!-- /panel-cohort -->
 
   <!-- Panel: MRS Explorer -->
-  <div id="panel-mrs" class="main-panel" style="display:none;padding:0;overflow:hidden;height:calc(100vh - 140px)">
-    <div style="display:flex;height:100%;gap:0">
+  <div id="panel-mrs" class="main-panel mrs-panel" style="display:none;">
+    <div id="mrs-shell" class="mrs-shell">
 
       <!-- Left column: search + move request list -->
-      <div style="width:300px;min-width:300px;max-width:300px;display:flex;flex-direction:column;border-right:1px solid #e2e8f0;background:#f8fafc">
+      <div id="mrs-left-pane" class="mrs-left-pane" style="width:300px;">
+        <div class="mrs-pane-head">
+          <span class="mrs-pane-tag">Panel A</span>
+          <span class="mrs-pane-name">Move Requests</span>
+          <span class="mrs-pane-note">List + filters</span>
+        </div>
         <!-- Controls -->
         <div style="padding:12px;border-bottom:1px solid #e2e8f0;display:flex;flex-direction:column;gap:6px">
           <input type="text" id="mrs-search" placeholder="Name, Alias, or Batch"
@@ -4443,18 +4626,20 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
         </div>
       </div>
 
+      <div id="mrs-splitter-main" class="mrs-splitter mrs-splitter-v" title="Drag to resize list pane"></div>
+
       <!-- Right area -->
-      <div style="flex:1;display:flex;flex-direction:column;overflow:hidden;background:#fff">
+      <div id="mrs-right-pane" class="mrs-right-pane">
 
         <!-- Empty state -->
-        <div id="mrs-empty-state" style="flex:1;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px;color:#94a3b8">
+        <div id="mrs-empty-state" style="flex:1;display:none;align-items:center;justify-content:center;flex-direction:column;gap:12px;color:#94a3b8">
           <div style="font-size:2.5rem">🔍</div>
           <div style="font-size:1rem;font-weight:500">Select a mailbox from the list</div>
           <div style="font-size:.85rem">or import an XML statistics file to view details</div>
         </div>
 
         <!-- 3-pane layout (shown when mailbox selected) -->
-        <div id="mrs-detail-area" style="display:none;flex:1;flex-direction:column;overflow:hidden">
+        <div id="mrs-detail-area" style="display:flex;flex:1;flex-direction:column;overflow:hidden">
 
           <!-- Breadcrumb + export button -->
           <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 14px;border-bottom:1px solid #e2e8f0;background:#f8fafc;flex-shrink:0">
@@ -4463,19 +4648,29 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
           </div>
 
           <!-- Property tree + center pane -->
-          <div style="flex:1;display:flex;overflow:hidden">
+          <div id="mrs-body-row" class="mrs-body-row">
 
             <!-- Property tree (left) -->
-            <div style="width:220px;min-width:220px;border-right:1px solid #e2e8f0;overflow-y:auto;background:#f8fafc">
+            <div id="mrs-tree-pane" class="mrs-tree-pane" style="width:220px;">
+              <div class="mrs-pane-head">
+                <span class="mrs-pane-tag">Panel B</span>
+                <span class="mrs-pane-name">Property Explorer</span>
+              </div>
               <ul id="mrs-property-tree" style="list-style:none;margin:0;padding:8px 0">
-                <li style="padding:12px 10px;color:#94a3b8;font-size:.8rem">No data loaded</li>
+                <li style="padding:12px 10px;color:#94a3b8;font-size:.8rem">No mailbox selected. Properties will appear here.</li>
               </ul>
             </div>
 
+            <div id="mrs-splitter-tree" class="mrs-splitter mrs-splitter-v" title="Drag to resize property pane"></div>
+
             <!-- Center pane (value / entries viewer) -->
-            <div style="flex:1;overflow-y:auto;padding:12px 14px;display:flex;flex-direction:column;gap:8px">
-              <div id="mrs-center-label" style="font-size:.78rem;font-weight:600;color:#475569"></div>
-              <div id="mrs-center-content" style="flex:1"></div>
+            <div id="mrs-center-pane" class="mrs-center-pane">
+              <div class="mrs-pane-head" style="margin:0;border-left:none;border-right:none;">
+                <span class="mrs-pane-tag">Panel C</span>
+                <span class="mrs-pane-name">Value / Report Viewer</span>
+              </div>
+              <div id="mrs-center-label" style="display:none;font-size:.78rem;font-weight:600;color:#475569"></div>
+              <div id="mrs-center-content" style="flex:1"><span style="color:#94a3b8;font-style:italic">No mailbox selected. Select a mailbox in Panel A.</span></div>
               <!-- Report entries log viewer (hidden by default) -->
               <div id="mrs-report-viewer" style="display:none">
                 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
@@ -4509,16 +4704,19 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
                 </div>
                 <div id="mrs-entries-count" style="font-size:.72rem;color:#64748b;margin-top:6px"></div>
               </div>
+              <!-- Panel D now lives inside Panel C -->
+              <div id="mrs-entry-detail-panel" style="display:none;margin-top:0;border:none;border-top:1px solid #e2e8f0;border-radius:0;background:#f8fafc;padding:8px 12px;height:160px;overflow-y:auto">
+                <div id="mrs-detail-resizer" class="mrs-splitter mrs-splitter-h" title="Drag to resize detail pane"></div>
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+                  <div style="display:flex;align-items:center;gap:8px">
+                    <span class="mrs-pane-tag">Panel D</span>
+                    <div style="font-size:.72rem;font-weight:600;color:#475569">Entry Detail</div>
+                  </div>
+                  <button class="ent-btn" onclick="mrsCopyDetail()" style="font-size:.7rem;padding:2px 8px">Copy</button>
+                </div>
+                <pre id="mrs-entry-detail" style="margin:0;font-size:.75rem;font-family:monospace;white-space:pre-wrap;word-break:break-word;color:#1e293b"></pre>
+              </div>
             </div>
-          </div>
-
-          <!-- Entry detail panel (bottom) -->
-          <div id="mrs-entry-detail-panel" style="display:none;flex-shrink:0;border-top:1px solid #e2e8f0;background:#f8fafc;padding:8px 14px;max-height:180px;overflow-y:auto">
-            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
-              <div style="font-size:.72rem;font-weight:600;color:#475569">Detail</div>
-              <button class="ent-btn" onclick="mrsCopyDetail()" style="font-size:.7rem;padding:2px 8px">Copy</button>
-            </div>
-            <pre id="mrs-entry-detail" style="margin:0;font-size:.75rem;font-family:monospace;white-space:pre-wrap;word-break:break-word;color:#1e293b"></pre>
           </div>
 
         </div><!-- /mrs-detail-area -->
@@ -8041,8 +8239,115 @@ function apiCall(endpoint, method, body) {
     filteredEntries : [],     // entries after filter
     listItems       : [],     // cached move request list
     lastFetchTime   : 0,      // ms timestamp of last successful list load (0 = never)
-    pollTimer       : null
+    pollTimer       : null,
+    layoutReady     : false
   };
+
+  function mrsClamp(val, min, max) {
+    return Math.max(min, Math.min(max, val));
+  }
+
+  function mrsLoadLayout() {
+    var defaults = { leftWidth: 300, treeWidth: 220, detailHeight: 160 };
+    try {
+      var raw = localStorage.getItem('mrsExplorerLayoutV1');
+      if (!raw) return defaults;
+      var parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return defaults;
+      return {
+        leftWidth: parseInt(parsed.leftWidth, 10) || defaults.leftWidth,
+        treeWidth: parseInt(parsed.treeWidth, 10) || defaults.treeWidth,
+        detailHeight: parseInt(parsed.detailHeight, 10) || defaults.detailHeight
+      };
+    } catch (_) {
+      return defaults;
+    }
+  }
+
+  function mrsSaveLayout(layout) {
+    try { localStorage.setItem('mrsExplorerLayoutV1', JSON.stringify(layout)); } catch (_) {}
+  }
+
+  function mrsInitResizableLayout() {
+    if (mrsState.layoutReady) return;
+
+    var shell = document.getElementById('mrs-shell');
+    var leftPane = document.getElementById('mrs-left-pane');
+    var rightPane = document.getElementById('mrs-right-pane');
+    var treePane = document.getElementById('mrs-tree-pane');
+    var detailPanel = document.getElementById('mrs-entry-detail-panel');
+    var splitMain = document.getElementById('mrs-splitter-main');
+    var splitTree = document.getElementById('mrs-splitter-tree');
+    var splitDetail = document.getElementById('mrs-detail-resizer');
+    if (!shell || !leftPane || !rightPane || !treePane || !detailPanel || !splitMain || !splitTree || !splitDetail) return;
+
+    var layout = mrsLoadLayout();
+    leftPane.style.width = mrsClamp(layout.leftWidth, 240, 560) + 'px';
+    treePane.style.width = mrsClamp(layout.treeWidth, 170, 480) + 'px';
+    detailPanel.style.height = mrsClamp(layout.detailHeight, 120, 360) + 'px';
+
+    var drag = null;
+
+    function maxLeftWidth() {
+      return Math.max(280, shell.clientWidth - 420);
+    }
+    function maxTreeWidth() {
+      return Math.max(220, rightPane.clientWidth - 280);
+    }
+    function persist() {
+      mrsSaveLayout({
+        leftWidth: parseInt(leftPane.style.width, 10) || 300,
+        treeWidth: parseInt(treePane.style.width, 10) || 220,
+        detailHeight: parseInt(detailPanel.style.height, 10) || 160
+      });
+    }
+    function begin(type, evt) {
+      drag = {
+        type: type,
+        startX: evt.clientX,
+        startY: evt.clientY,
+        leftWidth: parseInt(leftPane.style.width, 10) || 300,
+        treeWidth: parseInt(treePane.style.width, 10) || 220,
+        detailHeight: parseInt(detailPanel.style.height, 10) || 160
+      };
+      document.body.classList.add(type === 'detail' ? 'mrs-resizing-h' : 'mrs-resizing');
+      evt.preventDefault();
+    }
+    function move(evt) {
+      if (!drag) return;
+      if (drag.type === 'left') {
+        var lw = mrsClamp(drag.leftWidth + (evt.clientX - drag.startX), 240, Math.min(560, maxLeftWidth()));
+        leftPane.style.width = lw + 'px';
+      } else if (drag.type === 'tree') {
+        var tw = mrsClamp(drag.treeWidth + (evt.clientX - drag.startX), 170, Math.min(480, maxTreeWidth()));
+        treePane.style.width = tw + 'px';
+      } else if (drag.type === 'detail') {
+        var dh = mrsClamp(drag.detailHeight - (evt.clientY - drag.startY), 120, 360);
+        detailPanel.style.height = dh + 'px';
+      }
+    }
+    function end() {
+      if (!drag) return;
+      drag = null;
+      document.body.classList.remove('mrs-resizing');
+      document.body.classList.remove('mrs-resizing-h');
+      persist();
+    }
+
+    splitMain.addEventListener('mousedown', function(evt) { begin('left', evt); });
+    splitTree.addEventListener('mousedown', function(evt) { begin('tree', evt); });
+    splitDetail.addEventListener('mousedown', function(evt) { begin('detail', evt); });
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', end);
+    window.addEventListener('resize', function() {
+      var lw = parseInt(leftPane.style.width, 10) || 300;
+      if (lw > maxLeftWidth()) leftPane.style.width = maxLeftWidth() + 'px';
+      var tw = parseInt(treePane.style.width, 10) || 220;
+      if (tw > maxTreeWidth()) treePane.style.width = maxTreeWidth() + 'px';
+    });
+
+    mrsState.layoutReady = true;
+  }
   // ── Status badge colours ────────────────────────────────────────
   function mrsStatusColor(s) {
     if (!s) return '#94a3b8';
@@ -8070,6 +8375,11 @@ function apiCall(endpoint, method, body) {
   function mrsOnTabActivate() {
     console.log('[MRS] tab activated. lastFetchTime=', mrsState.lastFetchTime,
       'stale=', mrsState.lastFetchTime ? Math.round((Date.now() - mrsState.lastFetchTime)/1000) + 's' : 'never');
+    mrsInitResizableLayout();
+    if (!mrsState.currentStats && !mrsState.currentAlias) {
+      mrsShowDetailArea(false);
+      mrsSetNodePath('');
+    }
     mrsUpdateSessionBadge();
     // Auto-load if never loaded or stale (> 5 minutes)
     var FIVE_MIN = 5 * 60 * 1000;
@@ -8280,56 +8590,109 @@ function apiCall(endpoint, method, body) {
   // ── Show/hide detail area ───────────────────────────────────────
   function mrsShowDetailArea(show) {
     console.log('[MRS] mrsShowDetailArea:', show);
-    document.getElementById('mrs-empty-state').style.display   = show ? 'none'  : 'flex';
-    document.getElementById('mrs-detail-area').style.display   = show ? 'flex'  : 'none';
-    document.getElementById('mrs-entry-detail-panel').style.display = 'none';
+    var empty = document.getElementById('mrs-empty-state');
+    var area  = document.getElementById('mrs-detail-area');
+    var tree  = document.getElementById('mrs-property-tree');
+    var detailPanel = document.getElementById('mrs-entry-detail-panel');
+    var detailText  = document.getElementById('mrs-entry-detail');
+    var center = document.getElementById('mrs-center-content');
+    if (empty) empty.style.display = 'none';
+    if (area) area.style.display = 'flex';
+
     document.getElementById('mrs-report-viewer').style.display = 'none';
-    document.getElementById('mrs-center-label').textContent   = '';
-    document.getElementById('mrs-center-content').innerHTML   = '';
+
+    if (show) {
+      detailPanel.style.flex = '0 0 auto';
+      if (!detailPanel.style.height || detailPanel.style.height === 'auto') {
+        detailPanel.style.height = (mrsClamp(mrsLoadLayout().detailHeight, 120, 360)) + 'px';
+      }
+      detailPanel.style.display = 'none';
+      center.innerHTML = '';
+    } else {
+      if (tree) {
+        tree.innerHTML = '<li style="padding:12px 10px;color:#94a3b8;font-size:.8rem">No mailbox selected. Properties will appear here.</li>';
+      }
+      center.innerHTML = '<span style="color:#94a3b8;font-style:italic">No mailbox selected. Select a mailbox in Panel A.</span>';
+      detailPanel.style.flex = '0 0 auto';
+      if (!detailPanel.style.height || detailPanel.style.height === 'auto') {
+        detailPanel.style.height = (mrsClamp(mrsLoadLayout().detailHeight, 120, 360)) + 'px';
+      }
+      detailPanel.style.display = '';
+      detailText.textContent = 'Panel D - Entry Detail\nSelect a property or report row to populate this panel.';
+    }
   }
 
   // ── Breadcrumb path ─────────────────────────────────────────────
   function mrsSetNodePath(path) {
-    document.getElementById('mrs-node-path').textContent = path || '—';
+    document.getElementById('mrs-node-path').textContent = path || '';
   }
 
-  // ── Property tree ────────────────────────────────────────────────
-  var _mrsCategories = [
-    { key: 'Identity', label: 'Identity',  props: ['Identity','DisplayName','Alias','ExchangeGuid','MailboxIdentity'] },
-    { key: 'Status',   label: 'Status',    props: ['Status','StatusDetail','SyncStage','Flags','Direction'] },
-    { key: 'Progress', label: 'Progress',  props: ['PercentComplete','BytesTransferred','TotalMailboxSize','TotalMailboxItemCount','ItemsTransferred'] },
-    { key: 'Quality',  label: 'Quality',   props: ['BadItemCount','LargeItemCount','BadItemLimit','LargeItemLimit','DataConsistencyScore'] },
-    { key: 'Timing',   label: 'Timing',    props: ['QueuedTimestamp','StartTimestamp','InitialSeedingCompletedTimestamp','FinalSyncTimestamp','CompletionTimestamp','TotalInProgressDuration'] },
-    { key: 'Target',   label: 'Target',    props: ['TargetServer','TargetDatabase','TargetArchiveDatabase','RemoteHostName','TargetDeliveryDomain'] },
-    { key: 'Failures', label: 'Failures',  props: ['FailureSide','FailureType','FailureCode','Message','LastFailure'] }
-  ];
+  // Keep panel scaffolding visible even before first mailbox selection.
+  mrsShowDetailArea(false);
+  mrsSetNodePath('');
 
+  // ── Property tree ────────────────────────────────────────────────
   function mrsRenderPropertyTree(stats) {
     console.log('[MRS] mrsRenderPropertyTree called. stats type=', typeof stats,
-      'keys=', stats ? Object.keys(stats) : 'null/undefined');
+      'keys=', stats ? Object.keys(stats).length : 'null/undefined');
     var ul = document.getElementById('mrs-property-tree');
     if (!ul) { console.error('[MRS] mrs-property-tree element not found!'); return; }
     var html = '';
-    _mrsCategories.forEach(function(cat) {
-      var group = stats[cat.key] || {};
-      html += '<li style="padding:4px 10px 2px;font-size:.7rem;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;user-select:none">— ' + cat.label + ' —</li>';
-      cat.props.forEach(function(prop) {
-        var val = group[prop];
-        var display = (val === null || val === undefined || val === '') ? '—' : String(val);
-        if (display.length > 30) display = display.substring(0,30) + '…';
-        html += '<li class="mrs-tree-item" data-cat="' + cat.key + '" data-prop="' + prop + '"' +
-                ' onclick="mrsSelectProperty(\'' + cat.key + '\',\'' + prop + '\')"' +
-                ' style="padding:4px 10px 4px 16px;cursor:pointer;border-bottom:1px solid #f1f5f9;font-size:.76rem;display:flex;justify-content:space-between;gap:4px">' +
-                '<span style="color:#334155;font-weight:500">' + prop + '</span>' +
-                '<span style="color:#64748b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:110px" title="' + (val || '') + '">' + display + '</span>' +
-                '</li>';
-      });
+    // All top-level properties (Report handled separately at bottom)
+    Object.keys(stats).forEach(function(prop) {
+      if (prop === 'Report') return;
+      var val = stats[prop];
+      var display;
+      if (val === null || val === undefined || val === '') {
+        display = '—';
+      } else if (Array.isArray(val)) {
+        display = '[' + val.length + ' items]';
+      } else if (typeof val === 'object') {
+        display = '{…}';
+      } else {
+        var s = String(val);
+        display = s.length > 30 ? s.substring(0,30) + '…' : s;
+      }
+      var safeDisplay = display.replace(/</g,'&lt;');
+      var safeTitle   = String(val !== null && val !== undefined ? val : '').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+      html += '<li class="mrs-tree-item" data-prop="' + prop + '"' +
+              ' onclick="mrsSelectProperty(' + JSON.stringify(prop) + ')"' +
+              ' style="padding:4px 10px 4px 16px;cursor:pointer;border-bottom:1px solid #f1f5f9;font-size:.76rem;display:flex;justify-content:space-between;gap:4px">' +
+              '<span style="color:#334155;font-weight:500">' + prop + '</span>' +
+              '<span style="color:#64748b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:110px" title="' + safeTitle + '">' + safeDisplay + '</span>' +
+              '</li>';
     });
-    // Report Entries special item
+    // Report section
     var rpt = stats.Report || {};
     var rptLabel = 'Report Entries (' + (rpt.TotalEntries || 0) + ' total, ' + (rpt.WarningCount || 0) + ' warnings, ' + (rpt.FailureCount || 0) + ' errors)';
     html += '<li style="padding:4px 10px 2px;font-size:.7rem;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;user-select:none">— Report —</li>';
     html += '<li onclick="mrsOpenReportEntries()" style="padding:6px 10px 6px 16px;cursor:pointer;font-size:.76rem;color:#3b82f6;font-weight:600">' + rptLabel + '</li>';
+    // Report sub-properties (everything except the virtual summary keys and Entries array)
+    var _rptSkip = { Entries: 1, TotalEntries: 1, FailureCount: 1, WarningCount: 1 };
+    if (stats.Report) {
+      Object.keys(stats.Report).forEach(function(rk) {
+        if (_rptSkip[rk]) return;
+        var val = stats.Report[rk];
+        var display;
+        if (val === null || val === undefined || val === '') {
+          display = '—';
+        } else if (Array.isArray(val)) {
+          display = '[' + val.length + ' items]';
+        } else if (typeof val === 'object') {
+          display = '{…}';
+        } else {
+          var s = String(val);
+          display = s.length > 30 ? s.substring(0,30) + '…' : s;
+        }
+        var safeDisplay = display.replace(/</g,'&lt;');
+        html += '<li class="mrs-tree-item" data-prop="Report.' + rk + '"' +
+                ' onclick="mrsSelectProperty(' + JSON.stringify('Report.' + rk) + ')"' +
+                ' style="padding:4px 10px 4px 22px;cursor:pointer;border-bottom:1px solid #f1f5f9;font-size:.76rem;display:flex;justify-content:space-between;gap:4px">' +
+                '<span style="color:#475569">' + rk + '</span>' +
+                '<span style="color:#64748b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:110px">' + safeDisplay + '</span>' +
+                '</li>';
+      });
+    }
     ul.innerHTML = html;
   }
 
@@ -8366,32 +8729,47 @@ function apiCall(endpoint, method, body) {
     }
     var html = '<div style="font-size:.78rem;color:#475569;margin-bottom:6px">' + propName + ' (' + items.length + ' items)</div>';
     html += items.map(function(v, i) {
-      var display = String(v).replace(/</g,'&lt;');
+      var fullText = (v === null || v === undefined) ? '' :
+                     (typeof v === 'object' ? JSON.stringify(v, null, 2) : String(v));
+      var displayStr = (v === null || v === undefined) ? '(null)' :
+                       (typeof v === 'object' ? JSON.stringify(v) : String(v));
+      if (displayStr.length > 120) displayStr = displayStr.substring(0, 120) + '…';
+      var safeDisplay = displayStr.replace(/</g,'&lt;');
       return '<div class="mrs-collection-item" data-index="' + i + '" ' +
-             'onclick="mrsShowEntryDetail(' + JSON.stringify(String(v)) + ')" ' +
+             'onclick="mrsShowEntryDetail(' + JSON.stringify(fullText) + ')" ' +
              'style="padding:4px 8px;cursor:pointer;border-bottom:1px solid #f1f5f9;font-size:.76rem;font-family:monospace">' +
-             '<span style="color:#94a3b8;margin-right:8px">[' + i + ']</span>' + display + '</div>';
+             '<span style="color:#94a3b8;margin-right:8px">[' + i + ']</span>' + safeDisplay + '</div>';
     }).join('');
     content.innerHTML = html;
-    mrsShowEntryDetail(String(items[0]));
+    var first = items[0];
+    mrsShowEntryDetail(
+      (first === null || first === undefined) ? '' :
+      (typeof first === 'object' ? JSON.stringify(first, null, 2) : String(first))
+    );
   }
   window.renderMRSCollection = renderMRSCollection;
 
-  function mrsSelectProperty(cat, prop) {
+  function mrsSelectProperty(prop) {
     if (!mrsState.currentStats) return;
     document.querySelectorAll('.mrs-tree-item').forEach(function(li){ li.style.background = ''; });
-    var item = document.querySelector('.mrs-tree-item[data-cat="' + cat + '"][data-prop="' + prop + '"]');
+    var item = document.querySelector('.mrs-tree-item[data-prop="' + prop + '"]');
     if (item) item.style.background = '#eff6ff';
 
-    var group = mrsState.currentStats[cat] || {};
-    var val   = group[prop];
-    document.getElementById('mrs-center-label').textContent = prop;
-    mrsSetNodePath(mrsState.currentAlias + ' > ' + cat + ' > ' + prop);
+    // Resolve dotted path (e.g. "Report.BadItemReport")
+    var val = mrsState.currentStats;
+    prop.split('.').forEach(function(k) { val = (val != null) ? val[k] : undefined; });
+
+    mrsSetNodePath(mrsState.currentAlias + ' > ' + prop);
 
     if (Array.isArray(val)) {
       renderMRSCollection(prop, val);
     } else if (val !== null && val !== undefined && typeof val === 'object') {
-      renderMRSCollection(prop, Object.entries(val).map(function(e){ return e[0] + ': ' + e[1]; }));
+      // Expand object: show each key as a "key: value" string entry
+      var items = Object.keys(val).map(function(k) {
+        var v = val[k];
+        return k + ': ' + (v === null ? 'null' : (typeof v === 'object' ? JSON.stringify(v) : String(v)));
+      });
+      renderMRSCollection(prop, items);
     } else {
       renderMRSScalar(prop, val);
     }
@@ -8429,7 +8807,6 @@ function apiCall(endpoint, method, body) {
 
     document.getElementById('mrs-entries-level-filter').value = 'All';
     document.getElementById('mrs-entries-search').value = '';
-    document.getElementById('mrs-center-label').textContent = 'Report Entries';
     document.getElementById('mrs-center-content').innerHTML = '';
     document.getElementById('mrs-report-viewer').style.display = '';
     document.getElementById('mrs-entry-detail-panel').style.display = 'none';
@@ -10502,4 +10879,5 @@ if ($MyInvocation.InvocationName -ne '.') {
         Invoke-MigrationReport @invokeParams
     }
 }
+
 
