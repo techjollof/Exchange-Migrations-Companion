@@ -10,7 +10,7 @@
 
 .PARAMETER StatusFilter
     Filter move requests by status.
-    Accepts: All, Queued, InProgress, AutoSuspended, CompletedWithWarning, Completed, Failed
+    Accepts: All plus Microsoft migration statuses (e.g. Completed, Failed, Queued, Syncing, etc.)
     Default: All
 
 .PARAMETER Mailbox
@@ -149,7 +149,17 @@
 param (
     # ── Live mode — filtering ────────────────────────────────────────────────
     [Parameter(ParameterSetName = "Live")]
-    [ValidateSet("All","Queued","InProgress","AutoSuspended","CompletedWithWarning","Completed","Failed")]
+    [ValidateSet(
+        "All",
+        "AutoSuspended","InProgress","Suspended",
+        "Completed","CompletedWithWarning","CompletedWithWarnings","CompletedWithSkippedItems","Completing","CompletionFailed","CompletionInProgress","CompletionSynced",
+        "Corrupted","Failed",
+        "IncrementalFailed","IncrementalStopped","IncrementalSynced","IncrementalSyncing",
+        "Provisioning","ProvisionUpdating",
+        "Queued","Removing",
+        "Starting","Stopped","Stopping",
+        "Synced","Syncing","Validating"
+    )]
     [string]$StatusFilter = "All",
 
     [Parameter(ParameterSetName = "Live")]
@@ -1996,22 +2006,36 @@ function Get-MoveRequests {
     try {
         $all = Get-MoveRequest -ErrorAction Stop
 
+        # Normalize common naming variants from UI/docs.
+        $effectiveStatusFilter = switch ($StatusFilter) {
+            'CompletedWithWarnings' { 'CompletedWithWarning' }
+            default                 { $StatusFilter }
+        }
+
         # Status filter
-        $moves = switch ($StatusFilter) {
-            "All"   { if ($IncludeCompleted) { $all } else { $all | Where-Object { $_.Status -ne 'Completed' -and $_.Status -ne 'CompletedWithWarning' -and $_.Status -ne 'CompletedWithSkippedItems' } } }
-            default { $all | Where-Object { $_.Status -eq $StatusFilter } }
+        $moves = switch ($effectiveStatusFilter) {
+            "All"       { if ($IncludeCompleted) { $all } else { $all | Where-Object { $_.Status -ne 'Completed' -and $_.Status -ne 'CompletedWithWarning' -and $_.Status -ne 'CompletedWithSkippedItems' } } }
+            "Completed" { $all | Where-Object { $_.Status -in @('Completed','CompletedWithWarning','CompletedWithSkippedItems') } }
+            default     { $all | Where-Object { $_.Status -eq $effectiveStatusFilter } }
         }
 
         # MigrationBatchName filter
         if ($MigrationBatchName) {
+            # Support both single and comma-separated batches from watch-mode API.
+            $batchPatterns = @($MigrationBatchName -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            if ($batchPatterns.Count -eq 0) { $batchPatterns = @($MigrationBatchName) }
+
             # EXO prefixes batch names with "MigrationService:" internally.
-            # Match against both the raw value and the unprefixed version so
-            # both "keplerip-Aaron" and "MigrationService:keplerip-Aaron" work.
+            # Match against both the raw value and the unprefixed version.
             $moves = @($moves) | Where-Object {
-                $bn = "$($_.BatchName)" -replace '^MigrationService:',''
-                $bn -like $MigrationBatchName -or
-                "$($_.BatchName)" -like $MigrationBatchName -or
-                "$($_.BatchName)" -like "*$MigrationBatchName*"
+                $rawBatch = "$($_.BatchName)"
+                $normBatch = $rawBatch -replace '^MigrationService:',''
+                foreach ($bp in $batchPatterns) {
+                    if ($normBatch -like $bp -or $rawBatch -like $bp -or $normBatch -like "*$bp*" -or $rawBatch -like "*$bp*") {
+                        return $true
+                    }
+                }
+                return $false
             }
         }
 
@@ -4643,7 +4667,7 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
         <div style="padding:12px;border-bottom:1px solid #e2e8f0;display:flex;flex-direction:column;gap:6px">
           <input type="text" id="mrs-search" placeholder="Name, Alias, or Batch"
                  style="width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:.8rem"
-                 onkeydown="if(event.key==='Enter')mrsFetchList()">
+                 onkeydown="if(event.key==='Enter')mrsApplyFilter()">
           <select id="mrs-status-filter"
                   style="width:100%;padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:.8rem;background:#fff"
                   onchange="mrsApplyFilter()">
@@ -4659,7 +4683,7 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
             <option>Suspended</option>
           </select>
           <div style="display:flex;gap:4px">
-            <button class="ent-btn" onclick="mrsFetchList()" style="flex:1;justify-content:center;padding:5px 0;font-size:.78rem">Search</button>
+            <button class="ent-btn" onclick="mrsApplyFilter()" style="flex:1;justify-content:center;padding:5px 0;font-size:.78rem">Search</button>
             <button class="ent-btn" onclick="mrsRefreshList()" style="flex:1;justify-content:center;padding:5px 0;font-size:.78rem">Refresh</button>
             <button class="ent-btn" onclick="mrsResetList()" style="flex:0 0 auto;padding:5px 8px;font-size:.78rem;background:#fff;color:#475569;border-color:#cbd5e1">Reset</button>
           </div>
@@ -4707,7 +4731,10 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
           <!-- Breadcrumb + export button -->
           <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 14px;border-bottom:1px solid #e2e8f0;background:#f8fafc;flex-shrink:0">
             <div id="mrs-node-path" style="font-size:.78rem;color:#475569;font-family:monospace;word-break:break-all">—</div>
-            <button id="mrs-btn-export-xml" class="ent-btn" onclick="mrsExportXml()" style="font-size:.75rem;padding:4px 10px;flex-shrink:0;margin-left:10px">⬇ Export XML</button>
+            <div style="display:flex;align-items:center;gap:6px;flex-shrink:0;margin-left:10px">
+              <button id="mrs-btn-refresh-selected" class="ent-btn" onclick="mrsRefreshSelectedMailbox()" style="font-size:.75rem;padding:4px 10px">Refresh Selected</button>
+              <button id="mrs-btn-export-xml" class="ent-btn" onclick="mrsExportXml()" style="font-size:.75rem;padding:4px 10px">Export XML</button>
+            </div>
           </div>
 
           <!-- Property tree + center pane -->
@@ -5080,6 +5107,7 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     if (panel) { panel.style.display = ''; panel.classList.add('active'); }
     btn.classList.add('active');
     if (id === 'cohort') { loadCohortData(); }
+    if (id === 'compare') { compareOnTabActivate(); }
     if (id === 'mrs')    { mrsOnTabActivate(); }
   }
 
@@ -6526,6 +6554,63 @@ var batchCompareChart = null;
 var batchTrendChart   = null;
 var selectedBatches = [];
 var batchDataCache = {};
+var batchCompareRestoreDone = false;
+
+function loadBatchCompareUiState() {
+  var defaults = { selectedBatches: [], lastCompared: [] };
+  try {
+    var raw = localStorage.getItem('batchCompareUiStateV1');
+    if (!raw) return defaults;
+    var parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return defaults;
+    var selected = Array.isArray(parsed.selectedBatches) ? parsed.selectedBatches : [];
+    var compared = Array.isArray(parsed.lastCompared) ? parsed.lastCompared : [];
+    return { selectedBatches: selected, lastCompared: compared };
+  } catch (_) {
+    return defaults;
+  }
+}
+
+function saveBatchCompareUiState(extra) {
+  var current = loadBatchCompareUiState();
+  var lastCompared = current.lastCompared || [];
+  if (extra && Array.isArray(extra.lastCompared)) {
+    lastCompared = extra.lastCompared.slice();
+  }
+  try {
+    localStorage.setItem('batchCompareUiStateV1', JSON.stringify({
+      selectedBatches: Array.isArray(selectedBatches) ? selectedBatches.slice() : [],
+      lastCompared: lastCompared
+    }));
+  } catch (_) {}
+}
+
+function applyBatchSelectionFromState(names) {
+  var target = {};
+  (Array.isArray(names) ? names : []).forEach(function(n) { target[String(n)] = true; });
+  document.querySelectorAll('.batch-checkbox').forEach(function(cb) {
+    cb.checked = !!target[cb.value];
+  });
+  updateSelectedBatches();
+}
+
+function compareOnTabActivate() {
+  if (batchCompareRestoreDone) return;
+  var checkboxes = document.querySelectorAll('.batch-checkbox');
+  if (!checkboxes || checkboxes.length === 0) return;
+  batchCompareRestoreDone = true;
+  var state = loadBatchCompareUiState();
+  var restoreSelection = (state.selectedBatches && state.selectedBatches.length > 0)
+    ? state.selectedBatches
+    : state.lastCompared;
+  if (restoreSelection && restoreSelection.length > 0) {
+    applyBatchSelectionFromState(restoreSelection);
+  }
+  if (state.lastCompared && state.lastCompared.length > 0) {
+    applyBatchSelectionFromState(state.lastCompared);
+    loadBatchComparison({ forceRefresh: false, cacheOnly: true, silent: true });
+  }
+}
 
 function initBatchComparison() {
   var apiBase = window.WATCH_API_BASE;
@@ -6558,6 +6643,14 @@ function initBatchComparison() {
           '<span style="color:#94a3b8;font-size:.75rem;flex-shrink:0;">' + count + '</span>' +
         '</label>';
       }).join('');
+      var st = loadBatchCompareUiState();
+      if (st.selectedBatches && st.selectedBatches.length > 0) {
+        applyBatchSelectionFromState(st.selectedBatches);
+      }
+      var comparePanel = document.getElementById('panel-compare');
+      if (comparePanel && comparePanel.classList.contains('active')) {
+        compareOnTabActivate();
+      }
     })
     .catch(function(e) {
       var loadingEl = document.getElementById('compare-loading-batches');
@@ -6576,90 +6669,138 @@ function updateSelectedBatches() {
       : selectedBatches.length + ' batch' + (selectedBatches.length > 1 ? 'es' : '') + ' selected';
     hint.style.color = selectedBatches.length >= 1 ? '#3b82f6' : '#94a3b8';
   }
+  saveBatchCompareUiState();
 }
 
-function loadBatchComparison() {
+function loadBatchComparison(options) {
+  options = options || {};
+  var forceRefresh = (options.forceRefresh === undefined) ? true : !!options.forceRefresh;
+  var cacheOnly = !!options.cacheOnly;
+  var silent = !!options.silent;
+  if (cacheOnly) forceRefresh = false;
+
   if (selectedBatches.length < 1) {
-    alert('Please select at least 1 batch to analyze.');
+    if (!silent) alert('Please select at least 1 batch to analyze.');
     return;
   }
 
   var apiBase = window.WATCH_API_BASE;
   if (!apiBase) return;
 
-  document.getElementById('comparison-empty').style.display = 'none';
-  document.getElementById('comparison-results').style.display = 'none';
-  document.getElementById('comparison-loading').style.display = 'block';
-  document.getElementById('comparison-loading').innerHTML =
-    '<div style="font-size:2rem;margin-bottom:10px;">⏳</div>Requesting batch data from Exchange…';
+  var batchesToFetch = selectedBatches.slice();
+  var loadingEl = document.getElementById('comparison-loading');
+  var emptyEl = document.getElementById('comparison-empty');
+  var resultsEl = document.getElementById('comparison-results');
+  emptyEl.style.display = 'none';
+  resultsEl.style.display = 'none';
+  loadingEl.style.display = 'block';
+  loadingEl.innerHTML = cacheOnly
+    ? '<div style="font-size:2rem;margin-bottom:10px;">?</div>Loading cached batch comparison data.'
+    : '<div style="font-size:2rem;margin-bottom:10px;">?</div>Requesting batch data from Exchange.';
 
-  // Step 1 — trigger on-demand fetch in main loop for selected batches only
+  function showError(message) {
+    loadingEl.style.display = 'none';
+    emptyEl.innerHTML = '<div style="font-size:2rem;margin-bottom:10px;">??</div>' +
+      '<div style="color:#ef4444;">' + message + '</div>';
+    emptyEl.style.display = 'block';
+  }
+
+  function fetchBatchStatsRound() {
+    var promises = batchesToFetch.map(function(batchName) {
+      return fetch(apiBase + '/api/batch-stats?batch=' + encodeURIComponent(batchName))
+        .then(function(r) { return r.json(); })
+        .then(function(data) { return { batchName: batchName, data: data }; })
+        .catch(function() { return { batchName: batchName, data: { ok: false, error: 'Request failed' } }; });
+    });
+    return Promise.all(promises).then(function(results) {
+      var ready = [];
+      var missing = [];
+      results.forEach(function(r) {
+        if (r && r.data && r.data.ok) {
+          r.data.BatchName = r.batchName;
+          ready.push(r.data);
+          batchDataCache[r.batchName] = r.data;
+        } else {
+          missing.push(r);
+        }
+      });
+      return { ready: ready, missing: missing };
+    });
+  }
+
+  function renderReady(ready, missing, timedOut) {
+    loadingEl.style.display = 'none';
+    if (!ready || ready.length === 0) {
+      if (cacheOnly) {
+        emptyEl.innerHTML = '<div style="font-size:2rem;margin-bottom:10px;">??</div>' +
+          '<div>No cached comparison data found. Click <strong>Analyze / Compare Selected</strong> to refresh.</div>';
+      } else if (timedOut) {
+        emptyEl.innerHTML = '<div style="font-size:2rem;margin-bottom:10px;">??</div>' +
+          '<div style="color:#ef4444;">Timed out waiting for batch data. The main loop may be busy - try again.</div>';
+      } else {
+        emptyEl.innerHTML = '<div style="font-size:2rem;margin-bottom:10px;">??</div>' +
+          '<div style="color:#ef4444;">Could not load data: ' +
+          (missing || []).map(function(r) { return '<strong>' + r.batchName + '</strong> (' + ((r.data && r.data.error) || 'not found') + ')'; }).join(', ') +
+          '</div>';
+      }
+      emptyEl.style.display = 'block';
+      return;
+    }
+    resultsEl.style.display = 'block';
+    renderBatchComparison(ready);
+    loadBatchTrend(batchesToFetch);
+    saveBatchCompareUiState({ lastCompared: batchesToFetch.slice() });
+  }
+
+  function pollUntilReady(deadlineMs) {
+    var deadline = Date.now() + deadlineMs;
+    function pollOne() {
+      fetchBatchStatsRound().then(function(outcome) {
+        var ready = outcome.ready || [];
+        if (ready.length === batchesToFetch.length) {
+          renderReady(ready, outcome.missing, false);
+          return;
+        }
+        if (Date.now() > deadline) {
+          renderReady(ready, outcome.missing, true);
+          return;
+        }
+        setTimeout(pollOne, 1000);
+      }).catch(function(err) {
+        showError('Failed to load batch data: ' + err);
+      });
+    }
+    pollOne();
+  }
+
+  if (!forceRefresh) {
+    if (cacheOnly) {
+      fetchBatchStatsRound().then(function(outcome) {
+        renderReady(outcome.ready, outcome.missing, false);
+      }).catch(function(err) {
+        showError('Failed to load cached batch data: ' + err);
+      });
+      return;
+    }
+    pollUntilReady(12000);
+    return;
+  }
+
+  // Explicit refresh path (button click): trigger server-side fetch, then poll cache.
   fetch(apiBase + '/api/fetch-batch-stats', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ batches: selectedBatches })
+    body: JSON.stringify({ batches: batchesToFetch })
   })
   .then(function(r) { return r.json(); })
   .then(function(res) {
     if (!res.ok && !res.pending) {
       throw new Error(res.error || 'Fetch trigger failed');
     }
-    // Step 2 — poll /api/batch-stats for each batch until all are ready (max 30s)
-    var deadline = Date.now() + 30000;
-    var batchesToFetch = selectedBatches.slice();
-
-    function pollAll() {
-      if (Date.now() > deadline) {
-        document.getElementById('comparison-loading').style.display = 'none';
-        var emptyEl = document.getElementById('comparison-empty');
-        emptyEl.innerHTML = '<div style="font-size:2rem;margin-bottom:10px;">⏱️</div>' +
-          '<div style="color:#ef4444;">Timed out waiting for batch data. The main loop may be busy — try again.</div>';
-        emptyEl.style.display = 'block';
-        return;
-      }
-
-      var promises = batchesToFetch.map(function(batchName) {
-        return fetch(apiBase + '/api/batch-stats?batch=' + encodeURIComponent(batchName))
-          .then(function(r) { return r.json(); })
-          .then(function(data) { return { batchName: batchName, data: data }; })
-          .catch(function() { return { batchName: batchName, data: { ok: false, error: 'Request failed' } }; });
-      });
-
-      Promise.all(promises).then(function(results) {
-        var ready   = results.filter(function(r) { return r.data.ok; });
-        var pending = results.filter(function(r) { return !r.data.ok && !r.data.error; });
-        var failed  = results.filter(function(r) { return !r.data.ok && r.data.error; });
-
-        // Check if all resolved (ready + failed, no more pending)
-        if (pending.length === 0 || ready.length + failed.length === batchesToFetch.length) {
-          document.getElementById('comparison-loading').style.display = 'none';
-          if (ready.length === 0) {
-            var emptyEl = document.getElementById('comparison-empty');
-            emptyEl.innerHTML = '<div style="font-size:2rem;margin-bottom:10px;">⚠️</div>' +
-              '<div style="color:#ef4444;">Could not load data: ' +
-              failed.map(function(r) { return '<strong>' + r.batchName + '</strong> (' + (r.data.error || 'not found') + ')'; }).join(', ') + '</div>';
-            emptyEl.style.display = 'block';
-          } else {
-            document.getElementById('comparison-results').style.display = 'block';
-            renderBatchComparison(ready.map(function(r) { r.data.BatchName = r.batchName; return r.data; }));
-            loadBatchTrend(selectedBatches);
-          }
-        } else {
-          // Some still pending — wait and retry
-          setTimeout(pollAll, 1000);
-        }
-      });
-    }
-
-    // Small initial delay to give main loop time to process the command
-    setTimeout(pollAll, 800);
+    setTimeout(function() { pollUntilReady(30000); }, 800);
   })
   .catch(function(err) {
-    document.getElementById('comparison-loading').style.display = 'none';
-    var emptyEl = document.getElementById('comparison-empty');
-    emptyEl.innerHTML = '<div style="font-size:2rem;margin-bottom:10px;">⚠️</div>' +
-      '<div style="color:#ef4444;">Failed to request batch data: ' + err + '</div>';
-    emptyEl.style.display = 'block';
+    showError('Failed to request batch data: ' + err);
   });
 }
 
@@ -7606,11 +7747,33 @@ $(if($ListenerPort -gt 0){
       <div class='watch-sec'>Status Filter</div>
       <select class='watch-inp' id='wStatusFilter' onchange='applyStatusFilter()'>
         <option value=''>All Statuses</option>
-        <option value='InProgress'>In Progress</option>
+        <option value='AutoSuspended'>AutoSuspended</option>
+        <option value='InProgress'>InProgress</option>
+        <option value='Suspended'>Suspended</option>
         <option value='Completed'>Completed</option>
+        <option value='CompletedWithWarning'>CompletedWithWarning</option>
+        <option value='CompletedWithWarnings'>CompletedWithWarnings</option>
+        <option value='CompletedWithSkippedItems'>CompletedWithSkippedItems</option>
+        <option value='Completing'>Completing</option>
+        <option value='CompletionFailed'>CompletionFailed</option>
+        <option value='CompletionInProgress'>CompletionInProgress</option>
+        <option value='CompletionSynced'>CompletionSynced</option>
+        <option value='Corrupted'>Corrupted</option>
         <option value='Failed'>Failed</option>
-        <option value='Synced'>Synced</option>
+        <option value='IncrementalFailed'>IncrementalFailed</option>
+        <option value='IncrementalStopped'>IncrementalStopped</option>
+        <option value='IncrementalSynced'>IncrementalSynced</option>
+        <option value='IncrementalSyncing'>IncrementalSyncing</option>
+        <option value='Provisioning'>Provisioning</option>
+        <option value='ProvisionUpdating'>ProvisionUpdating</option>
         <option value='Queued'>Queued</option>
+        <option value='Removing'>Removing</option>
+        <option value='Starting'>Starting</option>
+        <option value='Stopped'>Stopped</option>
+        <option value='Stopping'>Stopping</option>
+        <option value='Synced'>Synced</option>
+        <option value='Syncing'>Syncing</option>
+        <option value='Validating'>Validating</option>
       </select>
     </div>
 
@@ -8311,7 +8474,9 @@ function apiCall(endpoint, method, body) {
     listItems       : [],     // cached move request list
     lastFetchTime   : 0,      // ms timestamp of last successful list load (0 = never)
     pollTimer       : null,
-    layoutReady     : false
+    layoutReady     : false,
+    uiRestored      : false,
+    selectToken     : 0
   };
 
   function mrsClamp(val, min, max) {
@@ -8337,6 +8502,48 @@ function apiCall(endpoint, method, body) {
 
   function mrsSaveLayout(layout) {
     try { localStorage.setItem('mrsExplorerLayoutV1', JSON.stringify(layout)); } catch (_) {}
+  }
+
+  function mrsLoadUiState() {
+    var defaults = { search: '', status: 'All', currentAlias: null, currentProp: null, treeExpanded: {} };
+    try {
+      var raw = localStorage.getItem('mrsExplorerUiStateV1');
+      if (!raw) return defaults;
+      var parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return defaults;
+      return {
+        search: parsed.search || '',
+        status: parsed.status || 'All',
+        currentAlias: parsed.currentAlias || null,
+        currentProp: parsed.currentProp || null,
+        treeExpanded: parsed.treeExpanded && typeof parsed.treeExpanded === 'object' ? parsed.treeExpanded : {}
+      };
+    } catch (_) {
+      return defaults;
+    }
+  }
+
+  function mrsSaveUiState() {
+    try {
+      localStorage.setItem('mrsExplorerUiStateV1', JSON.stringify({
+        search: (document.getElementById('mrs-search') || {}).value || '',
+        status: (document.getElementById('mrs-status-filter') || {}).value || 'All',
+        currentAlias: mrsState.currentAlias || null,
+        currentProp: mrsState.currentProp || null,
+        treeExpanded: mrsState.treeExpanded || {}
+      }));
+    } catch (_) {}
+  }
+
+  function mrsRestoreUiState() {
+    var st = mrsLoadUiState();
+    var search = document.getElementById('mrs-search');
+    var status = document.getElementById('mrs-status-filter');
+    if (search) search.value = st.search || '';
+    if (status) status.value = st.status || 'All';
+    mrsState.currentAlias = st.currentAlias || null;
+    mrsState.currentProp = st.currentProp || null;
+    mrsState.treeExpanded = st.treeExpanded && typeof st.treeExpanded === 'object' ? st.treeExpanded : {};
   }
 
   function mrsInitResizableLayout() {
@@ -8447,16 +8654,25 @@ function apiCall(endpoint, method, body) {
     console.log('[MRS] tab activated. lastFetchTime=', mrsState.lastFetchTime,
       'stale=', mrsState.lastFetchTime ? Math.round((Date.now() - mrsState.lastFetchTime)/1000) + 's' : 'never');
     mrsInitResizableLayout();
+    if (!mrsState.uiRestored) {
+      mrsRestoreUiState();
+      mrsState.uiRestored = true;
+    }
     if (!mrsState.currentStats && !mrsState.currentAlias) {
       mrsShowDetailArea(false);
       mrsSetNodePath('');
     }
     mrsUpdateSessionBadge();
-    // Auto-load if never loaded or stale (> 5 minutes)
-    var FIVE_MIN = 5 * 60 * 1000;
-    if (!mrsState.lastFetchTime || (Date.now() - mrsState.lastFetchTime) > FIVE_MIN) {
-      mrsFetchList();
-    }
+    mrsLoadListFromCache(function(info) {
+      var hasCache = info && info.hasCache;
+      var hasItems = info && info.items && info.items.length > 0;
+      if (mrsState.currentAlias && hasCache) {
+        mrsSelectMailbox(mrsState.currentAlias, { preferCache: true, preserveSelection: true, cacheOnly: true });
+      } else if (!hasCache && !hasItems) {
+        // First-time UX: fetch from EXO only when server cache is empty.
+        mrsFetchList();
+      }
+    });
   }
   window.mrsOnTabActivate = mrsOnTabActivate;
 
@@ -8481,8 +8697,26 @@ function apiCall(endpoint, method, body) {
   }
 
   // ── Fetch move request list ─────────────────────────────────────
+  function mrsLoadListFromCache(done) {
+    var search = encodeURIComponent((document.getElementById('mrs-search') || {}).value || '');
+    var status = encodeURIComponent((document.getElementById('mrs-status-filter') || {}).value || 'All');
+    var url = '/api/mrs/move-requests?search=' + search + '&status=' + status;
+    apiCall(url, 'GET', null).then(function(resp) {
+      var items = (resp && Array.isArray(resp.items)) ? resp.items : [];
+      if (items.length > 0 || (resp && resp.cacheTime)) {
+        mrsState.listItems = items;
+        mrsRenderList(items);
+      }
+      if (done) done({ hasCache: !!(resp && resp.cacheTime), items: items });
+    }).catch(function(err) {
+      console.warn('[MRS] mrsLoadListFromCache error:', err);
+      if (done) done({ hasCache: false, items: [] });
+    });
+  }
+
   function mrsFetchList() {
     console.log('[MRS] mrsFetchList called');
+    mrsSaveUiState();
     var tbody = document.getElementById('mrs-move-request-tbody');
     tbody.innerHTML = '<tr><td colspan="3" style="padding:16px;text-align:center;color:#94a3b8">Loading…</td></tr>';
     var pollSince = Date.now();
@@ -8519,6 +8753,7 @@ function apiCall(endpoint, method, body) {
       mrsState.listItems = resp.items || [];
       console.log('[MRS] mrsPollList: resolved', mrsState.listItems.length, 'items');
       mrsRenderList(mrsState.listItems);
+      mrsSaveUiState();
     }).catch(function(err) {
       console.error('[MRS] mrsPollList error:', err);
       setTimeout(function() { mrsPollList(startTime, pollSince); }, 2000);
@@ -8531,6 +8766,7 @@ function apiCall(endpoint, method, body) {
   function mrsResetList() {
     document.getElementById('mrs-search').value = '';
     document.getElementById('mrs-status-filter').value = 'All';
+    mrsSaveUiState();
     mrsApplyFilter();
   }
   window.mrsResetList = mrsResetList;
@@ -8572,6 +8808,7 @@ function apiCall(endpoint, method, body) {
 
   // ── Apply filter to already-cached list (no EXO re-fetch) ──────
   function mrsApplyFilter() {
+    mrsSaveUiState();
     var search = encodeURIComponent(document.getElementById('mrs-search').value || '');
     var status = encodeURIComponent(document.getElementById('mrs-status-filter').value || 'All');
     apiCall('/api/mrs/move-requests?search=' + search + '&status=' + status, 'GET', null).then(function(resp) {
@@ -8583,37 +8820,50 @@ function apiCall(endpoint, method, body) {
   window.mrsApplyFilter = mrsApplyFilter;
 
   // ── Select a mailbox and fetch statistics ───────────────────────
-  function mrsSelectMailbox(alias) {
-    console.log('[MRS] mrsSelectMailbox:', alias);
-    // Highlight selected row
-    document.querySelectorAll('#mrs-move-request-tbody tr').forEach(function(r){
-      r.style.background = '';
-    });
-    var row = document.getElementById('mrs-row-' + String(alias || '').replace(/[^A-Za-z0-9_.-]/g, '_'));
-    if (row) row.style.background = '#eff6ff';
-
-    mrsState.currentAlias = alias;
-    mrsState.currentProp = null;
-    mrsState.treeExpanded = {};
-    mrsSetImportLabel(alias);
-
-    // Show detail area immediately with a loading state so the breadcrumb is visible
-    mrsShowDetailArea(true);
-    var detailTextLoading = document.getElementById('mrs-entry-detail');
-    if (detailTextLoading) {
-      detailTextLoading.textContent = 'Panel D - Entry Detail\nLoading mailbox statistics...';
+  function mrsResolvePropertyValue(root, propPath) {
+    if (!root || !propPath) return { found: false, value: undefined };
+    var val = root;
+    var parts = String(propPath).split('.');
+    for (var i = 0; i < parts.length; i++) {
+      if (val === null || val === undefined || typeof val !== 'object' || !Object.prototype.hasOwnProperty.call(val, parts[i])) {
+        return { found: false, value: undefined };
+      }
+      val = val[parts[i]];
     }
-    document.getElementById('mrs-property-tree').innerHTML =
-      '<li style="padding:12px 10px;color:#94a3b8;font-size:.8rem">Fetching statistics…</li>';
-    mrsSetNodePath(alias + ' > contacting server…');
+    return { found: true, value: val };
+  }
 
-    var pollSince = Date.now() - 2000;  // 2 s tolerance for clock skew between client and server
+  function mrsRenderMailboxStats(alias, data, preserveSelection) {
+    mrsState.currentStats = data || null;
+    mrsShowDetailArea(true);
+    mrsRenderPropertyTree(mrsState.currentStats || {});
+    mrsSetNodePath(alias || '');
+    if (preserveSelection && mrsState.currentProp) {
+      var resolved = mrsResolvePropertyValue(mrsState.currentStats, mrsState.currentProp);
+      if (resolved.found) {
+        mrsSelectProperty(mrsState.currentProp);
+      } else {
+        mrsState.currentProp = null;
+      }
+    }
+    if (!mrsState.currentProp) {
+      document.getElementById('mrs-report-viewer').style.display = 'none';
+      document.getElementById('mrs-center-content').innerHTML =
+        '<span style="color:#94a3b8;font-style:italic">Select a property in Panel B to view value details.</span>';
+      mrsShowEntryDetail('');
+    }
+    mrsSaveUiState();
+  }
+
+  function mrsQueueStatsRefresh(alias, selectToken, preserveSelection) {
+    var pollSince = Date.now() - 2000; // 2 s tolerance for clock skew between client and server
     console.log('[MRS] posting fetch-statistics for', alias, 'pollSince=', pollSince);
     apiCall('/api/mrs/fetch-statistics', 'POST', { alias: alias }).then(function(resp) {
+      if (selectToken !== mrsState.selectToken || alias !== mrsState.currentAlias) return;
       console.log('[MRS] fetch-statistics response:', resp);
       if (resp && resp.status === 'queued') {
-        mrsSetNodePath(alias + ' > queued, waiting for data…');
-        mrsPollStats(alias, Date.now(), pollSince);
+        mrsSetNodePath(alias + ' > queued, waiting for data.');
+        mrsPollStats(alias, Date.now(), pollSince, selectToken, preserveSelection);
       } else {
         var errMsg = (resp && resp.error) ? resp.error : 'unexpected server response';
         console.warn('[MRS] fetch-statistics unexpected response:', resp);
@@ -8621,54 +8871,125 @@ function apiCall(endpoint, method, body) {
         mrsSetImportLabel('Error: ' + errMsg);
       }
     }).catch(function(err) {
+      if (selectToken !== mrsState.selectToken || alias !== mrsState.currentAlias) return;
       console.error('[MRS] fetch-statistics network error:', err);
       mrsSetNodePath(alias + ' > Error: could not contact server');
       mrsSetImportLabel('Error: could not contact server');
     });
   }
+
+  function mrsSelectMailbox(alias, options) {
+    options = options || {};
+    var preferCache = options.preferCache !== false;
+    var forceRefresh = !!options.forceRefresh;
+    var preserveSelection = !!options.preserveSelection;
+    var cacheOnly = !!options.cacheOnly;
+    var selectToken = ++mrsState.selectToken;
+    console.log('[MRS] mrsSelectMailbox:', alias, 'forceRefresh=', forceRefresh, 'preferCache=', preferCache, 'cacheOnly=', cacheOnly);
+    // Highlight selected row
+    document.querySelectorAll('#mrs-move-request-tbody tr').forEach(function(r) {
+      r.style.background = '';
+    });
+    var row = document.getElementById('mrs-row-' + String(alias || '').replace(/[^A-Za-z0-9_.-]/g, '_'));
+    if (row) row.style.background = '#eff6ff';
+
+    mrsState.currentAlias = alias;
+    if (!preserveSelection) {
+      mrsState.currentProp = null;
+      mrsState.treeExpanded = {};
+    }
+    mrsSetImportLabel(alias);
+    mrsSaveUiState();
+
+    // Show detail area immediately with a loading state so the breadcrumb is visible.
+    mrsShowDetailArea(true);
+    var detailTextLoading = document.getElementById('mrs-entry-detail');
+    if (detailTextLoading) {
+      detailTextLoading.textContent = 'Panel D - Entry Detail\nLoading mailbox statistics...';
+    }
+    document.getElementById('mrs-property-tree').innerHTML =
+      '<li style="padding:12px 10px;color:#94a3b8;font-size:.8rem">Fetching statistics.</li>';
+    mrsSetNodePath(alias + ' > contacting server.');
+
+    if (!forceRefresh && preferCache) {
+      apiCall('/api/mrs/statistics?alias=' + encodeURIComponent(alias), 'GET', null).then(function(resp) {
+        if (selectToken !== mrsState.selectToken || alias !== mrsState.currentAlias) return;
+        if (resp && resp.ok && resp.data) {
+          console.log('[MRS] cache hit for', alias, '- rendering cached statistics');
+          mrsRenderMailboxStats(alias, resp.data, preserveSelection);
+          return;
+        }
+        if (cacheOnly) {
+          mrsSetNodePath(alias + ' > No cached statistics. Click "Refresh Selected" to fetch.');
+          document.getElementById('mrs-property-tree').innerHTML =
+            '<li style="padding:12px 10px;color:#94a3b8;font-size:.8rem">No cached statistics for this mailbox.</li>';
+          mrsShowEntryDetail('Panel D - Entry Detail\nNo cached statistics were found. Click Refresh Selected to fetch fresh data.');
+          return;
+        }
+        mrsQueueStatsRefresh(alias, selectToken, preserveSelection);
+      }).catch(function(err) {
+        if (selectToken !== mrsState.selectToken || alias !== mrsState.currentAlias) return;
+        if (cacheOnly) {
+          mrsSetNodePath(alias + ' > Cache check failed. Click "Refresh Selected" to fetch.');
+          return;
+        }
+        console.warn('[MRS] cache read failed for', alias, '- falling back to refresh:', err);
+        mrsQueueStatsRefresh(alias, selectToken, preserveSelection);
+      });
+      return;
+    }
+
+    mrsQueueStatsRefresh(alias, selectToken, preserveSelection);
+  }
   window.mrsSelectMailbox = mrsSelectMailbox;
 
-  function mrsPollStats(alias, startTime, pollSince) {
+  function mrsRefreshSelectedMailbox() {
+    if (!mrsState.currentAlias) return;
+    mrsSelectMailbox(mrsState.currentAlias, { forceRefresh: true, preserveSelection: true });
+  }
+  window.mrsRefreshSelectedMailbox = mrsRefreshSelectedMailbox;
+
+  function mrsPollStats(alias, startTime, pollSince, selectToken, preserveSelection) {
+    if (selectToken !== mrsState.selectToken || alias !== mrsState.currentAlias) return;
     if (Date.now() - startTime > 180000) {
       console.warn('[MRS] mrsPollStats timed out for', alias);
       mrsSetNodePath(alias + ' > Error: timed out waiting for statistics');
-      mrsSetImportLabel('Timed out — try clicking again');
+      mrsSetImportLabel('Timed out - try clicking again');
       return;
     }
     apiCall('/api/mrs/statistics?alias=' + encodeURIComponent(alias), 'GET', null).then(function(resp) {
+      if (selectToken !== mrsState.selectToken || alias !== mrsState.currentAlias) return;
       var cacheMs = resp && resp.cacheTime ? new Date(resp.cacheTime).getTime() : 0;
       console.log('[MRS] poll stats:', alias, '| ok=', resp && resp.ok, '| cacheTime=', resp && resp.cacheTime,
         '| cacheMs=', cacheMs, '| pollSince=', pollSince, '| diff=', cacheMs - pollSince,
         '| dataKeys=', resp && resp.data ? Object.keys(resp.data) : 'none',
         '| error=', resp && resp.error, '| availableKeys=', resp && resp.availableKeys);
       if (!resp || !resp.ok) {
-        mrsSetNodePath(alias + ' > waiting for server cache…');
-        setTimeout(function() { mrsPollStats(alias, startTime, pollSince); }, 1500);
+        mrsSetNodePath(alias + ' > waiting for server cache.');
+        setTimeout(function() { mrsPollStats(alias, startTime, pollSince, selectToken, preserveSelection); }, 1500);
         return;
       }
       if (cacheMs < pollSince) {
-        mrsSetNodePath(alias + ' > waiting for fresh data… (' + Math.round((pollSince - cacheMs)/1000) + 's stale)');
-        setTimeout(function() { mrsPollStats(alias, startTime, pollSince); }, 1500);
+        mrsSetNodePath(alias + ' > waiting for fresh data. (' + Math.round((pollSince - cacheMs) / 1000) + 's stale)');
+        setTimeout(function() { mrsPollStats(alias, startTime, pollSince, selectToken, preserveSelection); }, 1500);
         return;
       }
-      console.log('[MRS] poll stats success for', alias, '— rendering property tree');
-      mrsState.currentStats = resp.data;
+      console.log('[MRS] poll stats success for', alias, '- rendering property tree');
       try {
-        mrsRenderPropertyTree(resp.data);
-        mrsSetNodePath(alias);
+        mrsRenderMailboxStats(alias, resp.data, preserveSelection);
         console.log('[MRS] render complete for', alias);
-      } catch(e) {
+      } catch (e) {
         console.error('[MRS] mrsRenderPropertyTree threw:', e);
         mrsSetNodePath(alias + ' > Render error: ' + (e && e.message ? e.message : String(e)));
-        mrsSetImportLabel('Render error — check breadcrumb');
+        mrsSetImportLabel('Render error - check breadcrumb');
       }
     }).catch(function(err) {
+      if (selectToken !== mrsState.selectToken || alias !== mrsState.currentAlias) return;
       console.error('[MRS] mrsPollStats network error:', err);
-      mrsSetNodePath(alias + ' > network error, retrying…');
-      setTimeout(function() { mrsPollStats(alias, startTime, pollSince); }, 2000);
+      mrsSetNodePath(alias + ' > network error, retrying.');
+      setTimeout(function() { mrsPollStats(alias, startTime, pollSince, selectToken, preserveSelection); }, 2000);
     });
   }
-
   // ── Show/hide detail area ───────────────────────────────────────
   function mrsShowDetailArea(show) {
     console.log('[MRS] mrsShowDetailArea:', show);
@@ -8775,6 +9096,7 @@ function apiCall(endpoint, method, body) {
   function mrsToggleTreeNode(propPath) {
     if (!propPath) return;
     mrsState.treeExpanded[propPath] = !mrsState.treeExpanded[propPath];
+    mrsSaveUiState();
     if (mrsState.currentStats) mrsRenderPropertyTree(mrsState.currentStats);
   }
   window.mrsToggleTreeNode = mrsToggleTreeNode;
@@ -9002,6 +9324,7 @@ function apiCall(endpoint, method, body) {
   function mrsSelectProperty(prop) {
     if (!mrsState.currentStats) return;
     mrsState.currentProp = prop;
+    mrsSaveUiState();
     document.querySelectorAll('.mrs-tree-item').forEach(function(li){ li.style.background = ''; });
     var item = null;
     document.querySelectorAll('.mrs-tree-item').forEach(function(li) {
@@ -9258,6 +9581,7 @@ function apiCall(endpoint, method, body) {
       mrsState.currentStats = resp.data;
       mrsState.currentProp = null;
       mrsState.treeExpanded = {};
+      mrsSaveUiState();
       mrsSetImportLabel(filename);
       mrsShowDetailArea(true);
       mrsRenderPropertyTree(resp.data);
@@ -10165,7 +10489,17 @@ function Invoke-MigrationReport {
     param(
         # Live mode — filtering
         [Parameter(ParameterSetName = "Live")]
-        [ValidateSet("All","Queued","InProgress","AutoSuspended","CompletedWithWarning","Completed","Failed")]
+        [ValidateSet(
+            "All",
+            "AutoSuspended","InProgress","Suspended",
+            "Completed","CompletedWithWarning","CompletedWithWarnings","CompletedWithSkippedItems","Completing","CompletionFailed","CompletionInProgress","CompletionSynced",
+            "Corrupted","Failed",
+            "IncrementalFailed","IncrementalStopped","IncrementalSynced","IncrementalSyncing",
+            "Provisioning","ProvisionUpdating",
+            "Queued","Removing",
+            "Starting","Stopped","Stopping",
+            "Synced","Syncing","Validating"
+        )]
         [string]$StatusFilter = "All",
 
         [Parameter(ParameterSetName = "Live")]
