@@ -3927,7 +3927,7 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     flex:1;
     min-height:0;
     overflow-y:auto;
-    overflow-x:hidden;
+    overflow-x:auto;
     display:flex;
     flex-direction:column;
   }
@@ -3952,8 +3952,12 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     background:transparent;
     padding:12px;
     min-height:90px;
+    overflow-x:auto;
+    overflow-y:auto;
+    white-space:nowrap;
   }
   #mrs-report-viewer { padding:8px 12px 12px; }
+  .mrs-collection-item { white-space:nowrap; }
   #mrs-entry-detail {
     flex:1;
     min-height:0;
@@ -8744,7 +8748,17 @@ function apiCall(endpoint, method, body) {
         dtKey = k;
       }
     });
-    if (dtKey) return String(obj[dtKey]);
+    if (dtKey) {
+      // Only treat as scalar when this looks like a wrapper object.
+      // Avoid collapsing rich objects like Report.Entries rows.
+      var nonWrapperKeys = keys.filter(function(k) {
+        var lk = String(k).toLowerCase();
+        var isDateLike = /date|time|timestamp/.test(lk);
+        var isMeta = lk === 'value' || lk === 'type' || lk === 'kind' || lk === 'offset' || lk === 'timezone';
+        return !isDateLike && !isMeta;
+      });
+      if (nonWrapperKeys.length === 0) return String(obj[dtKey]);
+    }
 
     return null;
   }
@@ -8855,21 +8869,31 @@ function apiCall(endpoint, method, body) {
       if (!o || typeof o !== 'object') return '';
       var scalar = mrsScalarFromObject(o);
       if (scalar !== null) return scalar;
+      function textVal(v) {
+        if (v === null || v === undefined) return '';
+        if (typeof v === 'object') {
+          var s = mrsScalarFromObject(v);
+          if (s !== null) return String(s);
+          if (v.__Text) return String(v.__Text);
+          try { return JSON.stringify(v); } catch (_) { return ''; }
+        }
+        return String(v);
+      }
 
       var ts = '';
       var lvl = '';
       var typ = '';
       var msg = '';
-      if (o.CreationTime !== undefined) ts = fmtDateLike(o.CreationTime);
-      else if (o.Timestamp !== undefined) ts = fmtDateLike(o.Timestamp);
-      else if (o.TimeStamp !== undefined) ts = fmtDateLike(o.TimeStamp);
-      if (o.Level !== undefined) lvl = String(o.Level || '');
-      else if (o.EntryLevel !== undefined) lvl = String(o.EntryLevel || '');
-      if (o.Type !== undefined) typ = String(o.Type || '');
-      else if (o.EntryType !== undefined) typ = String(o.EntryType || '');
-      if (o.Message !== undefined) msg = String(o.Message || '');
-      else if (o.Error !== undefined) msg = String(o.Error || '');
-      else if (o.Failure !== undefined) msg = String(o.Failure || '');
+      if (o.CreationTime !== undefined) ts = fmtDateLike(textVal(o.CreationTime));
+      else if (o.Timestamp !== undefined) ts = fmtDateLike(textVal(o.Timestamp));
+      else if (o.TimeStamp !== undefined) ts = fmtDateLike(textVal(o.TimeStamp));
+      if (o.Level !== undefined) lvl = textVal(o.Level);
+      else if (o.EntryLevel !== undefined) lvl = textVal(o.EntryLevel);
+      if (o.Type !== undefined) typ = textVal(o.Type);
+      else if (o.EntryType !== undefined) typ = textVal(o.EntryType);
+      if (o.Message !== undefined) msg = textVal(o.Message);
+      else if (o.Error !== undefined) msg = textVal(o.Error);
+      else if (o.Failure !== undefined) msg = textVal(o.Failure);
       if (ts || lvl || typ || msg) {
         var parts = [];
         if (ts) parts.push(ts);
@@ -8934,7 +8958,7 @@ function apiCall(endpoint, method, body) {
     } else if (typeof val === 'number') {
       content.innerHTML = '<div style="font-size:1.4rem;font-weight:600;color:#1e293b">' + val + '</div>';
     } else {
-      content.innerHTML = '<div style="font-size:1rem;color:#1e293b;word-break:break-word">' + String(val).replace(/</g,'&lt;') + '</div>';
+      content.innerHTML = '<div style="font-size:1rem;color:#1e293b;white-space:nowrap">' + String(val).replace(/</g,'&lt;') + '</div>';
     }
     mrsShowEntryDetail(mrsDetailTextForValue(val));
   }
@@ -8963,11 +8987,11 @@ function apiCall(endpoint, method, body) {
       mrsShowEntryDetail('');
       return;
     }
-    var html = '<div style="font-size:.78rem;color:#475569;margin-bottom:6px">' + propName + ' (' + items.length + ' items)</div>';
+    var html = '<div style="font-size:.78rem;color:#475569;margin-bottom:6px;white-space:nowrap">' + propName + ' (' + items.length + ' items)</div>';
     html += items.map(function(v, i) {
       return '<div class="mrs-collection-item" data-index="' + i + '" ' +
              'onclick="mrsSelectCollectionItem(' + i + ')" ' +
-             'style="padding:4px 8px;cursor:pointer;border-bottom:1px solid #f1f5f9;font-size:.76rem;font-family:monospace">' +
+             'style="padding:4px 8px;cursor:pointer;border-bottom:1px solid #f1f5f9;font-size:.76rem;font-family:monospace;white-space:nowrap">' +
              '<span style="color:#94a3b8;margin-right:8px">[' + i + ']</span>' + mrsPreviewTextForValue(v) + '</div>';
     }).join('');
     content.innerHTML = html;
@@ -9029,7 +9053,20 @@ function apiCall(endpoint, method, body) {
     if (!entry || typeof entry !== 'object') return '';
     for (var i = 0; i < names.length; i++) {
       var key = names[i];
-      if (entry[key] !== undefined && entry[key] !== null && String(entry[key]).length) return String(entry[key]);
+      if (entry[key] === undefined || entry[key] === null) continue;
+      var val = entry[key];
+      if (typeof val === 'object') {
+        var scalar = mrsScalarFromObject(val);
+        if (scalar !== null && String(scalar).length) return String(scalar);
+        if (val.__Text && String(val.__Text).length) return String(val.__Text);
+        try {
+          var js = JSON.stringify(val);
+          if (js && js !== '{}' && js !== '[]') return js;
+        } catch (_) {}
+      } else {
+        var str = String(val);
+        if (str.length) return str;
+      }
     }
     return '';
   }
