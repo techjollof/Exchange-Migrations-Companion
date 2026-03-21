@@ -1094,14 +1094,16 @@ function Invoke-BatchStatsRefresh {
 function ConvertTo-MRSStatisticsJson {
     param([Parameter(Mandatory)] $Stats)
 
-    # Serialize any value to a JSON-safe type. Max recursion depth = 3.
+    $maxDepth = 6
+
+    # Serialize any value to a JSON-safe type.
     function SafeVal {
         param($v, [int]$D)
         if ($null -eq $v)    { return $null }
-        if ($D -gt 3)        { return "$v" }
+        if ($D -gt $maxDepth) { return "$v" }
         if ($v -is [bool])   { return $v }
         if ($v -is [byte[]]) { return "<binary: $($v.Length) bytes>" }
-        if ($v -is [int32] -or $v -is [int64] -or $v -is [double] -or $v -is [single]) { return $v }
+        if ($v -is [int16] -or $v -is [int32] -or $v -is [int64] -or $v -is [decimal] -or $v -is [double] -or $v -is [single]) { return $v }
         if ($v -is [string]) { return $v }
         $tn = $v.GetType().FullName
         if ($tn -match 'DateTime|ExDateTime') {
@@ -1111,57 +1113,86 @@ function ConvertTo-MRSStatisticsJson {
         if ($v -is [System.Guid])     { return $v.ToString() }
         if ($v -is [System.Enum])     { return $v.ToString() }
         if ($tn -match 'ByteQuantifiedSize|Unlimited|SmtpAddress|ProxyAddress') { return "$v" }
-        # Collections (not strings or byte arrays)
-        if (-not ($v -is [string]) -and -not ($v -is [byte[]]) -and
-            ($v -is [System.Collections.IList] -or ($v -is [System.Array]))) {
-            $cap = if ($v.Count -gt 5000) { 5000 } else { $v.Count }
-            $arr = [System.Collections.ArrayList]@()
-            for ($i = 0; $i -lt $cap; $i++) {
-                try   { [void]$arr.Add((SafeVal $v[$i] ($D + 1))) }
-                catch { [void]$arr.Add("$($v[$i])") }
+
+        # Dictionary-like objects
+        if ($v -is [System.Collections.IDictionary]) {
+            $dict = [ordered]@{}
+            foreach ($k in @($v.Keys | Sort-Object)) {
+                try   { $dict["$k"] = SafeVal $v[$k] ($D + 1) }
+                catch { $dict["$k"] = $null }
             }
-            if ($v.Count -gt 5000) { [void]$arr.Insert(0, "<truncated: first 5000 of $($v.Count) items>") }
+            return $dict
+        }
+
+        # Collections (not strings/byte[]/dictionary)
+        if (-not ($v -is [string]) -and -not ($v -is [byte[]]) -and
+            -not ($v -is [System.Collections.IDictionary]) -and
+            ($v -is [System.Collections.IEnumerable])) {
+            $arr = [System.Collections.ArrayList]@()
+            $cap = 5000
+            $i = 0
+            $truncated = $false
+            foreach ($item in $v) {
+                if ($i -ge $cap) { $truncated = $true; break }
+                try   { [void]$arr.Add((SafeVal $item ($D + 1))) }
+                catch { [void]$arr.Add("$item") }
+                $i++
+            }
+            if ($truncated) { [void]$arr.Insert(0, "<truncated: first $cap items>") }
             return @($arr)
         }
-        # Object — expand via Get-Member
+
+        # Object - expand via Get-Member
         try {
             $members = @($v | Get-Member -MemberType Properties -ErrorAction SilentlyContinue |
-                         Where-Object { $_.Name -ne 'Length' })
-            if ($members.Count -gt 0 -and $members.Count -le 200) {
+                         Where-Object { $_.Name -ne 'Length' } | Sort-Object Name)
+            if ($members.Count -gt 0 -and $members.Count -le 400) {
                 $nested = [ordered]@{}
                 foreach ($m in $members) {
                     try   { $nested[$m.Name] = SafeVal $v.$($m.Name) ($D + 1) }
                     catch { $nested[$m.Name] = $null }
                 }
+                try {
+                    $txt = (($v | Out-String -Width 4096) -replace '\s+$','')
+                    if ($txt) { $nested['__Text'] = $txt }
+                } catch {}
                 return $nested
             }
         } catch {}
         return "$v"
     }
 
-    # Report.Entries — structured rows with clean schema + summary counts
+    # Report.Entries - keep full entry data for parity with WinForms explorer
     function SafeEntries {
         param($col)
         $result = [System.Collections.ArrayList]@()
         $failC = 0; $warnC = 0
-        if ($col) {
-            foreach ($e in $col) {
+        foreach ($e in @($col)) {
+            try {
+                $entry = [ordered]@{}
+                $entryMembers = @($e | Get-Member -MemberType Properties -ErrorAction SilentlyContinue |
+                                  Where-Object { $_.Name -ne 'Length' } | Sort-Object Name)
+                if ($entryMembers.Count -gt 0) {
+                    foreach ($m in $entryMembers) {
+                        try   { $entry[$m.Name] = SafeVal $e.$($m.Name) 1 }
+                        catch { $entry[$m.Name] = $null }
+                    }
+                } else {
+                    $entry['Value'] = SafeVal $e 1
+                }
+
                 try {
-                    $lvl    = "$($e.Level)"
-                    $msgRaw = "$($e.Message)"
-                    $msg    = if ($msgRaw.Length -gt 2000) { $msgRaw.Substring(0,2000) + '...' } else { $msgRaw }
-                    $ct     = if ($e.CreationTime) { try { $e.CreationTime.ToUniversalTime().ToString('o') } catch { "$($e.CreationTime)" } } else { $null }
-                    [void]$result.Add([ordered]@{
-                        CreationTime = $ct
-                        Level        = $lvl
-                        Type         = "$($e.Type)"
-                        Message      = $msg
-                        Duration     = "$($e.Duration)"
-                    })
-                    if ($lvl -eq 'Error' -or $lvl -eq 'Failure') { $failC++ }
-                    elseif ($lvl -eq 'Warning') { $warnC++ }
+                    $txt = (($e | Out-String -Width 4096) -replace '\s+$','')
+                    if ($txt) { $entry['__Text'] = $txt }
                 } catch {}
-            }
+
+                $lvl = ''
+                if ($entry.Contains('Level') -and $null -ne $entry['Level']) { $lvl = "$($entry['Level'])" }
+                if ($lvl -eq 'Error' -or $lvl -eq 'Failure') { $failC++ }
+                elseif ($lvl -eq 'Warning') { $warnC++ }
+
+                [void]$result.Add($entry)
+            } catch {}
         }
         return @{ entries = @($result); failC = $failC; warnC = $warnC }
     }
@@ -1201,7 +1232,7 @@ function ConvertTo-MRSStatisticsJson {
             $obj[$p.Name] = $null
         }
     }
-    return $obj | ConvertTo-Json -Depth 8 -Compress
+    return $obj | ConvertTo-Json -Depth 12 -Compress
 }
 
 function Invoke-MRSMoveRequestRefresh {
@@ -3841,7 +3872,7 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
   .mrs-center-pane {
     min-width:260px;
     flex:1;
-    overflow-y:auto;
+    overflow:hidden;
     padding:0;
     display:flex;
     flex-direction:column;
@@ -3892,7 +3923,29 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     transform:translateX(-50%);
     background:#94a3b8;
   }
-  #mrs-entry-detail-panel { position:relative; padding-top:12px !important; }
+  #mrs-panel-c-scroll {
+    flex:1;
+    min-height:0;
+    overflow-y:auto;
+    overflow-x:hidden;
+    display:flex;
+    flex-direction:column;
+  }
+  #mrs-entry-detail-panel {
+    position:relative;
+    padding-top:12px !important;
+    display:flex;
+    flex-direction:column;
+    overflow:hidden !important;
+  }
+  #mrs-detail-head {
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    margin-bottom:4px;
+    background:#f8fafc;
+    flex:0 0 auto;
+  }
   #mrs-center-content {
     border:none;
     border-radius:0;
@@ -3901,6 +3954,12 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     min-height:90px;
   }
   #mrs-report-viewer { padding:8px 12px 12px; }
+  #mrs-entry-detail {
+    flex:1;
+    min-height:0;
+    overflow-y:auto;
+    overflow-x:hidden;
+  }
   .mrs-pane-head {
     display:flex;
     align-items:center;
@@ -4669,8 +4728,9 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
                 <span class="mrs-pane-tag">Panel C</span>
                 <span class="mrs-pane-name">Value / Report Viewer</span>
               </div>
+              <div id="mrs-panel-c-scroll">
               <div id="mrs-center-label" style="display:none;font-size:.78rem;font-weight:600;color:#475569"></div>
-              <div id="mrs-center-content" style="flex:1"><span style="color:#94a3b8;font-style:italic">No mailbox selected. Select a mailbox in Panel A.</span></div>
+              <div id="mrs-center-content"><span style="color:#94a3b8;font-style:italic">No mailbox selected. Select a mailbox in Panel A.</span></div>
               <!-- Report entries log viewer (hidden by default) -->
               <div id="mrs-report-viewer" style="display:none">
                 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
@@ -4679,6 +4739,7 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
                     <option>Info</option>
                     <option>Warning</option>
                     <option>Error</option>
+                    <option>Failure</option>
                   </select>
                   <select id="mrs-entries-type-filter" style="padding:4px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:.78rem" onchange="mrsFilterEntries()">
                     <option value="All">All Types</option>
@@ -4704,10 +4765,11 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
                 </div>
                 <div id="mrs-entries-count" style="font-size:.72rem;color:#64748b;margin-top:6px"></div>
               </div>
+              </div>
               <!-- Panel D now lives inside Panel C -->
-              <div id="mrs-entry-detail-panel" style="display:none;margin-top:0;border:none;border-top:1px solid #e2e8f0;border-radius:0;background:#f8fafc;padding:8px 12px;height:160px;overflow-y:auto">
+              <div id="mrs-entry-detail-panel" style="display:none;margin-top:0;border:none;border-top:1px solid #e2e8f0;border-radius:0;background:#f8fafc;padding:8px 12px;height:160px;">
                 <div id="mrs-detail-resizer" class="mrs-splitter mrs-splitter-h" title="Drag to resize detail pane"></div>
-                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+                <div id="mrs-detail-head">
                   <div style="display:flex;align-items:center;gap:8px">
                     <span class="mrs-pane-tag">Panel D</span>
                     <div style="font-size:.72rem;font-weight:600;color:#475569">Entry Detail</div>
@@ -8235,8 +8297,13 @@ function apiCall(endpoint, method, body) {
   var mrsState = {
     currentAlias    : null,   // alias or 'imported:filename' key of selected item
     currentStats    : null,   // parsed JSON stats object
+    currentProp     : null,   // selected property path in Panel B tree
     allEntries      : [],     // full Report.Entries array for current selection
     filteredEntries : [],     // entries after filter
+    filteredEntryIndexes : [],// source indexes for filtered report entries
+    collectionItems : [],     // current Panel C collection/list values
+    collectionProp  : '',     // currently selected property path for Panel C
+    treeExpanded    : {},     // expanded object nodes in Panel B tree
     listItems       : [],     // cached move request list
     lastFetchTime   : 0,      // ms timestamp of last successful list load (0 = never)
     pollTimer       : null,
@@ -8522,6 +8589,8 @@ function apiCall(endpoint, method, body) {
     if (row) row.style.background = '#eff6ff';
 
     mrsState.currentAlias = alias;
+    mrsState.currentProp = null;
+    mrsState.treeExpanded = {};
     mrsSetImportLabel(alias);
 
     // Show detail area immediately with a loading state so the breadcrumb is visible
@@ -8636,79 +8705,122 @@ function apiCall(endpoint, method, body) {
     document.getElementById('mrs-node-path').textContent = path || '';
   }
 
+  function mrsTreeKeys(obj) {
+    return Object.keys(obj || {})
+      .filter(function(k) { return k !== '__Text' && k !== 'TotalEntries' && k !== 'FailureCount' && k !== 'WarningCount'; });
+  }
+
+  // Treat common deserialized wrappers as scalar values (avoid useless collapse/JSON noise).
+  function mrsScalarFromObject(obj) {
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
+    var keys = mrsTreeKeys(obj);
+    if (obj.__Text && keys.length === 0) return String(obj.__Text).trim();
+
+    if (Object.prototype.hasOwnProperty.call(obj, 'Value') &&
+        (obj.Value === null || typeof obj.Value !== 'object')) {
+      return String(obj.Value);
+    }
+    if (Object.prototype.hasOwnProperty.call(obj, 'value') &&
+        (obj.value === null || typeof obj.value !== 'object')) {
+      return String(obj.value);
+    }
+
+    if (keys.length === 1) {
+      var only = keys[0];
+      var onlyLower = String(only).toLowerCase();
+      var onlyVal = obj[only];
+      if (onlyVal === null || typeof onlyVal !== 'object') {
+        if (onlyLower === 'value' || onlyLower === 'datetime' || onlyLower === 'timestamp' ||
+            onlyLower.indexOf('date') !== -1 || onlyLower.indexOf('time') !== -1) {
+          return String(onlyVal);
+        }
+      }
+    }
+
+    var dtKey = null;
+    keys.forEach(function(k) {
+      if (!dtKey && /date|time|timestamp/i.test(k) &&
+          (obj[k] === null || typeof obj[k] !== 'object')) {
+        dtKey = k;
+      }
+    });
+    if (dtKey) return String(obj[dtKey]);
+
+    return null;
+  }
+
+  function mrsIsScalarLikeObject(obj) {
+    return mrsScalarFromObject(obj) !== null;
+  }
+
   // Keep panel scaffolding visible even before first mailbox selection.
   mrsShowDetailArea(false);
   mrsSetNodePath('');
 
   // ── Property tree ────────────────────────────────────────────────
+  function mrsToggleTreeNode(propPath) {
+    if (!propPath) return;
+    mrsState.treeExpanded[propPath] = !mrsState.treeExpanded[propPath];
+    if (mrsState.currentStats) mrsRenderPropertyTree(mrsState.currentStats);
+  }
+  window.mrsToggleTreeNode = mrsToggleTreeNode;
+
   function mrsRenderPropertyTree(stats) {
     console.log('[MRS] mrsRenderPropertyTree called. stats type=', typeof stats,
       'keys=', stats ? Object.keys(stats).length : 'null/undefined');
     var ul = document.getElementById('mrs-property-tree');
     if (!ul) { console.error('[MRS] mrs-property-tree element not found!'); return; }
-    var html = '';
-    // All top-level properties (Report handled separately at bottom)
-    Object.keys(stats).forEach(function(prop) {
-      if (prop === 'Report') return;
-      var val = stats[prop];
-      var display;
-      if (val === null || val === undefined || val === '') {
-        display = '—';
-      } else if (Array.isArray(val)) {
-        display = '[' + val.length + ' items]';
-      } else if (typeof val === 'object') {
-        display = '{…}';
-      } else {
-        var s = String(val);
-        display = s.length > 30 ? s.substring(0,30) + '…' : s;
-      }
-      var safeDisplay = display.replace(/</g,'&lt;');
-      var safeTitle   = String(val !== null && val !== undefined ? val : '').replace(/</g,'&lt;').replace(/"/g,'&quot;');
-      var propEnc     = encodeURIComponent(prop);
-      html += '<li class="mrs-tree-item" data-prop="' + prop + '"' +
-              ' onclick="mrsSelectProperty(decodeURIComponent(\'' + propEnc + '\'))"' +
-              ' style="padding:4px 10px 4px 16px;cursor:pointer;border-bottom:1px solid #f1f5f9;font-size:.76rem;display:flex;justify-content:space-between;gap:4px">' +
-              '<span style="color:#334155;font-weight:500">' + prop + '</span>' +
-              '<span style="color:#64748b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:110px" title="' + safeTitle + '">' + safeDisplay + '</span>' +
-              '</li>';
-    });
-    // Report section
-    var rpt = stats.Report || {};
-    var rptLabel = 'Report Entries (' + (rpt.TotalEntries || 0) + ' total, ' + (rpt.WarningCount || 0) + ' warnings, ' + (rpt.FailureCount || 0) + ' errors)';
-    html += '<li style="padding:4px 10px 2px;font-size:.7rem;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;user-select:none">— Report —</li>';
-    html += '<li onclick="mrsOpenReportEntries()" style="padding:6px 10px 6px 16px;cursor:pointer;font-size:.76rem;color:#3b82f6;font-weight:600">' + rptLabel + '</li>';
-    // Report sub-properties (everything except the virtual summary keys and Entries array)
-    var _rptSkip = { Entries: 1, TotalEntries: 1, FailureCount: 1, WarningCount: 1 };
-    if (stats.Report) {
-      Object.keys(stats.Report).forEach(function(rk) {
-        if (_rptSkip[rk]) return;
-        var val = stats.Report[rk];
-        var display;
-        if (val === null || val === undefined || val === '') {
-          display = '—';
-        } else if (Array.isArray(val)) {
-          display = '[' + val.length + ' items]';
-        } else if (typeof val === 'object') {
-          display = '{…}';
-        } else {
-          var s = String(val);
-          display = s.length > 30 ? s.substring(0,30) + '…' : s;
+
+    function esc(s) {
+      return String(s === null || s === undefined ? '' : s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    function buildNodes(obj, parentPath, depth) {
+      return mrsTreeKeys(obj).sort().map(function(key) {
+        var path = parentPath ? (parentPath + '.' + key) : key;
+        var val = obj[key];
+        var scalarLike = mrsIsScalarLikeObject(val);
+        var isObjectNode = val && typeof val === 'object' && !Array.isArray(val) && !scalarLike;
+        var hasChildren = isObjectNode && mrsTreeKeys(val).length > 0;
+        var expanded = !!mrsState.treeExpanded[path];
+        var pathEnc = encodeURIComponent(path);
+        var pad = 8 + (depth * 14);
+        var toggle = hasChildren
+          ? '<button type="button" onclick="mrsToggleTreeNode(decodeURIComponent(\'' + pathEnc + '\'));event.stopPropagation();" ' +
+            'style="border:none;background:transparent;cursor:pointer;color:#64748b;width:16px;padding:0 2px">' + (expanded ? '-' : '+') + '</button>'
+          : '<span style="display:inline-block;width:16px"></span>';
+
+        var row = '<div class="mrs-tree-item" data-prop="' + esc(path) + '" ' +
+                  'onclick="mrsSelectProperty(decodeURIComponent(\'' + pathEnc + '\'))" ' +
+                  'style="padding:4px 10px 4px ' + pad + 'px;cursor:pointer;border-bottom:1px solid #f1f5f9;font-size:.76rem;display:flex;align-items:center;gap:6px">' +
+                  toggle + '<span style="color:#334155;font-weight:500">' + esc(key) + '</span></div>';
+
+        if (hasChildren && expanded) {
+          row += '<ul style="list-style:none;margin:0;padding:0">' + buildNodes(val, path, depth + 1) + '</ul>';
         }
-        var safeDisplay = display.replace(/</g,'&lt;');
-        var reportPath  = 'Report.' + rk;
-        var reportEnc   = encodeURIComponent(reportPath);
-        html += '<li class="mrs-tree-item" data-prop="Report.' + rk + '"' +
-                ' onclick="mrsSelectProperty(decodeURIComponent(\'' + reportEnc + '\'))"' +
-                ' style="padding:4px 10px 4px 22px;cursor:pointer;border-bottom:1px solid #f1f5f9;font-size:.76rem;display:flex;justify-content:space-between;gap:4px">' +
-                '<span style="color:#475569">' + rk + '</span>' +
-                '<span style="color:#64748b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:110px">' + safeDisplay + '</span>' +
-                '</li>';
-      });
+        return '<li style="margin:0;padding:0">' + row + '</li>';
+      }).join('');
+    }
+
+    var html = buildNodes(stats || {}, '', 0);
+    if (!html) {
+      ul.innerHTML = '<li style="padding:12px 10px;color:#94a3b8;font-size:.8rem">No properties found.</li>';
+      return;
     }
     ul.innerHTML = html;
-  }
 
-  // ── Import label (current data source display) ───────────────────
+    if (mrsState.currentProp) {
+      var active = null;
+      ul.querySelectorAll('.mrs-tree-item').forEach(function(node) {
+        if (!active && node.getAttribute('data-prop') === mrsState.currentProp) active = node;
+      });
+      if (active) active.style.background = '#eff6ff';
+    }
+  }
   function mrsSetImportLabel(text) {
     var el = document.getElementById('mrs-import-label');
     if (!el) return;
@@ -8717,23 +8829,135 @@ function apiCall(endpoint, method, body) {
   }
 
   // ── Select a property and show its value ─────────────────────────
+  function mrsDetailTextForValue(v) {
+    if (v === null || v === undefined) return '';
+    if (typeof v === 'string') return v;
+    if (typeof v === 'object') {
+      var scalar = mrsScalarFromObject(v);
+      if (scalar !== null) return scalar;
+      if (v.__Text) return String(v.__Text);
+      try { return JSON.stringify(v, null, 2); } catch (_) { return String(v); }
+    }
+    return String(v);
+  }
+
+  function mrsPreviewTextForValue(v) {
+    var text = '';
+    function fmtDateLike(val) {
+      if (val === null || val === undefined || val === '') return '';
+      try {
+        var d = new Date(val);
+        if (!isNaN(d.getTime())) return d.toLocaleString();
+      } catch (_) {}
+      return String(val);
+    }
+    function describeObjectRow(o) {
+      if (!o || typeof o !== 'object') return '';
+      var scalar = mrsScalarFromObject(o);
+      if (scalar !== null) return scalar;
+
+      var ts = '';
+      var lvl = '';
+      var typ = '';
+      var msg = '';
+      if (o.CreationTime !== undefined) ts = fmtDateLike(o.CreationTime);
+      else if (o.Timestamp !== undefined) ts = fmtDateLike(o.Timestamp);
+      else if (o.TimeStamp !== undefined) ts = fmtDateLike(o.TimeStamp);
+      if (o.Level !== undefined) lvl = String(o.Level || '');
+      else if (o.EntryLevel !== undefined) lvl = String(o.EntryLevel || '');
+      if (o.Type !== undefined) typ = String(o.Type || '');
+      else if (o.EntryType !== undefined) typ = String(o.EntryType || '');
+      if (o.Message !== undefined) msg = String(o.Message || '');
+      else if (o.Error !== undefined) msg = String(o.Error || '');
+      else if (o.Failure !== undefined) msg = String(o.Failure || '');
+      if (ts || lvl || typ || msg) {
+        var parts = [];
+        if (ts) parts.push(ts);
+        if (lvl) parts.push('[' + lvl + ']');
+        if (typ) parts.push(typ);
+        if (msg) parts.push(msg);
+        return parts.join(' | ');
+      }
+
+      var keys = mrsTreeKeys(o).sort();
+      var parts2 = [];
+      for (var i = 0; i < keys.length && parts2.length < 4; i++) {
+        var k = keys[i];
+        var val = o[k];
+        if (val === null || val === undefined || val === '') continue;
+        if (typeof val === 'object') {
+          if (Array.isArray(val)) {
+            parts2.push(k + '[' + val.length + ']');
+          } else {
+            var nestedScalar = mrsScalarFromObject(val);
+            if (nestedScalar !== null) parts2.push(k + '=' + nestedScalar);
+          }
+        } else {
+          var sv = /date|time|timestamp/i.test(k) ? fmtDateLike(val) : String(val);
+          parts2.push(k + '=' + sv);
+        }
+      }
+      if (parts2.length > 0) return parts2.join(' | ');
+      if (o.__Text) return String(o.__Text).split('\n')[0];
+      try { return JSON.stringify(o); } catch (_) { return '[object with ' + mrsTreeKeys(o).length + ' fields]'; }
+    }
+
+    if (v === null || v === undefined) {
+      text = '(null)';
+    } else if (typeof v === 'object') {
+      text = describeObjectRow(v);
+    } else {
+      var sv = String(v);
+      if (/^\d{4}-\d{2}-\d{2}/.test(sv) || /^\d{1,2}\/\d{1,2}\/\d{4}/.test(sv)) {
+        text = fmtDateLike(sv);
+      } else {
+        text = sv;
+      }
+    }
+    return text.replace(/</g,'&lt;');
+  }
+
+  function mrsSplitScalarValue(val) {
+    if (val === null || val === undefined) return [];
+    var raw = String(val);
+    var parts = raw.split(';').map(function(s) { return s.trim(); }).filter(function(s) { return s.length > 0; });
+    return parts.length > 1 ? parts : [raw];
+  }
+
   function renderMRSScalar(propName, val) {
     var content = document.getElementById('mrs-center-content');
     document.getElementById('mrs-report-viewer').style.display = 'none';
+    mrsState.collectionItems = [];
+    mrsState.collectionProp = '';
     if (val === null || val === undefined || val === '') {
-      content.innerHTML = '<span style="color:#94a3b8;font-style:italic">— not set —</span>';
+      content.innerHTML = '<span style="color:#94a3b8;font-style:italic">- not set -</span>';
     } else if (typeof val === 'number') {
       content.innerHTML = '<div style="font-size:1.4rem;font-weight:600;color:#1e293b">' + val + '</div>';
     } else {
       content.innerHTML = '<div style="font-size:1rem;color:#1e293b;word-break:break-word">' + String(val).replace(/</g,'&lt;') + '</div>';
     }
-    mrsShowEntryDetail(String(val !== null && val !== undefined ? val : ''));
+    mrsShowEntryDetail(mrsDetailTextForValue(val));
   }
   window.renderMRSScalar = renderMRSScalar;
+
+  function mrsSelectCollectionItem(idx) {
+    if (!mrsState.collectionItems || idx < 0 || idx >= mrsState.collectionItems.length) return;
+    document.querySelectorAll('.mrs-collection-item').forEach(function(el) { el.style.background = ''; });
+    var selected = document.querySelector('.mrs-collection-item[data-index="' + idx + '"]');
+    if (selected) selected.style.background = '#eff6ff';
+    var item = mrsState.collectionItems[idx];
+    var path = mrsState.collectionProp || '';
+    if (mrsState.collectionItems.length > 1) path += '[' + idx + ']';
+    mrsSetNodePath((mrsState.currentAlias || '') + ' > ' + path);
+    mrsShowEntryDetail(mrsDetailTextForValue(item));
+  }
+  window.mrsSelectCollectionItem = mrsSelectCollectionItem;
 
   function renderMRSCollection(propName, items) {
     var content = document.getElementById('mrs-center-content');
     document.getElementById('mrs-report-viewer').style.display = 'none';
+    mrsState.collectionItems = Array.isArray(items) ? items : [];
+    mrsState.collectionProp = propName || '';
     if (!items || items.length === 0) {
       content.innerHTML = '<span style="color:#94a3b8;font-style:italic">(empty collection)</span>';
       mrsShowEntryDetail('');
@@ -8741,30 +8965,24 @@ function apiCall(endpoint, method, body) {
     }
     var html = '<div style="font-size:.78rem;color:#475569;margin-bottom:6px">' + propName + ' (' + items.length + ' items)</div>';
     html += items.map(function(v, i) {
-      var fullText = (v === null || v === undefined) ? '' :
-                     (typeof v === 'object' ? JSON.stringify(v, null, 2) : String(v));
-      var displayStr = (v === null || v === undefined) ? '(null)' :
-                       (typeof v === 'object' ? JSON.stringify(v) : String(v));
-      if (displayStr.length > 120) displayStr = displayStr.substring(0, 120) + '…';
-      var safeDisplay = displayStr.replace(/</g,'&lt;');
       return '<div class="mrs-collection-item" data-index="' + i + '" ' +
-             'onclick="mrsShowEntryDetail(' + JSON.stringify(fullText) + ')" ' +
+             'onclick="mrsSelectCollectionItem(' + i + ')" ' +
              'style="padding:4px 8px;cursor:pointer;border-bottom:1px solid #f1f5f9;font-size:.76rem;font-family:monospace">' +
-             '<span style="color:#94a3b8;margin-right:8px">[' + i + ']</span>' + safeDisplay + '</div>';
+             '<span style="color:#94a3b8;margin-right:8px">[' + i + ']</span>' + mrsPreviewTextForValue(v) + '</div>';
     }).join('');
     content.innerHTML = html;
-    var first = items[0];
-    mrsShowEntryDetail(
-      (first === null || first === undefined) ? '' :
-      (typeof first === 'object' ? JSON.stringify(first, null, 2) : String(first))
-    );
+    mrsSelectCollectionItem(0);
   }
   window.renderMRSCollection = renderMRSCollection;
 
   function mrsSelectProperty(prop) {
     if (!mrsState.currentStats) return;
+    mrsState.currentProp = prop;
     document.querySelectorAll('.mrs-tree-item').forEach(function(li){ li.style.background = ''; });
-    var item = document.querySelector('.mrs-tree-item[data-prop="' + prop + '"]');
+    var item = null;
+    document.querySelectorAll('.mrs-tree-item').forEach(function(li) {
+      if (!item && li.getAttribute('data-prop') === prop) item = li;
+    });
     if (item) item.style.background = '#eff6ff';
 
     // Resolve dotted path (e.g. "Report.BadItemReport")
@@ -8775,25 +8993,29 @@ function apiCall(endpoint, method, body) {
 
     if (Array.isArray(val)) {
       renderMRSCollection(prop, val);
-    } else if (val !== null && val !== undefined && typeof val === 'object') {
-      // Expand object: show each key as a "key: value" string entry
-      var items = Object.keys(val).map(function(k) {
-        var v = val[k];
-        return k + ': ' + (v === null ? 'null' : (typeof v === 'object' ? JSON.stringify(v) : String(v)));
-      });
-      renderMRSCollection(prop, items);
-    } else {
-      renderMRSScalar(prop, val);
+      return;
     }
+    if (val !== null && val !== undefined && typeof val === 'object') {
+      var scalarObjVal = mrsScalarFromObject(val);
+      if (scalarObjVal !== null) {
+        renderMRSCollection(prop, mrsSplitScalarValue(scalarObjVal));
+        return;
+      }
+      // WinForms parity: object values behave as a single selectable entry.
+      renderMRSCollection(prop, [val]);
+      return;
+    }
+    renderMRSCollection(prop, mrsSplitScalarValue(val));
   }
   window.mrsSelectProperty = mrsSelectProperty;
 
-  // ── Entry detail panel ───────────────────────────────────────────
+  // ДД Entry detail panel ДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДД
   function mrsShowEntryDetail(text) {
     var panel = document.getElementById('mrs-entry-detail-panel');
     var pre   = document.getElementById('mrs-entry-detail');
-    pre.textContent = text;
-    panel.style.display = text ? '' : 'none';
+    var val = (text === null || text === undefined) ? '' : String(text);
+    pre.textContent = val.length ? val : 'Panel D - Entry Detail\nSelect a property or report row to populate this panel.';
+    panel.style.display = '';
   }
 
   function mrsCopyDetail() {
@@ -8802,7 +9024,22 @@ function apiCall(endpoint, method, body) {
   }
   window.mrsCopyDetail = mrsCopyDetail;
 
-  // ── Report Entries log viewer ────────────────────────────────────
+  // ДД Report Entries log viewer ДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДДД
+  function mrsEntryField(entry, names) {
+    if (!entry || typeof entry !== 'object') return '';
+    for (var i = 0; i < names.length; i++) {
+      var key = names[i];
+      if (entry[key] !== undefined && entry[key] !== null && String(entry[key]).length) return String(entry[key]);
+    }
+    return '';
+  }
+
+  function mrsEntryLevel(entry) { return mrsEntryField(entry, ['Level', 'EntryLevel']); }
+  function mrsEntryType(entry) { return mrsEntryField(entry, ['Type', 'EntryType', 'Category']); }
+  function mrsEntryMessage(entry) { return mrsEntryField(entry, ['Message', 'Error', 'Failure', '__Text']); }
+  function mrsEntryTime(entry) { return mrsEntryField(entry, ['CreationTime', 'Timestamp', 'TimeStamp']); }
+  function mrsEntryDuration(entry) { return mrsEntryField(entry, ['Duration']); }
+
   function mrsOpenReportEntries() {
     if (!mrsState.currentStats || !mrsState.currentStats.Report) return;
     mrsState.allEntries = mrsState.currentStats.Report.Entries || [];
@@ -8811,7 +9048,8 @@ function apiCall(endpoint, method, body) {
     var typeFilter = document.getElementById('mrs-entries-type-filter');
     var types = ['All'];
     mrsState.allEntries.forEach(function(e) {
-      if (e.Type && types.indexOf(e.Type) === -1) types.push(e.Type);
+      var type = mrsEntryType(e);
+      if (type && types.indexOf(type) === -1) types.push(type);
     });
     typeFilter.innerHTML = types.map(function(t) {
       return '<option value="' + t + '">' + t + '</option>';
@@ -8821,7 +9059,7 @@ function apiCall(endpoint, method, body) {
     document.getElementById('mrs-entries-search').value = '';
     document.getElementById('mrs-center-content').innerHTML = '';
     document.getElementById('mrs-report-viewer').style.display = '';
-    document.getElementById('mrs-entry-detail-panel').style.display = 'none';
+    mrsShowEntryDetail('Panel D - Entry Detail\nSelect a report row to view full entry detail.');
     mrsSetNodePath(mrsState.currentAlias + ' > Report > Entries');
     mrsFilterEntries();
   }
@@ -8831,27 +9069,42 @@ function apiCall(endpoint, method, body) {
     var lvlF  = document.getElementById('mrs-entries-level-filter').value;
     var typF  = document.getElementById('mrs-entries-type-filter').value;
     var srch  = (document.getElementById('mrs-entries-search').value || '').toLowerCase();
-    var filtered = mrsState.allEntries.filter(function(e) {
-      if (lvlF !== 'All' && e.Level !== lvlF) return false;
-      if (typF !== 'All' && e.Type  !== typF) return false;
-      if (srch && (e.Message || '').toLowerCase().indexOf(srch) === -1) return false;
-      return true;
+    var filtered = [];
+    var indexes = [];
+    mrsState.allEntries.forEach(function(e, idx) {
+      var lvl = mrsEntryLevel(e);
+      var typ = mrsEntryType(e);
+      var msg = mrsEntryMessage(e).toLowerCase();
+      if (lvlF !== 'All' && lvl !== lvlF) return;
+      if (typF !== 'All' && typ !== typF) return;
+      if (srch && msg.indexOf(srch) === -1) return;
+      filtered.push(e);
+      indexes.push(idx);
     });
     mrsState.filteredEntries = filtered;
+    mrsState.filteredEntryIndexes = indexes;
     var tbody = document.getElementById('mrs-entries-tbody');
     var html = filtered.map(function(e, idx) {
-      var col = mrsLevelColor(e.Level);
-      var badge = '<span style="background:' + col + ';color:#fff;padding:1px 6px;border-radius:8px;font-size:.68rem">' + (e.Level || '') + '</span>';
-      var ts  = e.CreationTime ? new Date(e.CreationTime).toLocaleString() : '';
-      var typ = ((e.Type || '').length > 22 ? (e.Type).substring(0,22) + '…' : (e.Type || ''));
-      var msg = ((e.Message || '').length > 80 ? (e.Message).substring(0,80) + '…' : (e.Message || '')).replace(/</g,'&lt;');
-      var dur = e.Duration || '';
+      var level = mrsEntryLevel(e);
+      var type = mrsEntryType(e);
+      var message = mrsEntryMessage(e);
+      var tsRaw = mrsEntryTime(e);
+      var duration = mrsEntryDuration(e);
+      var col = mrsLevelColor(level);
+      var badge = '<span style="background:' + col + ';color:#fff;padding:1px 6px;border-radius:8px;font-size:.68rem">' + (level || '') + '</span>';
+      var ts = '';
+      if (tsRaw) {
+        var dt = new Date(tsRaw);
+        ts = isNaN(dt.getTime()) ? tsRaw : dt.toLocaleString();
+      }
+      var typ = (type.length > 22 ? type.substring(0,22) + '.' : type);
+      var msg = (message.length > 80 ? message.substring(0,80) + '.' : message).replace(/</g,'&lt;');
       return '<tr style="cursor:pointer;border-bottom:1px solid #f1f5f9" onclick="mrsSelectEntry(' + idx + ')">' +
              '<td style="padding:4px 8px;font-size:.72rem;white-space:nowrap">' + ts + '</td>' +
              '<td style="padding:4px 8px">' + badge + '</td>' +
-             '<td style="padding:4px 8px;font-size:.72rem" title="' + (e.Type||'').replace(/"/g,'') + '">' + typ + '</td>' +
+             '<td style="padding:4px 8px;font-size:.72rem" title="' + type.replace(/"/g,'') + '">' + typ + '</td>' +
              '<td style="padding:4px 8px;font-size:.72rem">' + msg + '</td>' +
-             '<td style="padding:4px 8px;font-size:.72rem;white-space:nowrap">' + dur + '</td>' +
+             '<td style="padding:4px 8px;font-size:.72rem;white-space:nowrap">' + duration + '</td>' +
              '</tr>';
     }).join('');
     tbody.innerHTML = html || '<tr><td colspan="5" style="padding:16px;text-align:center;color:#94a3b8">No entries match filters</td></tr>';
@@ -8862,22 +9115,19 @@ function apiCall(endpoint, method, body) {
   function mrsSelectEntry(idx) {
     var entry = mrsState.filteredEntries[idx];
     if (!entry) return;
-    var detail = 'Timestamp: ' + (entry.CreationTime || '') + '\n' +
-                 'Level:     ' + (entry.Level || '') + '\n' +
-                 'Type:      ' + (entry.Type  || '') + '\n' +
-                 'Duration:  ' + (entry.Duration || '') + '\n' +
-                 '\n' + (entry.Message || '');
-    mrsShowEntryDetail(detail);
-    mrsSetNodePath(mrsState.currentAlias + ' > Report > Entries[' + idx + ']');
+    var originalIndex = (mrsState.filteredEntryIndexes && mrsState.filteredEntryIndexes[idx] !== undefined)
+      ? mrsState.filteredEntryIndexes[idx]
+      : idx;
+    mrsShowEntryDetail(mrsDetailTextForValue(entry));
+    mrsSetNodePath(mrsState.currentAlias + ' > Report > Entries[' + originalIndex + ']');
   }
   window.mrsSelectEntry = mrsSelectEntry;
-
   // ── Export entries as CSV ────────────────────────────────────────
   function mrsExportEntriesCsv() {
     var rows = [['Timestamp','Level','Type','Message','Duration']];
     mrsState.filteredEntries.forEach(function(e) {
       function q(v) { v = String(v || ''); return v.indexOf(',') !== -1 || v.indexOf('"') !== -1 ? '"' + v.replace(/"/g,'""') + '"' : v; }
-      rows.push([q(e.CreationTime), q(e.Level), q(e.Type), q(e.Message), q(e.Duration)]);
+      rows.push([q(mrsEntryTime(e)), q(mrsEntryLevel(e)), q(mrsEntryType(e)), q(mrsEntryMessage(e)), q(mrsEntryDuration(e))]);
     });
     var csv = rows.map(function(r){ return r.join(','); }).join('\r\n');
     var blob = new Blob([csv], { type: 'text/csv' });
@@ -8969,6 +9219,8 @@ function apiCall(endpoint, method, body) {
       // Auto-select the imported entry
       mrsState.currentAlias = key;
       mrsState.currentStats = resp.data;
+      mrsState.currentProp = null;
+      mrsState.treeExpanded = {};
       mrsSetImportLabel(filename);
       mrsShowDetailArea(true);
       mrsRenderPropertyTree(resp.data);
@@ -9666,7 +9918,7 @@ function Start-WatchListener {
                                 $timeStr = if ($cacheTimeVal) { "`"$cacheTimeVal`"" } else { 'null' }
                                 $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"ok`":true,`"cacheTime`":$timeStr,`"data`":$innerJson}")
                             } elseif ($alias) {
-                                $ctx.Response.StatusCode = 404
+                                # Keep pending polls as normal JSON responses (avoid noisy browser 404 errors).
                                 $mrsKeys = ($State.Keys | Where-Object { $_ -like 'MRSStatsJson_*' }) -join ','
                                 $safeAlias = $alias -replace '"',"'"
                                 $safeKeys  = $mrsKeys -replace '"',"'"
