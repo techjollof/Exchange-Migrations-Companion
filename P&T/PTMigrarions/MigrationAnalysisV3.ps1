@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Analyzes Exchange mailbox migration move requests and generates detailed reports.
+    Analyzes Exchange mailbox migration St and generates detailed reports.
 
 .DESCRIPTION
     Collects move request statistics from Exchange Online (live mode) or a previously
@@ -1282,24 +1282,166 @@ function Resolve-MRSIdentity {
     return $Alias
 }
 
+function Get-MRSProfileSignatureHash {
+    param([string]$ProfileSignature)
+    if ([string]::IsNullOrWhiteSpace($ProfileSignature)) { return 'default' }
+    try {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($ProfileSignature)
+            $hashBytes = $sha.ComputeHash($bytes)
+            $hex = [System.BitConverter]::ToString($hashBytes).Replace('-', '').ToLowerInvariant()
+            if ($hex.Length -gt 16) { return $hex.Substring(0, 16) }
+            return $hex
+        } finally {
+            $sha.Dispose()
+        }
+    } catch {
+        return ($ProfileSignature -replace '[^A-Za-z0-9]','_')
+    }
+}
+
+function Get-MRSStatsCacheKeys {
+    param(
+        [Parameter(Mandatory)][string]$Alias,
+        [string]$ProfileSignature
+    )
+    $aliasKey = "$Alias"
+    $legacyJsonKey = "MRSStatsJson_$aliasKey"
+    $legacyTimeKey = "MRSStatsTime_$aliasKey"
+    $sigHash = Get-MRSProfileSignatureHash -ProfileSignature $ProfileSignature
+    return @{
+        JsonKey        = "MRSStatsJson_${aliasKey}__$sigHash"
+        TimeKey        = "MRSStatsTime_${aliasKey}__$sigHash"
+        LegacyJsonKey  = $legacyJsonKey
+        LegacyTimeKey  = $legacyTimeKey
+        SignatureHash  = $sigHash
+    }
+}
+
+function ConvertTo-MRSProfileMap {
+    param([object]$InputObject)
+    $out = @{}
+    if ($null -eq $InputObject) { return $out }
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        foreach ($k in @($InputObject.Keys)) {
+            try { $out["$k"] = $InputObject[$k] } catch {}
+        }
+        return $out
+    }
+    foreach ($p in @($InputObject.PSObject.Properties)) {
+        try { $out["$($p.Name)"] = $p.Value } catch {}
+    }
+    return $out
+}
+
 function Invoke-MRSStatisticsRefresh {
     param(
         [Parameter(Mandatory)][hashtable]$WatchState,
-        [Parameter(Mandatory)][string]$Alias
+        [Parameter(Mandatory)][string]$Alias,
+        [object]$CommandProfile,
+        [string]$ProfileSignature
     )
     try {
-        # Imported XML entries are already in the cache — no EXO call needed.
+        # Imported XML entries are already in the cache - no EXO call needed.
         if ($Alias -like 'imported:*') {
-            Write-Console "MRSStatisticsRefresh: '$Alias' is an imported entry, skipping EXO fetch." -Level Info -NoTimestamp
+            $keys = Get-MRSStatsCacheKeys -Alias $Alias -ProfileSignature $ProfileSignature
+            $legacyJson = $WatchState[$keys.LegacyJsonKey]
+            if ($legacyJson) {
+                $nowUtc = (Get-Date).ToUniversalTime().ToString('o')
+                $WatchState[$keys.JsonKey] = $legacyJson
+                $WatchState[$keys.TimeKey] = $nowUtc
+                if (-not $WatchState[$keys.LegacyTimeKey]) { $WatchState[$keys.LegacyTimeKey] = $nowUtc }
+                Write-Console "MRSStatisticsRefresh: '$Alias' is imported; refreshed cache timestamp only (profile=$($keys.SignatureHash))." -Level Info -NoTimestamp
+            } else {
+                Write-Console "MRSStatisticsRefresh: '$Alias' imported entry not found in cache." -Level Warn -NoTimestamp
+            }
             return
         }
-        $identity = Resolve-MRSIdentity -WatchState $WatchState -Alias $Alias
-        $stats = Get-MoveRequestStatistics $identity -IncludeReport
-        if ($null -eq $stats) { throw "Get-MoveRequestStatistics returned null for '$Alias'" }
+
+        $profile = ConvertTo-MRSProfileMap -InputObject $CommandProfile
+        $command = "$($profile['command'])".Trim()
+        if ([string]::IsNullOrWhiteSpace($command)) { $command = 'Get-MoveRequestStatistics' }
+        $envKey = if ("$($profile['environment'])".Trim().ToLowerInvariant() -eq 'onprem') { 'onprem' } else { 'exo' }
+        $identityOverride = "$($profile['identity'])".Trim()
+
+        $supportedSwitches = @{
+            'Get-MoveRequestStatistics'   = @{ exo = @('IncludeReport','Analysis','DiagnosticOnly','ReportOnly'); onprem = @('IncludeReport','Diagnostic','ReportOnly') }
+            'Get-MigrationUserStatistics' = @{ exo = @('IncludeReport','IncludeSkippedItems','IncludeCopilotReport','SkipSubscription'); onprem = @('IncludeReport','IncludeSkippedItems','SkipSubscription','Diagnostic') }
+            'Get-MigrationStatistics'     = @{ exo = @(); onprem = @('Diagnostic') }
+            'Get-SyncRequestStatistics'   = @{ exo = @('IncludeReport'); onprem = @('IncludeReport') }
+        }
+        $supportedValues = @{
+            'Get-MoveRequestStatistics'   = @{ exo = @('DiagnosticInfo','ProxyToMailbox'); onprem = @('DiagnosticArgument','DomainController') }
+            'Get-MigrationUserStatistics' = @{ exo = @('DiagnosticInfo','LimitSkippedItemsTo','Partition'); onprem = @('DiagnosticArgument','LimitSkippedItemsTo','DomainController') }
+            'Get-MigrationStatistics'     = @{ exo = @('DiagnosticInfo','Partition'); onprem = @('DiagnosticArgument','DomainController') }
+            'Get-SyncRequestStatistics'   = @{ exo = @('DiagnosticInfo'); onprem = @() }
+        }
+
+        if (-not $supportedSwitches.ContainsKey($command)) {
+            throw "Unsupported statistics cmdlet '$command'"
+        }
+
+        $commandSupportsIdentity = @{
+            'Get-MoveRequestStatistics'   = $true
+            'Get-MigrationUserStatistics' = $true
+            'Get-MigrationStatistics'     = $false
+            'Get-SyncRequestStatistics'   = $true
+        }
+        $identity = if ($identityOverride) { $identityOverride } else { Resolve-MRSIdentity -WatchState $WatchState -Alias $Alias }
+        $invokeParams = @{}
+        if ($identity -and $commandSupportsIdentity[$command]) { $invokeParams['Identity'] = $identity }
+
+        $switchMap = ConvertTo-MRSProfileMap -InputObject $profile['switches']
+        $valueMap  = ConvertTo-MRSProfileMap -InputObject $profile['values']
+        if (-not $switchMap.ContainsKey('IncludeReport')) { $switchMap['IncludeReport'] = $true }
+
+        $allowedSwitches = @($supportedSwitches[$command][$envKey])
+        foreach ($name in $allowedSwitches) {
+            if ($switchMap.ContainsKey($name) -and [bool]$switchMap[$name]) {
+                $invokeParams[$name] = $true
+            }
+        }
+        if ($allowedSwitches -contains 'IncludeReport' -and -not $invokeParams.ContainsKey('IncludeReport')) {
+            $invokeParams['IncludeReport'] = $true
+        }
+
+        $allowedValues = @($supportedValues[$command][$envKey])
+        foreach ($name in $allowedValues) {
+            if (-not $valueMap.ContainsKey($name)) { continue }
+            $raw = "$($valueMap[$name])".Trim()
+            if ([string]::IsNullOrWhiteSpace($raw)) { continue }
+            if ($name -eq 'LimitSkippedItemsTo') {
+                $n = 0
+                if ([int]::TryParse($raw, [ref]$n) -and $n -ge 0) {
+                    $invokeParams[$name] = $n
+                }
+            } else {
+                $invokeParams[$name] = $raw
+            }
+        }
+
+        Write-Console "MRSStatisticsRefresh: $command for '$Alias' (env=$envKey sig=$(Get-MRSProfileSignatureHash -ProfileSignature $ProfileSignature))." -Level Info -NoTimestamp
+        $stats = & $command @invokeParams
+        if ($stats -is [System.Collections.IEnumerable] -and $stats -isnot [string]) {
+            $arr = @($stats)
+            if ($arr.Count -gt 1) {
+                Write-Console "MRSStatisticsRefresh: '$Alias' returned $($arr.Count) records; caching first item." -Level Warn -NoTimestamp
+            }
+            $stats = if ($arr.Count -gt 0) { $arr[0] } else { $null }
+        }
+        if ($null -eq $stats) { throw "$command returned null for '$Alias'" }
         $json = ConvertTo-MRSStatisticsJson -Stats $stats
-        $WatchState["MRSStatsJson_$Alias"] = $json
-        $WatchState["MRSStatsTime_$Alias"] = (Get-Date).ToUniversalTime().ToString('o')
-        Write-Console "MRSStatisticsRefresh: cached statistics for '$Alias'." -Level Info -NoTimestamp
+        $keys = Get-MRSStatsCacheKeys -Alias $Alias -ProfileSignature $ProfileSignature
+        $nowUtc = (Get-Date).ToUniversalTime().ToString('o')
+        $WatchState[$keys.JsonKey] = $json
+        $WatchState[$keys.TimeKey] = $nowUtc
+        # Backward compatibility for legacy callers/import paths that do not specify profile.
+        if (-not $WatchState[$keys.LegacyJsonKey]) {
+            $WatchState[$keys.LegacyJsonKey] = $json
+            $WatchState[$keys.LegacyTimeKey] = $nowUtc
+        }
+        Write-Console "MRSStatisticsRefresh: cached statistics for '$Alias' (profile=$($keys.SignatureHash))." -Level Info -NoTimestamp
     } catch {
         Write-Console "MRSStatisticsRefresh failed for '$Alias': $($_.Exception.Message)" -Level Warn -NoTimestamp
     }
@@ -4562,6 +4704,230 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     border-color:#93c5fd !important;
     box-shadow:0 0 0 2px rgba(59,130,246,.15);
   }
+  .mrs-cmd-toolbar{
+    margin:8px 10px 6px;
+    padding:10px;
+    border:2px solid #0f766e;
+    border-radius:10px;
+    background:linear-gradient(180deg,#f3fffd 0%,#eff6ff 100%);
+    box-shadow:0 6px 14px rgba(15,118,110,.12);
+    display:grid;
+    gap:8px;
+    position:relative;
+    overflow:hidden;
+  }
+  .mrs-cmd-head{
+    width:100%;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:8px;
+    border:1px solid #0f766e;
+    background:linear-gradient(180deg,#0f172a 0%,#1e293b 100%);
+    color:#f8fafc;
+    border-radius:8px;
+    padding:7px 9px;
+    font-size:.74rem;
+    font-weight:700;
+    cursor:pointer;
+  }
+  .mrs-cmd-head-icon{
+    font-size:.84rem;
+    color:#99f6e4;
+    line-height:1;
+  }
+  .mrs-cmd-body{display:grid;gap:8px}
+  .mrs-cmd-toolbar.collapsed .mrs-cmd-body{display:none}
+  .mrs-cmd-row{display:grid;gap:6px}
+  .mrs-cmd-topline{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center}
+  .mrs-cmd-label{
+    font-size:.66rem;
+    text-transform:uppercase;
+    letter-spacing:.06em;
+    color:#0f766e;
+    font-weight:700;
+  }
+  .mrs-cmd-select,
+  .mrs-cmd-input{
+    width:100%;
+    padding:6px 8px;
+    border:1px solid #94a3b8;
+    border-radius:6px;
+    font-size:.76rem;
+    background:#ffffff;
+    color:#1e293b;
+  }
+  .mrs-cmd-seg{display:flex;gap:6px;flex-wrap:nowrap}
+  .mrs-cmd-btn{
+    border:1px solid #94a3b8;
+    background:#fff;
+    color:#334155;
+    border-radius:999px;
+    padding:4px 8px;
+    font-size:.7rem;
+    cursor:pointer;
+  }
+  .mrs-cmd-btn.active{
+    border-color:#0f766e;
+    background:#0f766e;
+    color:#ecfeff;
+    font-weight:700;
+  }
+  .mrs-cmd-inline{display:flex;gap:6px;align-items:center}
+  .mrs-cmd-mini{
+    border:1px solid #94a3b8;
+    background:#fff;
+    color:#334155;
+    border-radius:6px;
+    padding:4px 7px;
+    font-size:.68rem;
+    cursor:pointer;
+  }
+  .mrs-cmd-mini.active{
+    border-color:#0f766e;
+    background:#0f766e;
+    color:#ecfeff;
+    font-weight:700;
+  }
+  .mrs-cmd-override{font-size:.68rem;color:#0f766e}
+  .mrs-cmd-params{display:grid;gap:8px}
+  .mrs-param-group-title{
+    font-size:.64rem;
+    letter-spacing:.06em;
+    text-transform:uppercase;
+    color:#94a3b8;
+    font-weight:700;
+  }
+  .mrs-param-chips{display:flex;flex-wrap:wrap;gap:6px}
+  .mrs-param-chip{
+    display:inline-flex;
+    gap:5px;
+    align-items:center;
+    border:1px solid #d1dae8;
+    background:#fff;
+    border-radius:999px;
+    padding:3px 8px;
+    font-size:.69rem;
+    color:#334155;
+  }
+  .mrs-param-chip input{margin:0}
+  .mrs-param-values{display:grid;grid-template-columns:1fr 1fr;gap:6px 8px}
+  .mrs-param-item{
+    border:1px solid #dbe3ef;
+    border-radius:6px;
+    padding:6px;
+    background:#fff;
+    display:grid;
+    gap:5px;
+  }
+  .mrs-param-label{
+    font-size:.72rem;
+    color:#334155;
+    display:flex;
+    gap:6px;
+    align-items:flex-start;
+  }
+  .mrs-param-label input{margin-top:2px}
+  .mrs-param-input{
+    width:100%;
+    padding:4px 6px;
+    border:1px solid #cbd5e1;
+    border-radius:5px;
+    font-size:.72rem;
+    background:#fff;
+    color:#1e293b;
+  }
+  .mrs-cmd-hint{
+    font-size:.68rem;
+    color:#0f766e;
+    line-height:1.35;
+    background:#ecfeff;
+    border:1px solid #99f6e4;
+    border-radius:6px;
+    padding:4px 6px;
+  }
+  .mrs-command-preview{
+    margin-top:4px;
+    padding:5px 8px;
+    border:1px solid #dbe3ef;
+    border-radius:6px;
+    background:#f8fafc;
+    color:#334155;
+    font-size:.68rem;
+    font-family:Consolas,monospace;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+    cursor:pointer;
+  }
+  .mrs-command-preview:hover{
+    background:#eef2ff;
+    border-color:#c7d2fe;
+  }
+  .mrs-command-preview-compact{
+    margin:8px 10px 4px;
+  }
+  .mrs-command-preview-full{
+    margin-top:4px;
+    padding:6px 8px;
+    border:1px solid #cbd5e1;
+    border-radius:6px;
+    background:#0b1220;
+    color:#dbe8ff;
+    font-size:.68rem;
+    font-family:Consolas,monospace;
+    white-space:pre-wrap;
+    word-break:break-word;
+    overflow:auto;
+    max-height:130px;
+  }
+  .mrs-a-section{
+    margin:8px 10px 0;
+    border:1px solid #dbe4ef;
+    border-radius:10px;
+    background:#ffffff;
+    overflow:hidden;
+    display:flex;
+    flex-direction:column;
+  }
+  .mrs-a-section-head{
+    padding:6px 10px;
+    font-size:.66rem;
+    text-transform:uppercase;
+    letter-spacing:.06em;
+    color:#475569;
+    font-weight:700;
+    background:#f8fafc;
+    border-bottom:1px solid #e2e8f0;
+  }
+  .mrs-a-controls{
+    padding:10px;
+    display:flex;
+    flex-direction:column;
+    gap:6px;
+  }
+  .mrs-a-section-list{
+    flex:1;
+    min-height:0;
+  }
+  .mrs-a-list-scroll{
+    flex:1;
+    min-height:0;
+    overflow-y:auto;
+  }
+  .mrs-a-foot{
+    padding:6px 10px;
+    font-size:.72rem;
+    color:#64748b;
+    border-top:1px solid #e2e8f0;
+    background:#f8fafc;
+  }
+  .mrs-a-session{
+    padding:10px 12px;
+    display:flex;
+    flex-direction:column;
+    gap:6px;
+  }
   body.mrs-resizing, body.mrs-resizing * { user-select:none !important; cursor:col-resize !important; }
   body.mrs-resizing-h, body.mrs-resizing-h * { user-select:none !important; cursor:row-resize !important; }
 
@@ -5216,44 +5582,88 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
           <span class="mrs-pane-name">Move Requests</span>
           <span class="mrs-pane-note">List + filters</span>
         </div>
-        <!-- Controls -->
-        <div style="padding:12px;border-bottom:1px solid #e2e8f0;display:flex;flex-direction:column;gap:6px">
-          <input type="text" id="mrs-search" placeholder="Name, Alias, or Batch"
-                 style="width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:.8rem"
-                 onkeydown="if(event.key==='Enter')mrsApplyFilter()">
-          <select id="mrs-status-filter"
-                  style="width:100%;padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:.8rem;background:#fff"
-                  onchange="mrsApplyFilter()">
-            <option value="All">All Statuses</option>
-          </select>
-          <div style="display:flex;gap:4px">
-            <button class="ent-btn" onclick="mrsApplyFilter()" style="flex:1;justify-content:center;padding:5px 0;font-size:.78rem">Search</button>
-            <button class="ent-btn" onclick="mrsRefreshList()" style="flex:1;justify-content:center;padding:5px 0;font-size:.78rem">Refresh</button>
-            <button class="ent-btn" onclick="mrsResetList()" style="flex:0 0 auto;padding:5px 8px;font-size:.78rem;background:#fff;color:#475569;border-color:#cbd5e1">Reset</button>
+        <div id="mrs-command-toolbar" class="mrs-cmd-toolbar">
+          <button id="mrs-cmd-collapse" class="mrs-cmd-head" type="button" aria-expanded="true" onclick="mrsToggleCommandToolbar()">
+            <span>Command Center</span>
+            <span id="mrs-cmd-collapse-icon" class="mrs-cmd-head-icon">v</span>
+          </button>
+          <div id="mrs-command-toolbar-body" class="mrs-cmd-body">
+            <div class="mrs-cmd-row">
+              <div class="mrs-cmd-label">Cmdlet + Environment</div>
+              <div class="mrs-cmd-topline">
+                <select id="mrs-cmdlet" class="mrs-cmd-select">
+                  <option value="Get-MoveRequestStatistics">Get-MoveRequestStatistics</option>
+                  <option value="Get-MigrationUserStatistics">Get-MigrationUserStatistics</option>
+                  <option value="Get-MigrationStatistics">Get-MigrationStatistics</option>
+                  <option value="Get-SyncRequestStatistics">Get-SyncRequestStatistics</option>
+                </select>
+                <div class="mrs-cmd-seg">
+                  <button class="mrs-cmd-btn active" data-env="exo" type="button" onclick="mrsSetCommandEnv('exo', this)">EXO</button>
+                  <button class="mrs-cmd-btn" data-env="onprem" type="button" onclick="mrsSetCommandEnv('onprem', this)">On_PRM</button>
+                </div>
+              </div>
+            </div>
+            <div class="mrs-cmd-row">
+              <div class="mrs-cmd-label">Scope / Identity</div>
+              <input id="mrs-cmd-identity" class="mrs-cmd-input" type="text" placeholder="Alias, UPN, Queue, or Instance" oninput="mrsSetIdentityOverride(this.value)">
+              <div class="mrs-cmd-inline">
+                <button id="mrs-use-panel-selection" class="mrs-cmd-mini active" type="button" onclick="mrsUsePanelASelection()">Use Panel A Selection</button>
+                <span id="mrs-override-state" class="mrs-cmd-override">Auto mode</span>
+              </div>
+            </div>
+            <div class="mrs-cmd-row">
+              <div class="mrs-cmd-label">Include / Diagnostics</div>
+              <div id="mrs-param-grid" class="mrs-cmd-params"></div>
+              <div class="mrs-cmd-hint">Parameters shown match the current cmdlet and environment.</div>
+            </div>
           </div>
         </div>
-        <!-- Move request list -->
-        <div style="flex:1;overflow-y:auto">
-          <table id="mrs-move-request-table" style="width:100%;border-collapse:collapse;font-size:.75rem">
-            <thead>
-              <tr style="background:#f1f5f9;position:sticky;top:0">
-                <th style="padding:6px 8px;text-align:left;font-weight:600;color:#475569;border-bottom:1px solid #e2e8f0">Name</th>
-                <th style="padding:6px 8px;text-align:left;font-weight:600;color:#475569;border-bottom:1px solid #e2e8f0">Status</th>
-                <th style="padding:6px 8px;text-align:left;font-weight:600;color:#475569;border-bottom:1px solid #e2e8f0">Batch</th>
-              </tr>
-            </thead>
-            <tbody id="mrs-move-request-tbody">
-              <tr><td colspan="3" style="padding:20px;text-align:center;color:#94a3b8;font-size:.8rem">Click Search to load move requests</td></tr>
-            </tbody>
-          </table>
+        <div id="mrs-command-preview-a" class="mrs-command-preview mrs-command-preview-compact" onclick="mrsToggleCommandPreviewFull()" title="Click to show full command">-</div>
+        <pre id="mrs-command-preview-a-full" class="mrs-command-preview-full mrs-command-preview-compact" style="display:none"></pre>
+        <div class="mrs-a-section">
+          <div class="mrs-a-section-head">Mailbox List Controls</div>
+          <div class="mrs-a-controls">
+            <input type="text" id="mrs-search" placeholder="Name, Alias, or Batch"
+                   style="width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:.8rem"
+                   onkeydown="if(event.key==='Enter')mrsApplyFilter()">
+            <select id="mrs-status-filter"
+                    style="width:100%;padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:.8rem;background:#fff"
+                    onchange="mrsApplyFilter()">
+              <option value="All">All Statuses</option>
+            </select>
+            <div style="display:flex;gap:4px">
+              <button class="ent-btn" onclick="mrsApplyFilter()" style="flex:1;justify-content:center;padding:5px 0;font-size:.78rem">Search</button>
+              <button class="ent-btn" onclick="mrsRefreshList()" style="flex:1;justify-content:center;padding:5px 0;font-size:.78rem">Refresh</button>
+              <button class="ent-btn" onclick="mrsResetList()" style="flex:0 0 auto;padding:5px 8px;font-size:.78rem;background:#fff;color:#475569;border-color:#cbd5e1">Reset</button>
+            </div>
+          </div>
         </div>
-        <div id="mrs-list-count" style="padding:6px 10px;font-size:.72rem;color:#64748b;border-top:1px solid #e2e8f0;background:#f8fafc"></div>
-        <!-- Bottom controls -->
-        <div style="padding:10px 12px;border-top:1px solid #e2e8f0;display:flex;flex-direction:column;gap:6px">
-          <input type="file" id="mrs-xml-file-input" accept=".xml" style="display:none" onchange="mrsImportXml(this)">
-          <button class="ent-btn" onclick="document.getElementById('mrs-xml-file-input').click()" style="width:100%;justify-content:center;font-size:.78rem">📂 Import XML Statistics</button>
-          <div id="mrs-import-label" style="font-size:.72rem;padding:2px 8px;color:#64748b;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title=""></div>
-          <div id="mrs-session-status" style="font-size:.72rem;padding:3px 8px;border-radius:10px;text-align:center;background:#dcfce7;color:#166534">Session Active</div>
+        <div class="mrs-a-section mrs-a-section-list">
+          <div class="mrs-a-section-head">Move Requests</div>
+          <div class="mrs-a-list-scroll">
+            <table id="mrs-move-request-table" style="width:100%;border-collapse:collapse;font-size:.75rem">
+              <thead>
+                <tr style="background:#f1f5f9;position:sticky;top:0">
+                  <th style="padding:6px 8px;text-align:left;font-weight:600;color:#475569;border-bottom:1px solid #e2e8f0">Name</th>
+                  <th style="padding:6px 8px;text-align:left;font-weight:600;color:#475569;border-bottom:1px solid #e2e8f0">Status</th>
+                  <th style="padding:6px 8px;text-align:left;font-weight:600;color:#475569;border-bottom:1px solid #e2e8f0">Batch</th>
+                </tr>
+              </thead>
+              <tbody id="mrs-move-request-tbody">
+                <tr><td colspan="3" style="padding:20px;text-align:center;color:#94a3b8;font-size:.8rem">Click Search to load move requests</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div id="mrs-list-count" class="mrs-a-foot"></div>
+        </div>
+        <div class="mrs-a-section">
+          <div class="mrs-a-section-head">Session &amp; Import</div>
+          <div class="mrs-a-session">
+            <input type="file" id="mrs-xml-file-input" accept=".xml" style="display:none" onchange="mrsImportXml(this)">
+            <button class="ent-btn" onclick="document.getElementById('mrs-xml-file-input').click()" style="width:100%;justify-content:center;font-size:.78rem">?? Import XML Statistics</button>
+            <div id="mrs-import-label" style="font-size:.72rem;padding:2px 8px;color:#64748b;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title=""></div>
+            <div id="mrs-session-status" style="font-size:.72rem;padding:3px 8px;border-radius:10px;text-align:center;background:#dcfce7;color:#166534">Session Active</div>
+          </div>
         </div>
       </div>
 
@@ -5274,7 +5684,9 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
 
           <!-- Breadcrumb + export button -->
           <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 14px;border-bottom:1px solid #e2e8f0;background:#f8fafc;flex-shrink:0">
-            <div id="mrs-node-path" style="font-size:.78rem;color:#475569;font-family:monospace;word-break:break-all">—</div>
+            <div style="display:flex;flex-direction:column;gap:2px;min-width:0;flex:1;">
+              <div id="mrs-node-path" style="font-size:.78rem;color:#475569;font-family:monospace;word-break:break-all">-</div>
+            </div>
             <div style="display:flex;align-items:center;gap:6px;flex-shrink:0;margin-left:10px">
               <button id="mrs-btn-refresh-selected" class="ent-btn" onclick="mrsRefreshSelectedMailbox()" style="font-size:.75rem;padding:4px 10px">Refresh Selected</button>
               <button id="mrs-btn-export-xml" class="ent-btn" onclick="mrsExportXml()" style="font-size:.75rem;padding:4px 10px">Export XML</button>
@@ -9033,6 +9445,426 @@ function apiCall(endpoint, method, body) {
     return Math.max(min, Math.min(max, val));
   }
 
+  function mrsCreateDefaultCommandState() {
+    return {
+      command: 'Get-MoveRequestStatistics',
+      env: 'exo',
+      collapsed: false,
+      previewExpanded: false,
+      manualIdentity: false,
+      identity: '',
+      switches: {
+        includeReport: true,
+        includeSkippedItems: false,
+        includeCopilotReport: false,
+        skipSubscription: false,
+        analysis: false,
+        diagnostic: false,
+        diagnosticOnly: false,
+        reportOnly: false
+      },
+      valueEnabled: {
+        diagnosticInfo: false,
+        diagnosticArgument: false,
+        limitSkippedItemsTo: false,
+        proxyToMailbox: false,
+        domainController: false,
+        partition: false
+      },
+      values: {
+        diagnosticInfo: 'showtimeslots, showtimeline, verbose',
+        diagnosticArgument: '',
+        limitSkippedItemsTo: '200',
+        proxyToMailbox: '',
+        domainController: '',
+        partition: ''
+      }
+    };
+  }
+
+  var mrsCmdState = mrsCreateDefaultCommandState();
+
+  var mrsCmdKeyMap = {
+    'Get-MoveRequestStatistics': 'move',
+    'Get-MigrationUserStatistics': 'user',
+    'Get-MigrationStatistics': 'migration',
+    'Get-SyncRequestStatistics': 'sync'
+  };
+
+  var mrsParamDefs = {
+    switches: [
+      { id:'includeReport', name:'IncludeReport', label:'-IncludeReport', commands:['move','user','sync'], exo:true, onprem:true },
+      { id:'includeSkippedItems', name:'IncludeSkippedItems', label:'-IncludeSkippedItems', commands:['user'], exo:true, onprem:true },
+      { id:'includeCopilotReport', name:'IncludeCopilotReport', label:'-IncludeCopilotReport', commands:['user'], exo:true, onprem:false },
+      { id:'skipSubscription', name:'SkipSubscription', label:'-SkipSubscription', commands:['user'], exo:true, onprem:true },
+      { id:'analysis', name:'Analysis', label:'-Analysis', commands:['move'], exo:true, onprem:false },
+      { id:'diagnostic', name:'Diagnostic', label:'-Diagnostic', commands:['move','user','migration'], exo:false, onprem:true },
+      { id:'diagnosticOnly', name:'DiagnosticOnly', label:'-DiagnosticOnly', commands:['move'], exo:true, onprem:false },
+      { id:'reportOnly', name:'ReportOnly', label:'-ReportOnly', commands:['move'], exo:true, onprem:true }
+    ],
+    values: [
+      { id:'diagnosticInfo', name:'DiagnosticInfo', label:'-DiagnosticInfo', commands:['move','user','migration','sync'], exo:true, onprem:false, list:['Verbose','ShowTimeline','ShowTimeslot','showtimeslots','showtimeline','verbose','showtimeslots, showtimeline, verbose'] },
+      { id:'diagnosticArgument', name:'DiagnosticArgument', label:'-DiagnosticArgument', commands:['move','user','migration'], exo:false, onprem:true },
+      { id:'limitSkippedItemsTo', name:'LimitSkippedItemsTo', label:'-LimitSkippedItemsTo', commands:['user'], exo:true, onprem:true, number:true },
+      { id:'proxyToMailbox', name:'ProxyToMailbox', label:'-ProxyToMailbox', commands:['move'], exo:true, onprem:false },
+      { id:'domainController', name:'DomainController', label:'-DomainController', commands:['move','user','migration'], exo:false, onprem:true },
+      { id:'partition', name:'Partition', label:'-Partition', commands:['user','migration'], exo:true, onprem:false }
+    ]
+  };
+
+  function mrsCommandKey() {
+    return mrsCmdKeyMap[mrsCmdState.command] || 'move';
+  }
+
+  function mrsParamSupported(def) {
+    var cmdOk = def.commands.indexOf(mrsCommandKey()) !== -1;
+    var envOk = (mrsCmdState.env === 'exo') ? !!def.exo : !!def.onprem;
+    return cmdOk && envOk;
+  }
+
+  function mrsEnsureIncludeReportDefault() {
+    var includeDef = null;
+    for (var i = 0; i < mrsParamDefs.switches.length; i++) {
+      if (mrsParamDefs.switches[i].id === 'includeReport') {
+        includeDef = mrsParamDefs.switches[i];
+        break;
+      }
+    }
+    if (includeDef && mrsParamSupported(includeDef)) {
+      mrsCmdState.switches.includeReport = true;
+    }
+  }
+
+  function mrsSyncIdentityFromPanelSelection() {
+    if (mrsCmdState.manualIdentity) return;
+    var alias = mrsState.currentAlias || '';
+    mrsCmdState.identity = alias;
+    var input = document.getElementById('mrs-cmd-identity');
+    if (input) input.value = alias;
+  }
+
+  function mrsUpdateOverrideBadge() {
+    var badge = document.getElementById('mrs-override-state');
+    if (badge) badge.textContent = mrsCmdState.manualIdentity ? 'Manual override' : 'Auto mode';
+    var btn = document.getElementById('mrs-use-panel-selection');
+    if (btn) {
+      if (mrsCmdState.manualIdentity) btn.classList.remove('active');
+      else btn.classList.add('active');
+    }
+  }
+
+  function mrsUpdateCommandToolbarCollapsedUi() {
+    var host = document.getElementById('mrs-command-toolbar');
+    var btn = document.getElementById('mrs-cmd-collapse');
+    var icon = document.getElementById('mrs-cmd-collapse-icon');
+    if (!host || !btn) return;
+    var collapsed = !!mrsCmdState.collapsed;
+    if (collapsed) host.classList.add('collapsed');
+    else host.classList.remove('collapsed');
+    btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    if (icon) icon.textContent = collapsed ? '>' : 'v';
+  }
+
+  function mrsToggleCommandToolbar() {
+    mrsCmdState.collapsed = !mrsCmdState.collapsed;
+    mrsUpdateCommandToolbarCollapsedUi();
+    mrsSaveUiState();
+  }
+  window.mrsToggleCommandToolbar = mrsToggleCommandToolbar;
+
+  function mrsBuildDiagDatalist(def) {
+    if (!def.list || !def.list.length) return;
+    var listId = 'mrs-param-list-' + def.id;
+    if (document.getElementById(listId)) return;
+    var dl = document.createElement('datalist');
+    dl.id = listId;
+    def.list.forEach(function(v) {
+      var opt = document.createElement('option');
+      opt.value = v;
+      dl.appendChild(opt);
+    });
+    document.body.appendChild(dl);
+  }
+
+  function mrsRenderCommandParams() {
+    var host = document.getElementById('mrs-param-grid');
+    if (!host) return;
+    host.innerHTML = '';
+
+    var switchDefs = mrsParamDefs.switches.filter(mrsParamSupported);
+    if (switchDefs.length) {
+      var st = document.createElement('div');
+      st.className = 'mrs-param-group-title';
+      st.textContent = 'Quick Toggles';
+      host.appendChild(st);
+      var chips = document.createElement('div');
+      chips.className = 'mrs-param-chips';
+      switchDefs.forEach(function(def) {
+        var chip = document.createElement('label');
+        chip.className = 'mrs-param-chip';
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = !!mrsCmdState.switches[def.id];
+        cb.addEventListener('change', function() {
+          mrsCmdState.switches[def.id] = cb.checked;
+          if (def.id === 'includeReport' && !cb.checked) {
+            // Keep IncludeReport enabled by default; user can toggle again if needed.
+            mrsEnsureIncludeReportDefault();
+            cb.checked = !!mrsCmdState.switches[def.id];
+          }
+          mrsUpdateCommandPreviewBar();
+          mrsSaveUiState();
+        });
+        chip.appendChild(cb);
+        chip.appendChild(document.createTextNode(def.label));
+        chips.appendChild(chip);
+      });
+      host.appendChild(chips);
+    }
+
+    var valueDefs = mrsParamDefs.values.filter(mrsParamSupported);
+    if (valueDefs.length) {
+      var vt = document.createElement('div');
+      vt.className = 'mrs-param-group-title';
+      vt.textContent = 'Value Inputs';
+      host.appendChild(vt);
+      var valuesWrap = document.createElement('div');
+      valuesWrap.className = 'mrs-param-values';
+      valueDefs.forEach(function(def) {
+        var item = document.createElement('div');
+        item.className = 'mrs-param-item';
+
+        var label = document.createElement('label');
+        label.className = 'mrs-param-label';
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = !!mrsCmdState.valueEnabled[def.id];
+        label.appendChild(cb);
+        label.appendChild(document.createTextNode(def.label));
+        item.appendChild(label);
+
+        var input = document.createElement('input');
+        input.className = 'mrs-param-input';
+        input.type = def.number ? 'number' : 'text';
+        input.value = mrsCmdState.values[def.id] || '';
+        input.disabled = !cb.checked;
+        if (def.number) input.min = '0';
+        if (def.id === 'limitSkippedItemsTo') input.placeholder = '200';
+        if (def.list && def.list.length) {
+          mrsBuildDiagDatalist(def);
+          input.setAttribute('list', 'mrs-param-list-' + def.id);
+        }
+        cb.addEventListener('change', function() {
+          mrsCmdState.valueEnabled[def.id] = cb.checked;
+          input.disabled = !cb.checked;
+          mrsUpdateCommandPreviewBar();
+          mrsSaveUiState();
+        });
+        input.addEventListener('input', function() {
+          mrsCmdState.values[def.id] = input.value;
+          mrsUpdateCommandPreviewBar();
+          mrsSaveUiState();
+        });
+        item.appendChild(input);
+        valuesWrap.appendChild(item);
+      });
+      host.appendChild(valuesWrap);
+    }
+
+    if (!switchDefs.length && !valueDefs.length) {
+      var empty = document.createElement('div');
+      empty.className = 'mrs-cmd-hint';
+      empty.textContent = 'No parameters available for selected cmdlet/environment.';
+      host.appendChild(empty);
+    }
+  }
+
+  function mrsGetCommandProfilePayload() {
+    var profile = {
+      command: mrsCmdState.command || 'Get-MoveRequestStatistics',
+      environment: mrsCmdState.env === 'onprem' ? 'onprem' : 'exo',
+      identity: (mrsCmdState.identity || '').trim(),
+      switches: {},
+      values: {}
+    };
+    mrsParamDefs.switches.forEach(function(def) {
+      if (!mrsParamSupported(def)) return;
+      if (mrsCmdState.switches[def.id]) profile.switches[def.name] = true;
+    });
+    mrsParamDefs.values.forEach(function(def) {
+      if (!mrsParamSupported(def)) return;
+      if (!mrsCmdState.valueEnabled[def.id]) return;
+      var v = (mrsCmdState.values[def.id] || '').trim();
+      if (!v) return;
+      profile.values[def.name] = v;
+    });
+    return profile;
+  }
+
+  function mrsGetCommandProfileSignature(profile) {
+    profile = profile || mrsGetCommandProfilePayload();
+    var parts = [profile.command || '', profile.environment || '', profile.identity || ''];
+    var sw = Object.keys(profile.switches || {}).sort();
+    sw.forEach(function(k) { if (profile.switches[k]) parts.push('S:' + k); });
+    var vals = Object.keys(profile.values || {}).sort();
+    vals.forEach(function(k) { parts.push('V:' + k + '=' + profile.values[k]); });
+    return parts.join('|');
+  }
+
+  function mrsStatsQueryUrl(alias, profileSignature) {
+    var url = '/api/mrs/statistics?alias=' + encodeURIComponent(alias || '');
+    if (profileSignature) {
+      url += '&profile=' + encodeURIComponent(profileSignature);
+    }
+    return url;
+  }
+
+  function mrsCommandPreviewText() {
+    var p = mrsGetCommandProfilePayload();
+    var out = [p.command];
+    if (p.identity && p.command !== 'Get-MigrationStatistics') {
+      out.push('-Identity "' + p.identity.replace(/"/g, '\\"') + '"');
+    }
+    Object.keys(p.switches).sort().forEach(function(k) {
+      if (p.switches[k]) out.push('-' + k);
+    });
+    Object.keys(p.values).sort().forEach(function(k) {
+      var val = p.values[k];
+      if (k === 'LimitSkippedItemsTo') out.push('-' + k + ' ' + val);
+      else out.push('-' + k + ' "' + String(val).replace(/"/g, '\\"') + '"');
+    });
+    out.push('# env=' + p.environment);
+    return out.join(' ');
+  }
+
+  function mrsCommandPreviewSummaryText() {
+    var p = mrsGetCommandProfilePayload();
+    var envLabel = p.environment === 'onprem' ? 'On_PRM' : 'EXO';
+    var identity = p.identity ? p.identity : 'Auto identity';
+    var switchCount = Object.keys(p.switches || {}).length;
+    var valueCount = Object.keys(p.values || {}).length;
+    var paramCount = switchCount + valueCount;
+    return p.command + ' | ' + envLabel + ' | ' + identity + ' | +' + paramCount + ' params';
+  }
+
+  function mrsToggleCommandPreviewFull() {
+    mrsCmdState.previewExpanded = !mrsCmdState.previewExpanded;
+    mrsUpdateCommandPreviewBar();
+    mrsSaveUiState();
+  }
+  window.mrsToggleCommandPreviewFull = mrsToggleCommandPreviewFull;
+
+  function mrsUpdateCommandPreviewBar() {
+    var summaryText = mrsCommandPreviewSummaryText();
+    var fullText = mrsCommandPreviewText();
+    var expanded = !!mrsCmdState.previewExpanded;
+
+    var summaryEls = [
+      document.getElementById('mrs-command-preview'),
+      document.getElementById('mrs-command-preview-a')
+    ];
+    summaryEls.forEach(function(el) {
+      if (el) el.textContent = summaryText;
+    });
+
+    var fullEls = [
+      document.getElementById('mrs-command-preview-full'),
+      document.getElementById('mrs-command-preview-a-full')
+    ];
+    fullEls.forEach(function(el) {
+      if (!el) return;
+      el.textContent = fullText;
+      el.style.display = expanded ? 'block' : 'none';
+    });
+  }
+
+  function mrsApplyCommandState(stored) {
+    if (!stored || typeof stored !== 'object') return;
+    var def = mrsCreateDefaultCommandState();
+    mrsCmdState.command = stored.command || def.command;
+    mrsCmdState.env = stored.env === 'onprem' ? 'onprem' : 'exo';
+    mrsCmdState.collapsed = stored.collapsed !== undefined ? !!stored.collapsed : !!def.collapsed;
+    mrsCmdState.previewExpanded = stored.previewExpanded !== undefined ? !!stored.previewExpanded : !!def.previewExpanded;
+    mrsCmdState.manualIdentity = !!stored.manualIdentity;
+    mrsCmdState.identity = stored.identity || '';
+    Object.keys(def.switches).forEach(function(k) {
+      mrsCmdState.switches[k] = stored.switches && stored.switches[k] !== undefined ? !!stored.switches[k] : def.switches[k];
+    });
+    Object.keys(def.valueEnabled).forEach(function(k) {
+      mrsCmdState.valueEnabled[k] = stored.valueEnabled && stored.valueEnabled[k] !== undefined ? !!stored.valueEnabled[k] : def.valueEnabled[k];
+    });
+    Object.keys(def.values).forEach(function(k) {
+      mrsCmdState.values[k] = stored.values && stored.values[k] !== undefined ? String(stored.values[k]) : def.values[k];
+    });
+    // One-time migration: older saved state had DiagnosticInfo checked by default.
+    try {
+      var migKey = 'mrsExplorerDiagInfoDefaultV2';
+      if (!localStorage.getItem(migKey)) {
+        mrsCmdState.valueEnabled.diagnosticInfo = false;
+        localStorage.setItem(migKey, '1');
+      }
+    } catch (_) {}
+  }
+
+  function mrsInitCommandToolbar() {
+    var cmdSelect = document.getElementById('mrs-cmdlet');
+    var idInput = document.getElementById('mrs-cmd-identity');
+    if (!cmdSelect || !idInput) return;
+
+    cmdSelect.value = mrsCmdState.command || 'Get-MoveRequestStatistics';
+    cmdSelect.addEventListener('change', function() {
+      mrsCmdState.command = cmdSelect.value;
+      mrsEnsureIncludeReportDefault();
+      mrsRenderCommandParams();
+      mrsUpdateCommandPreviewBar();
+      mrsSaveUiState();
+    });
+
+    document.querySelectorAll('#mrs-command-toolbar .mrs-cmd-btn').forEach(function(btn) {
+      var isActive = btn.getAttribute('data-env') === mrsCmdState.env;
+      if (isActive) btn.classList.add('active'); else btn.classList.remove('active');
+    });
+
+    idInput.value = mrsCmdState.identity || '';
+    mrsUpdateOverrideBadge();
+    mrsUpdateCommandToolbarCollapsedUi();
+    mrsEnsureIncludeReportDefault();
+    mrsRenderCommandParams();
+    mrsSyncIdentityFromPanelSelection();
+    mrsUpdateCommandPreviewBar();
+  }
+
+  function mrsSetCommandEnv(env, btn) {
+    mrsCmdState.env = (env === 'onprem') ? 'onprem' : 'exo';
+    document.querySelectorAll('#mrs-command-toolbar .mrs-cmd-btn').forEach(function(b) {
+      if (b === btn) b.classList.add('active');
+      else b.classList.remove('active');
+    });
+    mrsEnsureIncludeReportDefault();
+    mrsRenderCommandParams();
+    mrsUpdateCommandPreviewBar();
+    mrsSaveUiState();
+  }
+  window.mrsSetCommandEnv = mrsSetCommandEnv;
+
+  function mrsSetIdentityOverride(val) {
+    mrsCmdState.manualIdentity = true;
+    mrsCmdState.identity = val || '';
+    mrsUpdateOverrideBadge();
+    mrsUpdateCommandPreviewBar();
+    mrsSaveUiState();
+  }
+  window.mrsSetIdentityOverride = mrsSetIdentityOverride;
+
+  function mrsUsePanelASelection() {
+    mrsCmdState.manualIdentity = false;
+    mrsSyncIdentityFromPanelSelection();
+    mrsUpdateOverrideBadge();
+    mrsUpdateCommandPreviewBar();
+    mrsSaveUiState();
+  }
+  window.mrsUsePanelASelection = mrsUsePanelASelection;
+
   function mrsLoadLayout() {
     var defaults = { leftWidth: 300, treeWidth: 220, detailHeight: 160 };
     try {
@@ -9055,7 +9887,7 @@ function apiCall(endpoint, method, body) {
   }
 
   function mrsLoadUiState() {
-    var defaults = { search: '', status: 'All', currentAlias: null, currentProp: null, treeExpanded: {} };
+    var defaults = { search: '', status: 'All', currentAlias: null, currentProp: null, treeExpanded: {}, commandState: mrsCreateDefaultCommandState() };
     try {
       var raw = localStorage.getItem('mrsExplorerUiStateV1');
       if (!raw) return defaults;
@@ -9066,7 +9898,8 @@ function apiCall(endpoint, method, body) {
         status: parsed.status || 'All',
         currentAlias: parsed.currentAlias || null,
         currentProp: parsed.currentProp || null,
-        treeExpanded: parsed.treeExpanded && typeof parsed.treeExpanded === 'object' ? parsed.treeExpanded : {}
+        treeExpanded: parsed.treeExpanded && typeof parsed.treeExpanded === 'object' ? parsed.treeExpanded : {},
+        commandState: parsed.commandState && typeof parsed.commandState === 'object' ? parsed.commandState : defaults.commandState
       };
     } catch (_) {
       return defaults;
@@ -9080,7 +9913,8 @@ function apiCall(endpoint, method, body) {
         status: (document.getElementById('mrs-status-filter') || {}).value || 'All',
         currentAlias: mrsState.currentAlias || null,
         currentProp: mrsState.currentProp || null,
-        treeExpanded: mrsState.treeExpanded || {}
+        treeExpanded: mrsState.treeExpanded || {},
+        commandState: mrsCmdState
       }));
     } catch (_) {}
   }
@@ -9095,9 +9929,13 @@ function apiCall(endpoint, method, body) {
       status.value = restored;
       status.setAttribute('data-pending-status', restored);
     }
+    mrsApplyCommandState(st.commandState);
+    mrsInitCommandToolbar();
     mrsState.currentAlias = st.currentAlias || null;
     mrsState.currentProp = st.currentProp || null;
     mrsState.treeExpanded = st.treeExpanded && typeof st.treeExpanded === 'object' ? st.treeExpanded : {};
+    mrsSyncIdentityFromPanelSelection();
+    mrsUpdateCommandPreviewBar();
   }
 
   function mrsInitResizableLayout() {
@@ -9300,6 +10138,8 @@ function apiCall(endpoint, method, body) {
       mrsShowDetailArea(false);
       mrsSetNodePath('');
     }
+    mrsSyncIdentityFromPanelSelection();
+    mrsUpdateCommandPreviewBar();
     mrsUpdateSessionBadge();
     mrsLoadListFromCache(function(info) {
       var hasCache = info && info.hasCache;
@@ -9484,6 +10324,9 @@ function apiCall(endpoint, method, body) {
   }
 
   function mrsRenderMailboxStats(alias, data, preserveSelection) {
+    if (typeof data === 'string') {
+      try { data = JSON.parse(data); } catch (_) {}
+    }
     mrsState.currentStats = data || null;
     mrsShowDetailArea(true);
     mrsRenderPropertyTree(mrsState.currentStats || {});
@@ -9505,15 +10348,21 @@ function apiCall(endpoint, method, body) {
     mrsSaveUiState();
   }
 
-  function mrsQueueStatsRefresh(alias, selectToken, preserveSelection) {
+  function mrsQueueStatsRefresh(alias, selectToken, preserveSelection, profile, profileSignature) {
+    profile = profile || mrsGetCommandProfilePayload();
+    profileSignature = profileSignature || mrsGetCommandProfileSignature(profile);
     var pollSince = Date.now() - 2000; // 2 s tolerance for clock skew between client and server
-    console.log('[MRS] posting fetch-statistics for', alias, 'pollSince=', pollSince);
-    apiCall('/api/mrs/fetch-statistics', 'POST', { alias: alias }).then(function(resp) {
+    console.log('[MRS] posting fetch-statistics for', alias, 'pollSince=', pollSince, 'profile=', profileSignature);
+    apiCall('/api/mrs/fetch-statistics', 'POST', {
+      alias: alias,
+      commandProfile: profile,
+      profileSignature: profileSignature
+    }).then(function(resp) {
       if (selectToken !== mrsState.selectToken || alias !== mrsState.currentAlias) return;
       console.log('[MRS] fetch-statistics response:', resp);
       if (resp && resp.status === 'queued') {
         mrsSetNodePath(alias + ' > queued, waiting for data.');
-        mrsPollStats(alias, Date.now(), pollSince, selectToken, preserveSelection);
+        mrsPollStats(alias, Date.now(), pollSince, selectToken, preserveSelection, profileSignature);
       } else {
         var errMsg = (resp && resp.error) ? resp.error : 'unexpected server response';
         console.warn('[MRS] fetch-statistics unexpected response:', resp);
@@ -9544,10 +10393,14 @@ function apiCall(endpoint, method, body) {
     if (row) row.style.background = '#eff6ff';
 
     mrsState.currentAlias = alias;
+    mrsSyncIdentityFromPanelSelection();
+    mrsUpdateCommandPreviewBar();
     if (!preserveSelection) {
       mrsState.currentProp = null;
       mrsState.treeExpanded = {};
     }
+    var profile = mrsGetCommandProfilePayload();
+    var profileSignature = mrsGetCommandProfileSignature(profile);
     mrsSetImportLabel(alias);
     mrsSaveUiState();
 
@@ -9562,7 +10415,7 @@ function apiCall(endpoint, method, body) {
     mrsSetNodePath(alias + ' > contacting server.');
 
     if (!forceRefresh && preferCache) {
-      apiCall('/api/mrs/statistics?alias=' + encodeURIComponent(alias), 'GET', null).then(function(resp) {
+      apiCall(mrsStatsQueryUrl(alias, profileSignature), 'GET', null).then(function(resp) {
         if (selectToken !== mrsState.selectToken || alias !== mrsState.currentAlias) return;
         if (resp && resp.ok && resp.data) {
           console.log('[MRS] cache hit for', alias, '- rendering cached statistics');
@@ -9576,7 +10429,7 @@ function apiCall(endpoint, method, body) {
           mrsShowEntryDetail('Panel D - Entry Detail\nNo cached statistics were found. Click Refresh Selected to fetch fresh data.');
           return;
         }
-        mrsQueueStatsRefresh(alias, selectToken, preserveSelection);
+        mrsQueueStatsRefresh(alias, selectToken, preserveSelection, profile, profileSignature);
       }).catch(function(err) {
         if (selectToken !== mrsState.selectToken || alias !== mrsState.currentAlias) return;
         if (cacheOnly) {
@@ -9584,12 +10437,12 @@ function apiCall(endpoint, method, body) {
           return;
         }
         console.warn('[MRS] cache read failed for', alias, '- falling back to refresh:', err);
-        mrsQueueStatsRefresh(alias, selectToken, preserveSelection);
+        mrsQueueStatsRefresh(alias, selectToken, preserveSelection, profile, profileSignature);
       });
       return;
     }
 
-    mrsQueueStatsRefresh(alias, selectToken, preserveSelection);
+    mrsQueueStatsRefresh(alias, selectToken, preserveSelection, profile, profileSignature);
   }
   window.mrsSelectMailbox = mrsSelectMailbox;
 
@@ -9599,7 +10452,7 @@ function apiCall(endpoint, method, body) {
   }
   window.mrsRefreshSelectedMailbox = mrsRefreshSelectedMailbox;
 
-  function mrsPollStats(alias, startTime, pollSince, selectToken, preserveSelection) {
+  function mrsPollStats(alias, startTime, pollSince, selectToken, preserveSelection, profileSignature) {
     if (selectToken !== mrsState.selectToken || alias !== mrsState.currentAlias) return;
     if (Date.now() - startTime > 180000) {
       console.warn('[MRS] mrsPollStats timed out for', alias);
@@ -9607,7 +10460,7 @@ function apiCall(endpoint, method, body) {
       mrsSetImportLabel('Timed out - try clicking again');
       return;
     }
-    apiCall('/api/mrs/statistics?alias=' + encodeURIComponent(alias), 'GET', null).then(function(resp) {
+    apiCall(mrsStatsQueryUrl(alias, profileSignature), 'GET', null).then(function(resp) {
       if (selectToken !== mrsState.selectToken || alias !== mrsState.currentAlias) return;
       var cacheMs = resp && resp.cacheTime ? new Date(resp.cacheTime).getTime() : 0;
       console.log('[MRS] poll stats:', alias, '| ok=', resp && resp.ok, '| cacheTime=', resp && resp.cacheTime,
@@ -9616,12 +10469,12 @@ function apiCall(endpoint, method, body) {
         '| error=', resp && resp.error, '| availableKeys=', resp && resp.availableKeys);
       if (!resp || !resp.ok) {
         mrsSetNodePath(alias + ' > waiting for server cache.');
-        setTimeout(function() { mrsPollStats(alias, startTime, pollSince, selectToken, preserveSelection); }, 1500);
+        setTimeout(function() { mrsPollStats(alias, startTime, pollSince, selectToken, preserveSelection, profileSignature); }, 1500);
         return;
       }
       if (cacheMs < pollSince) {
         mrsSetNodePath(alias + ' > waiting for fresh data. (' + Math.round((pollSince - cacheMs) / 1000) + 's stale)');
-        setTimeout(function() { mrsPollStats(alias, startTime, pollSince, selectToken, preserveSelection); }, 1500);
+        setTimeout(function() { mrsPollStats(alias, startTime, pollSince, selectToken, preserveSelection, profileSignature); }, 1500);
         return;
       }
       console.log('[MRS] poll stats success for', alias, '- rendering property tree');
@@ -9637,7 +10490,7 @@ function apiCall(endpoint, method, body) {
       if (selectToken !== mrsState.selectToken || alias !== mrsState.currentAlias) return;
       console.error('[MRS] mrsPollStats network error:', err);
       mrsSetNodePath(alias + ' > network error, retrying.');
-      setTimeout(function() { mrsPollStats(alias, startTime, pollSince, selectToken, preserveSelection); }, 2000);
+      setTimeout(function() { mrsPollStats(alias, startTime, pollSince, selectToken, preserveSelection, profileSignature); }, 2000);
     });
   }
   // ── Show/hide detail area ───────────────────────────────────────
@@ -10930,40 +11783,154 @@ function Start-WatchListener {
                             [void]$req.InputStream.Read($bodyBytes2, 0, $bodyBytes2.Length)
                             $bodyObj = [System.Text.Encoding]::UTF8.GetString($bodyBytes2) | ConvertFrom-Json
                             $alias   = "$($bodyObj.alias)"
+                            $profileSignature = "$($bodyObj.profileSignature)".Trim()
+                            $commandProfile = $bodyObj.commandProfile
                             if ($alias) {
-                                [void]$State.PendingCommands.Add([hashtable]@{ Action = 'fetchMRSStatistics'; Alias = $alias })
-                                $safeAlias = $alias -replace '"','\"'
-                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"status`":`"queued`",`"alias`":`"$safeAlias`"}")
+                                [void]$State.PendingCommands.Add([hashtable]@{
+                                    Action = 'fetchMRSStatistics'
+                                    Alias = $alias
+                                    CommandProfile = $commandProfile
+                                    ProfileSignature = $profileSignature
+                                })
+                                $payload = @{
+                                    status = 'queued'
+                                    alias = $alias
+                                    profile = $profileSignature
+                                } | ConvertTo-Json -Depth 5 -Compress
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
                             } else {
-                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"error":"Missing alias"}')
+                                $payload = @{ error = 'Missing alias' } | ConvertTo-Json -Compress
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
                             }
                         } catch {
-                            $errMsg = $_.Exception.Message -replace '"', "'"
-                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"error`":`"$errMsg`"}")
+                            $payload = @{ error = "$($_.Exception.Message)" } | ConvertTo-Json -Compress
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
                         }
                     }
                     elseif ($path -eq '/api/mrs/statistics') {
                         $contentType = 'application/json; charset=utf-8'
                         try {
-                            # Use RawUrl (e.g. /api/mrs/statistics?alias=foo) to avoid Url.Query being empty on some hosts
-                            $alias = if ($req.RawUrl -match '[?&]alias=([^&]+)') { [System.Uri]::UnescapeDataString($Matches[1]) } else { $null }
-                            $innerJson    = if ($alias) { $State["MRSStatsJson_$alias"] } else { $null }
-                            $cacheTimeVal = if ($alias) { $State["MRSStatsTime_$alias"] } else { $null }
+                            # Use RawUrl query parsing to avoid Url.Query being empty on some hosts.
+                            $rawQuery = ''
+                            if ($req.RawUrl -match '\?(.*)$') {
+                                $rawQuery = $Matches[1]
+                            } elseif ($req.Url.Query) {
+                                $rawQuery = $req.Url.Query.TrimStart('?')
+                            }
+                            $qs = if ($rawQuery) { [System.Web.HttpUtility]::ParseQueryString($rawQuery) } else { $null }
+                            $alias = if ($qs) { "$($qs['alias'])" } else { '' }
+                            $profileSig = if ($qs) { "$($qs['profile'])" } else { '' }
+                            # Fallback parsing for hosts where NameValueCollection lookup intermittently fails.
+                            if ([string]::IsNullOrWhiteSpace($alias) -and $req.RawUrl -match '(?:\?|&)alias=([^&]+)') {
+                                try { $alias = [System.Uri]::UnescapeDataString($Matches[1]) } catch { $alias = $Matches[1] }
+                            }
+                            if ([string]::IsNullOrWhiteSpace($profileSig) -and $req.RawUrl -match '(?:\?|&)profile=([^&]+)') {
+                                try { $profileSig = [System.Uri]::UnescapeDataString($Matches[1]) } catch { $profileSig = $Matches[1] }
+                            }
+                            $alias = "$alias".Trim()
+                            $profileSig = "$profileSig".Trim()
+
+                            $innerJson = $null
+                            $cacheTimeVal = $null
+                            if ($alias) {
+                                # Compute cache keys inline here because listener runspace can't
+                                # rely on top-level helper functions being in scope.
+                                $sigHash = 'default'
+                                if (-not [string]::IsNullOrWhiteSpace($profileSig)) {
+                                    try {
+                                        $sha = [System.Security.Cryptography.SHA256]::Create()
+                                        try {
+                                            $bytes = [System.Text.Encoding]::UTF8.GetBytes($profileSig)
+                                            $hashBytes = $sha.ComputeHash($bytes)
+                                            $hex = [System.BitConverter]::ToString($hashBytes).Replace('-', '').ToLowerInvariant()
+                                            $sigHash = if ($hex.Length -gt 16) { $hex.Substring(0, 16) } else { $hex }
+                                        } finally {
+                                            $sha.Dispose()
+                                        }
+                                    } catch {
+                                        $sigHash = ($profileSig -replace '[^A-Za-z0-9]','_')
+                                    }
+                                }
+                                $jsonKey = "MRSStatsJson_${alias}__$sigHash"
+                                $timeKey = "MRSStatsTime_${alias}__$sigHash"
+                                $legacyJsonKey = "MRSStatsJson_$alias"
+                                $legacyTimeKey = "MRSStatsTime_$alias"
+
+                                $innerJson = $State[$jsonKey]
+                                $cacheTimeVal = $State[$timeKey]
+                                if (-not $innerJson) {
+                                    $innerJson = $State[$legacyJsonKey]
+                                    $cacheTimeVal = $State[$legacyTimeKey]
+                                }
+                                if (-not $innerJson) {
+                                    # Resiliency fallback: if exact profile key misses, use latest cached profile for same alias.
+                                    $jsonPrefix = "MRSStatsJson_${alias}__"
+                                    $candidateJsonKeys = @($State.Keys | Where-Object { $_ -like "${jsonPrefix}*" })
+                                    if ($candidateJsonKeys.Count -gt 0) {
+                                        $bestTime = ''
+                                        $bestJson = $null
+                                        foreach ($jk in $candidateJsonKeys) {
+                                            $tk = $jk -replace '^MRSStatsJson_', 'MRSStatsTime_'
+                                            $jt = "$($State[$tk])"
+                                            if (-not $jt) { $jt = '' }
+                                            if ($jt -ge $bestTime) {
+                                                $bestTime = $jt
+                                                $bestJson = $State[$jk]
+                                            }
+                                        }
+                                        if ($bestJson) {
+                                            $innerJson = $bestJson
+                                            $cacheTimeVal = if ($bestTime) { $bestTime } else { $cacheTimeVal }
+                                        }
+                                    }
+                                }
+                            }
+
                             if ($alias -and $innerJson) {
-                                $timeStr = if ($cacheTimeVal) { "`"$cacheTimeVal`"" } else { 'null' }
-                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"ok`":true,`"cacheTime`":$timeStr,`"data`":$innerJson}")
+                                # Normalize cached value into an object payload whenever possible.
+                                # Some paths can produce double-encoded JSON strings.
+                                $dataObj = $innerJson
+                                $parsed = $null
+                                $parseOk = $false
+                                try {
+                                    if ($innerJson -is [string]) {
+                                        $parsed = $innerJson | ConvertFrom-Json -Depth 100 -ErrorAction Stop
+                                        $parseOk = $true
+                                    }
+                                } catch {}
+                                if ($parseOk) {
+                                    $dataObj = $parsed
+                                    if ($dataObj -is [string]) {
+                                        $inner2 = "$dataObj".Trim()
+                                        $looksJson2 = ($inner2.StartsWith('{') -and $inner2.EndsWith('}')) -or ($inner2.StartsWith('[') -and $inner2.EndsWith(']'))
+                                        if ($looksJson2) {
+                                            try { $dataObj = $inner2 | ConvertFrom-Json -Depth 100 -ErrorAction Stop } catch {}
+                                        }
+                                    }
+                                }
+                                $payload = @{
+                                    ok = $true
+                                    cacheTime = $cacheTimeVal
+                                    data = $dataObj
+                                } | ConvertTo-Json -Depth 100 -Compress
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
                             } elseif ($alias) {
                                 # Keep pending polls as normal JSON responses (avoid noisy browser 404 errors).
-                                $mrsKeys = ($State.Keys | Where-Object { $_ -like 'MRSStatsJson_*' }) -join ','
-                                $safeAlias = $alias -replace '"',"'"
-                                $safeKeys  = $mrsKeys -replace '"',"'"
-                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"ok`":false,`"error`":`"not found`",`"alias`":`"$safeAlias`",`"availableKeys`":`"$safeKeys`"}")
+                                $mrsKeys = @($State.Keys | Where-Object { $_ -like "MRSStatsJson_${alias}*" } | Sort-Object)
+                                $payload = @{
+                                    ok = $false
+                                    error = 'not found'
+                                    alias = $alias
+                                    availableKeys = $mrsKeys
+                                } | ConvertTo-Json -Depth 6 -Compress
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
                             } else {
-                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"Missing alias parameter"}')
+                                $payload = @{ ok = $false; error = 'Missing alias parameter' } | ConvertTo-Json -Compress
+                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
                             }
                         } catch {
-                            $errMsg = $_.Exception.Message -replace '"', "'"
-                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"ok`":false,`"error`":`"$errMsg`"}")
+                            $payload = @{ ok = $false; error = "$($_.Exception.Message)" } | ConvertTo-Json -Compress
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
                         }
                     }
                     elseif ($path -eq '/api/mrs/export-xml') {
@@ -12071,7 +13038,7 @@ if ($MyInvocation.InvocationName -ne '.') {
                         }
                         elseif ($cmd.Action -eq 'fetchMRSStatistics') {
                             if ($cmd.Alias) {
-                                Invoke-MRSStatisticsRefresh -WatchState $watchState -Alias $cmd.Alias
+                                Invoke-MRSStatisticsRefresh -WatchState $watchState -Alias $cmd.Alias -CommandProfile $cmd.CommandProfile -ProfileSignature $cmd.ProfileSignature
                             }
                         }
                         elseif ($cmd.Action -eq 'exportMRSXml') {
@@ -12225,3 +13192,4 @@ if ($MyInvocation.InvocationName -ne '.') {
         Invoke-MigrationReport @invokeParams
     }
 }
+
