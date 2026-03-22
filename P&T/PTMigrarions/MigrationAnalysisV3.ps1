@@ -2039,11 +2039,24 @@ function Get-MoveRequests {
             }
         }
 
-        # SinceDate filter — QueuedTimestamp or StartTimestamp
+        # SinceDate filter - include common move lifecycle timestamps
         if ($SinceDate) {
             $moves = @($moves) | Where-Object {
-                $ts = if ($_.QueuedTimestamp) { $_.QueuedTimestamp } else { $_.StartTimestamp }
-                $ts -and $ts -ge $SinceDate
+                $candidates = @(
+                    $_.QueuedTimestamp,
+                    $_.StartTimestamp,
+                    $_.LastUpdateTimestamp,
+                    $_.CompletionTimestamp
+                )
+                $match = $false
+                foreach ($cand in $candidates) {
+                    if (-not $cand) { continue }
+                    try {
+                        $ts = [datetime]$cand
+                        if ($ts -ge $SinceDate) { $match = $true; break }
+                    } catch {}
+                }
+                $match
             }
         }
 
@@ -2106,6 +2119,169 @@ function Get-MoveRequests {
         Write-Console "Failed to retrieve move requests: $_" -Level ERROR
         throw
     }
+}
+
+function Get-CachedMoveStats {
+    param(
+        [object[]]$Stats,
+        [string]$StatusFilter = 'All',
+        [bool]$IncludeCompleted,
+        [string[]]$Mailbox,
+        [string]$MigrationBatchName,
+        [datetime]$SinceDate
+    )
+
+    if (-not $Stats -or @($Stats).Count -eq 0) { return @() }
+    $all = @($Stats)
+
+    # Normalize common naming variants from UI/docs.
+    $effectiveStatusFilter = switch ($StatusFilter) {
+        'CompletedWithWarnings' { 'CompletedWithWarning' }
+        default                 { $StatusFilter }
+    }
+
+    # Status filter
+    $filtered = switch ($effectiveStatusFilter) {
+        'All' {
+            if ($IncludeCompleted) {
+                $all
+            } else {
+                @($all) | Where-Object { $_.Status -notin @('Completed','CompletedWithWarning','CompletedWithSkippedItems') }
+            }
+        }
+        'Completed' { @($all) | Where-Object { $_.Status -in @('Completed','CompletedWithWarning','CompletedWithSkippedItems') } }
+        default     { @($all) | Where-Object { "$($_.Status)" -eq $effectiveStatusFilter } }
+    }
+
+    # Batch filter
+    if ($MigrationBatchName) {
+        $batchPatterns = @($MigrationBatchName -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        if ($batchPatterns.Count -eq 0) { $batchPatterns = @($MigrationBatchName) }
+
+        $filtered = @($filtered) | Where-Object {
+            $rawBatch  = "$($_.BatchName)"
+            $normBatch = $rawBatch -replace '^MigrationService:',''
+            foreach ($bp in $batchPatterns) {
+                if ($normBatch -like $bp -or $rawBatch -like $bp -or $normBatch -like "*$bp*" -or $rawBatch -like "*$bp*") {
+                    return $true
+                }
+            }
+            return $false
+        }
+    }
+
+    # SinceDate filter
+    if ($SinceDate) {
+        $filtered = @($filtered) | Where-Object {
+            $candidates = @(
+                $_.QueuedTimestamp,
+                $_.StartTimestamp,
+                $_.LastUpdateTimestamp,
+                $_.CompletionTimestamp
+            )
+            foreach ($cand in $candidates) {
+                if (-not $cand) { continue }
+                try {
+                    if ([datetime]$cand -ge $SinceDate) { return $true }
+                } catch {}
+            }
+            return $false
+        }
+    }
+
+    # Mailbox filter
+    if ($Mailbox -and @($Mailbox).Count -gt 0) {
+        $mailFilters = @()
+        foreach ($m in @($Mailbox)) {
+            if ($null -eq $m) { continue }
+            foreach ($part in @("$m" -split ',')) {
+                $p = $part.Trim()
+                if ($p) { $mailFilters += $p }
+            }
+        }
+        if ($mailFilters.Count -gt 0) {
+            $filtered = @($filtered) | Where-Object {
+                $alias    = "$($_.Alias)"
+                $disp     = "$($_.DisplayName)"
+                $identity = "$($_.Identity)"
+                $mailbox  = "$($_.MailboxIdentity)"
+                $exg      = "$($_.ExchangeGuid)"
+                $mbg      = "$($_.MailboxGuid)"
+                foreach ($f in $mailFilters) {
+                    if (
+                        ($alias    -and ($alias    -like $f -or $alias    -like "*$f*")) -or
+                        ($disp     -and ($disp     -like $f -or $disp     -like "*$f*")) -or
+                        ($identity -and ($identity -like $f -or $identity -like "*$f*")) -or
+                        ($mailbox  -and ($mailbox  -like $f -or $mailbox  -like "*$f*")) -or
+                        ($exg      -and ($exg      -like $f -or $exg      -like "*$f*")) -or
+                        ($mbg      -and ($mbg      -like $f -or $mbg      -like "*$f*"))
+                    ) { return $true }
+                }
+                return $false
+            }
+        }
+    }
+
+    return @($filtered)
+}
+
+function Invoke-MigrationReportFromCache {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$CachedRawStats,
+
+        [string]$StatusFilter = 'All',
+        [bool]$IncludeCompleted,
+        [string[]]$Mailbox,
+        [string]$MigrationBatchName,
+        [datetime]$SinceDate,
+
+        [int]$Percentile = 90,
+        [double]$MinSizeGBForScoring = 0.1,
+
+        [string]$ReportPath = (Get-Location).Path,
+        [string]$ReportName = 'MigrationReport',
+        [int]$AutoRefreshSeconds = 0,
+        [int]$ListenerPort = 0,
+        [string]$ListenerBaseUrl = '',
+        [bool]$SkipHtml,
+        [bool]$SkipCsv
+    )
+
+    $stats = Get-CachedMoveStats -Stats $CachedRawStats -StatusFilter $StatusFilter -IncludeCompleted:$IncludeCompleted -Mailbox $Mailbox -MigrationBatchName $MigrationBatchName -SinceDate $SinceDate
+    if (-not $stats -or @($stats).Count -eq 0) {
+        Write-Console 'No cached data matched the selected filters. Click Refresh Now to fetch latest data from Exchange.' -Level Warn
+        return $null
+    }
+
+    Write-Console "Rendering from cache: $(@($stats).Count) mailbox record(s)." -Level Info -NoTimestamp
+
+    $summary = Invoke-ProcessStats -Stats @($stats) -Name $ReportName -Percentile $Percentile -MinSizeGBForScoring $MinSizeGBForScoring
+    $summary | Add-Member -NotePropertyName FailedMailboxes -NotePropertyValue @() -Force
+
+    $detectedDetailReport = $false
+    $detSample = $null
+    foreach ($s in @($stats)) { if ($null -ne $s) { $detSample = $s; break } }
+    if ($null -ne $detSample) {
+        if     ([int64]$detSample.TickSrcProvider -gt 0 -or [int64]$detSample.TickDstProvider -gt 0) { $detectedDetailReport = $true }
+        elseif ($detSample.SourceLatencyMs -gt 0 -or $detSample.DestLatencyMs -gt 0)                 { $detectedDetailReport = $true }
+        elseif ($null -ne $detSample.Report -and "$($detSample.Report)" -notin @('','{}'))            { $detectedDetailReport = $true }
+    }
+    $summary | Add-Member -NotePropertyName HasDetailReport -NotePropertyValue $detectedDetailReport -Force
+
+    $health = Get-OverallHealthScore -Summary $summary
+    Write-ConsoleSummary -Summary $summary -Health $health
+
+    if (-not $SkipHtml) {
+        Export-HtmlReport -Summary $summary -Health $health -Path $ReportPath -AutoRefreshSeconds $AutoRefreshSeconds -ListenerPort $ListenerPort -ListenerBaseUrl $ListenerBaseUrl | Out-Null
+    }
+    if (-not $SkipCsv) {
+        Export-CsvReport -Summary $summary -Path $ReportPath | Out-Null
+    }
+
+    $summary | Add-Member -NotePropertyName RawStats -NotePropertyValue @($stats) -Force
+    return $summary
 }
 
 function Resolve-MoveGuid {
@@ -3846,6 +4022,361 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
   body.dark-mode tr.pinned-row:hover { background:#4a2106 !important; }
   .pin-header { width:40px; text-align:center; }
 
+  /* Compare Batch + Cohort UI refresh */
+  .compare-shell { padding:0 !important; overflow:hidden; }
+  .compare-layout {
+    display:grid;
+    grid-template-columns:280px 1fr;
+    min-height:560px;
+  }
+  .compare-side {
+    background:#f8fafc;
+    border-right:1px solid #e2e8f0;
+    display:flex;
+    flex-direction:column;
+    min-width:0;
+  }
+  .compare-side-head {
+    padding:16px;
+    border-bottom:1px solid #e2e8f0;
+    background:#fff;
+  }
+  .compare-title {
+    font-weight:700;
+    font-size:1rem;
+    color:#1e293b;
+    margin-bottom:6px;
+  }
+  .compare-subtitle {
+    font-size:.78rem;
+    color:#64748b;
+    line-height:1.45;
+    margin-bottom:10px;
+  }
+  .compare-run-btn {
+    width:100%;
+    justify-content:center;
+    margin-bottom:6px;
+  }
+  .compare-selection-hint {
+    font-size:.75rem;
+    color:#94a3b8;
+    text-align:center;
+  }
+  .compare-batch-list-wrap {
+    padding:12px;
+    flex:1;
+    overflow:auto;
+  }
+  .compare-batch-list {
+    display:flex;
+    flex-direction:column;
+    gap:8px;
+  }
+  .compare-batch-item {
+    display:flex;
+    align-items:center;
+    gap:8px;
+    padding:9px 10px;
+    border:1px solid #e2e8f0;
+    border-radius:8px;
+    cursor:pointer;
+    font-size:.84rem;
+    color:#334155;
+    background:#fff;
+    transition:all .15s ease;
+  }
+  .compare-batch-item:hover {
+    border-color:#bfdbfe;
+    background:#eff6ff;
+  }
+  .compare-batch-selected {
+    border-color:#93c5fd;
+    background:#dbeafe;
+    color:#1e3a8a;
+  }
+  .compare-batch-checkbox {
+    width:14px;
+    height:14px;
+    cursor:pointer;
+    flex:0 0 auto;
+  }
+  .compare-batch-name {
+    flex:1;
+    overflow:hidden;
+    text-overflow:ellipsis;
+    white-space:nowrap;
+  }
+  .compare-batch-count {
+    font-size:.74rem;
+    color:#64748b;
+    background:#f1f5f9;
+    border:1px solid #e2e8f0;
+    border-radius:999px;
+    padding:1px 8px;
+    flex-shrink:0;
+  }
+  .compare-loading-batches {
+    color:#94a3b8;
+    font-size:.82rem;
+    padding:8px 2px;
+  }
+  .compare-main {
+    display:flex;
+    flex-direction:column;
+    min-width:0;
+    background:#fff;
+  }
+  .compare-main-scroll {
+    padding:20px;
+    overflow:auto;
+    min-height:0;
+    flex:1;
+  }
+  .compare-state {
+    text-align:center;
+    padding:60px 26px;
+    color:#94a3b8;
+    border:1px dashed #cbd5e1;
+    border-radius:12px;
+    background:#f8fafc;
+  }
+  .compare-state-icon {
+    font-size:2.2rem;
+    line-height:1;
+    margin-bottom:10px;
+    color:#94a3b8;
+  }
+  .compare-results {
+    display:flex;
+    flex-direction:column;
+    gap:16px;
+  }
+  .compare-note {
+    padding:10px 14px;
+    background:#fffbeb;
+    border:1px solid #fcd34d;
+    border-radius:8px;
+    font-size:.82rem;
+    color:#92400e;
+  }
+  .compare-section {
+    border:1px solid #e2e8f0;
+    border-radius:10px;
+    background:#fff;
+    padding:14px;
+  }
+  .compare-section-title {
+    font-size:.82rem;
+    font-weight:700;
+    text-transform:uppercase;
+    letter-spacing:.06em;
+    color:#64748b;
+    margin-bottom:10px;
+  }
+  .compare-chart-wrap {
+    position:relative;
+    height:220px;
+  }
+  .compare-table-wrap {
+    border:1px solid #e2e8f0;
+    border-radius:8px;
+    overflow:auto;
+  }
+  #comparison-table {
+    width:100%;
+    border-collapse:collapse;
+    font-size:.82rem;
+  }
+  #comparison-table thead th {
+    position:sticky;
+    top:0;
+    z-index:1;
+    white-space:nowrap;
+    background:#f1f5f9;
+  }
+  #comparison-table tbody td {
+    white-space:nowrap;
+  }
+  .compare-section-row td {
+    padding:7px 10px;
+    background:#f8fafc;
+    border-top:1px solid #e2e8f0;
+    border-bottom:1px solid #e2e8f0;
+  }
+  .compare-section-label {
+    font-size:.71rem;
+    font-weight:700;
+    color:#64748b;
+    text-transform:uppercase;
+    letter-spacing:.07em;
+  }
+  .compare-metric-label {
+    font-weight:600;
+    color:#374151;
+  }
+  .compare-cell-alert {
+    color:#ef4444;
+    font-weight:700;
+  }
+  .compare-partial-note {
+    color:#f59e0b;
+    font-size:.73rem;
+    font-weight:700;
+    margin-left:4px;
+  }
+  #batch-trend-section .compare-chart-wrap {
+    height:260px;
+  }
+  .cohort-shell {
+    display:flex;
+    flex-direction:column;
+    gap:16px;
+    padding:18px 20px 20px !important;
+  }
+  .cohort-head {
+    display:flex;
+    align-items:flex-start;
+    justify-content:space-between;
+    gap:12px;
+    flex-wrap:wrap;
+  }
+  .cohort-title {
+    margin:0;
+    border:none !important;
+    padding:0 !important;
+    font-size:1rem;
+    color:#0f172a;
+  }
+  .cohort-note {
+    font-size:.82rem;
+    color:#64748b;
+    margin:7px 0 0;
+    line-height:1.5;
+    max-width:920px;
+  }
+  .cohort-updated {
+    font-size:.78rem;
+    color:#64748b;
+    background:#f8fafc;
+    border:1px solid #e2e8f0;
+    border-radius:999px;
+    padding:4px 10px;
+    white-space:nowrap;
+  }
+  .cohort-cards-grid {
+    display:grid;
+    grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+    gap:12px;
+  }
+  .cohort-card {
+    border:1px solid #e2e8f0;
+    border-radius:10px;
+    padding:12px 14px;
+    background:#f8fafc;
+  }
+  .cohort-card-label {
+    font-size:.72rem;
+    font-weight:700;
+    text-transform:uppercase;
+    letter-spacing:.06em;
+    margin-bottom:5px;
+  }
+  .cohort-card-value {
+    font-size:1.45rem;
+    font-weight:800;
+    line-height:1.1;
+  }
+  .cohort-card-sub {
+    margin-top:3px;
+    font-size:.78rem;
+  }
+  .cohort-card-total .cohort-card-label,
+  .cohort-card-total .cohort-card-value,
+  .cohort-card-total .cohort-card-sub { color:#334155; }
+  .cohort-card-good { background:#f0fdf4; border-color:#bbf7d0; }
+  .cohort-card-good .cohort-card-label,
+  .cohort-card-good .cohort-card-value,
+  .cohort-card-good .cohort-card-sub { color:#166534; }
+  .cohort-card-warn { background:#fff7ed; border-color:#fed7aa; }
+  .cohort-card-warn .cohort-card-label,
+  .cohort-card-warn .cohort-card-value,
+  .cohort-card-warn .cohort-card-sub { color:#9a3412; }
+  .cohort-card-danger { background:#fef2f2; border-color:#fecaca; }
+  .cohort-card-danger .cohort-card-label,
+  .cohort-card-danger .cohort-card-value,
+  .cohort-card-danger .cohort-card-sub { color:#991b1b; }
+  .cohort-table-wrap {
+    border:1px solid #e2e8f0;
+    border-radius:10px;
+    overflow:auto;
+    max-height:360px;
+  }
+  #cohort-table {
+    width:100%;
+    border-collapse:collapse;
+    font-size:.84rem;
+  }
+  #cohort-table thead th {
+    position:sticky;
+    top:0;
+    z-index:1;
+    background:#f8fafc;
+    border-bottom:2px solid #e2e8f0;
+    white-space:nowrap;
+  }
+  #cohort-table tbody td { white-space:nowrap; }
+  .cohort-empty-row td {
+    padding:24px;
+    text-align:center;
+    color:#94a3b8;
+  }
+  .cohort-charts-grid {
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:16px;
+  }
+  .cohort-chart-card {
+    border:1px solid #e2e8f0;
+    border-radius:10px;
+    background:#fff;
+    padding:12px;
+  }
+  .cohort-chart-title {
+    font-weight:700;
+    font-size:.8rem;
+    color:#475569;
+    margin-bottom:8px;
+  }
+
+  body.dark-mode .compare-side,
+  body.dark-mode .compare-main,
+  body.dark-mode .compare-section,
+  body.dark-mode .cohort-chart-card { background:#1e293b; border-color:#334155; }
+  body.dark-mode .compare-side-head,
+  body.dark-mode .compare-state,
+  body.dark-mode .cohort-card,
+  body.dark-mode .cohort-updated,
+  body.dark-mode #comparison-table thead th,
+  body.dark-mode #cohort-table thead th { background:#334155; border-color:#475569; color:#cbd5e1; }
+  body.dark-mode .compare-batch-item { background:#1e293b; border-color:#334155; color:#e2e8f0; }
+  body.dark-mode .compare-batch-item:hover { background:#334155; border-color:#475569; }
+  body.dark-mode .compare-batch-selected { background:#1d4ed8; border-color:#60a5fa; color:#fff; }
+  body.dark-mode .compare-batch-count { background:#1e293b; border-color:#475569; color:#cbd5e1; }
+  body.dark-mode .compare-title,
+  body.dark-mode .cohort-title { color:#f1f5f9; }
+  body.dark-mode .compare-subtitle,
+  body.dark-mode .compare-selection-hint,
+  body.dark-mode .cohort-note,
+  body.dark-mode .cohort-card-total .cohort-card-sub { color:#94a3b8; }
+  body.dark-mode .compare-section-title,
+  body.dark-mode .cohort-chart-title,
+  body.dark-mode .cohort-card-total .cohort-card-label,
+  body.dark-mode .cohort-card-total .cohort-card-value { color:#cbd5e1; }
+  body.dark-mode .compare-table-wrap,
+  body.dark-mode .cohort-table-wrap { border-color:#334155; }
+  body.dark-mode .compare-section-row td { background:#334155; border-color:#475569; }
+
   /* MRS Explorer UI refresh */
   .mrs-panel {
     padding:8px !important;
@@ -4035,6 +4566,20 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
   body.mrs-resizing-h, body.mrs-resizing-h * { user-select:none !important; cursor:row-resize !important; }
 
   @media (max-width: 1100px) {
+    .compare-layout {
+      grid-template-columns:1fr;
+      min-height:0;
+    }
+    .compare-side {
+      border-right:none;
+      border-bottom:1px solid #e2e8f0;
+      max-height:280px;
+    }
+    .compare-main-scroll { padding:14px; }
+    .cohort-shell { padding:14px !important; }
+    .cohort-charts-grid { grid-template-columns:1fr; }
+    .cohort-table-wrap { max-height:300px; }
+
     .mrs-panel { min-height:0; height:auto !important; }
     .mrs-shell { flex-direction:column; height:auto; }
     #mrs-splitter-main, #mrs-splitter-tree { display:none; }
@@ -4489,60 +5034,66 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
 
   <!-- Panel 3: Batch Comparison (Watch Mode Only) -->
   <div id="panel-compare" class="main-panel" style="display:none">
-    <div class="card" style="padding:0;overflow:hidden;">
-      <div style="display:grid;grid-template-columns:260px 1fr;min-height:500px;">
+    <div class="card compare-shell">
+      <div class="compare-layout">
 
         <!-- Left: Batch list -->
-        <div style="background:#f8fafc;border-right:1px solid #e2e8f0;display:flex;flex-direction:column;">
-          <div style="padding:16px;border-bottom:1px solid #e2e8f0;">
-            <div style="font-weight:700;font-size:1rem;color:#1e293b;margin-bottom:8px;">📋 Batch Comparison</div>
-            <button class="ent-btn" onclick="loadBatchComparison()" style="width:100%;justify-content:center;">🔄 Analyze / Compare Selected</button>
-            <div id="compare-selection-hint" style="font-size:.75rem;color:#94a3b8;text-align:center;margin-top:6px;">0 batches selected</div>
+        <div class="compare-side">
+          <div class="compare-side-head">
+            <div class="compare-title">Batch Comparison</div>
+            <div class="compare-subtitle">Select one or more batches and run a side-by-side analysis.</div>
+            <button class="ent-btn compare-run-btn" onclick="loadBatchComparison()">Analyze / Compare Selected</button>
+            <div id="compare-selection-hint" class="compare-selection-hint">0 batches selected</div>
           </div>
-          <div style="padding:12px;flex:1;overflow-y:auto;">
-            <div id="batch-selector" style="display:flex;flex-direction:column;gap:6px;"></div>
-            <div id="compare-loading-batches" style="color:#94a3b8;font-size:.82rem;padding:8px 0;">Loading batches…</div>
+          <div class="compare-batch-list-wrap">
+            <div id="batch-selector" class="compare-batch-list"></div>
+            <div id="compare-loading-batches" class="compare-loading-batches">Loading batches.</div>
           </div>
         </div>
 
         <!-- Right: Comparison results -->
-        <div style="padding:20px;overflow-y:auto;">
-          <div id="comparison-loading" style="display:none;text-align:center;padding:60px;color:#64748b;">
-            <div style="font-size:2rem;margin-bottom:10px;">⏳</div>
-            Loading batch data…
-          </div>
-
-          <div id="comparison-results" style="display:none;">
-            <!-- Fixed slot for scope warning — populated by JS, never grows the layout -->
-            <div id="compare-raw-note" style="display:none;margin-bottom:14px;padding:10px 14px;background:#fffbeb;border:1px solid #fcd34d;border-radius:8px;font-size:.82rem;color:#92400e;">
-              ⚠ One or more batches are outside the current watch scope. Status counts come directly from Exchange (authoritative) — transfer rate, size, and efficiency are only available for mailboxes loaded in the active scope.
+        <div class="compare-main">
+          <div class="compare-main-scroll">
+            <div id="comparison-loading" class="compare-state" style="display:none;">
+              <div class="compare-state-icon">?</div>
+              Loading batch data.
             </div>
-            <div style="margin-bottom:24px;">
-              <div style="font-size:.85rem;font-weight:600;color:#64748b;margin-bottom:12px;">Performance Comparison</div>
-              <!-- Fixed-height wrapper prevents Chart.js growing the canvas on each redraw -->
-              <div style="position:relative;height:220px;">
-                <canvas id="chart-batch-compare"></canvas>
+
+            <div id="comparison-results" class="compare-results" style="display:none;">
+              <!-- Fixed slot for scope warning - populated by JS, never grows the layout -->
+              <div id="compare-raw-note" class="compare-note" style="display:none;">
+                Note: one or more batches are outside the current watch scope. Status counts come directly from Exchange (authoritative); transfer rate, size, and efficiency are only available for mailboxes loaded in the active scope.
+              </div>
+              <div class="compare-section">
+                <div class="compare-section-title">Performance Comparison</div>
+                <!-- Fixed-height wrapper prevents Chart.js growing the canvas on each redraw -->
+                <div class="compare-chart-wrap">
+                  <canvas id="chart-batch-compare"></canvas>
+                </div>
+              </div>
+              <div class="compare-section">
+                <div class="compare-section-title">Metric Breakdown</div>
+                <div class="compare-table-wrap">
+                  <table id="comparison-table" style="width:100%">
+                    <thead><tr><th>Metric</th></tr></thead>
+                    <tbody id="comparison-tbody"></tbody>
+                  </table>
+                </div>
+              </div>
+              <!-- Batch trend over time -->
+              <div id="batch-trend-section" class="compare-section">
+                <div class="compare-section-title">Batch Progress Over Time</div>
+                <div id="batch-trend-empty" style="display:none;color:#94a3b8;font-size:.82rem;padding:20px 0;text-align:center;">No trend data yet - data points are collected each refresh cycle.</div>
+                <div class="compare-chart-wrap">
+                  <canvas id="chart-batch-trend"></canvas>
+                </div>
               </div>
             </div>
-            <div class="tbl-wrap">
-              <table id="comparison-table" style="width:100%">
-                <thead><tr><th>Metric</th></tr></thead>
-                <tbody id="comparison-tbody"></tbody>
-              </table>
-            </div>
-            <!-- Batch trend over time -->
-            <div id="batch-trend-section" style="margin-top:28px;">
-              <div style="font-size:.85rem;font-weight:600;color:#64748b;margin-bottom:12px;">📈 Batch Progress Over Time</div>
-              <div id="batch-trend-empty" style="display:none;color:#94a3b8;font-size:.82rem;padding:20px 0;text-align:center;">No trend data yet — data points are collected each refresh cycle.</div>
-              <div style="position:relative;height:260px;">
-                <canvas id="chart-batch-trend"></canvas>
-              </div>
-            </div>
-          </div>
 
-          <div id="comparison-empty" style="text-align:center;padding:60px;color:#94a3b8;">
-            <div style="font-size:3rem;margin-bottom:10px;">📊</div>
-            <div>Select 1 or more batches from the list on the left, then click <strong>Analyze / Compare Selected</strong>.</div>
+            <div id="comparison-empty" class="compare-state">
+              <div class="compare-state-icon">i</div>
+              <div>Select 1 or more batches from the list on the left, then click <strong>Analyze / Compare Selected</strong>.</div>
+            </div>
           </div>
         </div>
 
@@ -4605,47 +5156,49 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
 
   <!-- Panel 5: Cohort Analysis (always visible) -->
   <div id="panel-cohort" class="main-panel" style="display:none">
-    <div class="card">
-      <div style="display:flex;align-items:baseline;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:18px">
-        <h2 style="margin:0;border:none;padding:0">🪣 Mailbox Cohort Analysis</h2>
-        <span style="font-size:.78rem;color:#64748b" id="cohort-updated">—</span>
+    <div class="card cohort-shell">
+      <div class="cohort-head">
+        <div>
+          <h2 class="cohort-title">Mailbox Cohort Analysis</h2>
+          <p class="cohort-note">Mailboxes grouped by total size. Completion rate, failure rate, and average transfer rate per bucket help identify whether large mailboxes are systematically slower.</p>
+        </div>
+        <span id="cohort-updated" class="cohort-updated">-</span>
       </div>
-      <p style="font-size:.82rem;color:#64748b;margin:0 0 18px">Mailboxes grouped by total size. Completion rate, failure rate, and average transfer rate per bucket help identify whether large mailboxes are systematically slower.</p>
 
       <!-- Summary cards row -->
-      <div id="cohort-cards" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-bottom:24px"></div>
+      <div id="cohort-cards" class="cohort-cards-grid"></div>
 
       <!-- Table -->
-      <div style="overflow-x:auto">
-        <table id="cohort-table" style="width:100%;border-collapse:collapse;font-size:.85rem">
+      <div class="cohort-table-wrap">
+        <table id="cohort-table">
           <thead>
-            <tr style="background:#f1f5f9;text-align:left">
-              <th style="padding:8px 12px;border-bottom:2px solid #e2e8f0">Size Bucket</th>
-              <th style="padding:8px 12px;border-bottom:2px solid #e2e8f0;text-align:right">Mailboxes</th>
-              <th style="padding:8px 12px;border-bottom:2px solid #e2e8f0;text-align:right">Avg Size</th>
-              <th style="padding:8px 12px;border-bottom:2px solid #e2e8f0;text-align:right">Active</th>
-              <th style="padding:8px 12px;border-bottom:2px solid #e2e8f0;text-align:right">Completed</th>
-              <th style="padding:8px 12px;border-bottom:2px solid #e2e8f0;text-align:right">Failed</th>
-              <th style="padding:8px 12px;border-bottom:2px solid #e2e8f0;text-align:right">Completion %</th>
-              <th style="padding:8px 12px;border-bottom:2px solid #e2e8f0;text-align:right">Failure %</th>
-              <th style="padding:8px 12px;border-bottom:2px solid #e2e8f0;text-align:right">Avg Rate (MB/min)</th>
-              <th style="padding:8px 12px;border-bottom:2px solid #e2e8f0;text-align:right">Avg % Done</th>
+            <tr>
+              <th>Size Bucket</th>
+              <th style="text-align:right">Mailboxes</th>
+              <th style="text-align:right">Avg Size</th>
+              <th style="text-align:right">Active</th>
+              <th style="text-align:right">Completed</th>
+              <th style="text-align:right">Failed</th>
+              <th style="text-align:right">Completion %</th>
+              <th style="text-align:right">Failure %</th>
+              <th style="text-align:right">Avg Rate (MB/min)</th>
+              <th style="text-align:right">Avg % Done</th>
             </tr>
           </thead>
           <tbody id="cohort-tbody">
-            <tr><td colspan="10" style="padding:24px;text-align:center;color:#94a3b8">Loading cohort data…</td></tr>
+            <tr class="cohort-empty-row"><td colspan="10">Loading cohort data.</td></tr>
           </tbody>
         </table>
       </div>
 
       <!-- Bar chart canvas -->
-      <div style="margin-top:28px;display:grid;grid-template-columns:1fr 1fr;gap:24px" id="cohort-charts">
-        <div>
-          <div style="font-weight:600;font-size:.85rem;color:#475569;margin-bottom:8px">Completion Rate by Bucket (%)</div>
+      <div class="cohort-charts-grid" id="cohort-charts">
+        <div class="cohort-chart-card">
+          <div class="cohort-chart-title">Completion Rate by Bucket (%)</div>
           <canvas id="cohort-chart-completion" height="160"></canvas>
         </div>
-        <div>
-          <div style="font-weight:600;font-size:.85rem;color:#475569;margin-bottom:8px">Avg Transfer Rate by Bucket (MB/min)</div>
+        <div class="cohort-chart-card">
+          <div class="cohort-chart-title">Avg Transfer Rate by Bucket (MB/min)</div>
           <canvas id="cohort-chart-rate" height="160"></canvas>
         </div>
       </div>
@@ -4672,15 +5225,6 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
                   style="width:100%;padding:6px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:.8rem;background:#fff"
                   onchange="mrsApplyFilter()">
             <option value="All">All Statuses</option>
-            <option>AutoSuspended</option>
-            <option>Completed</option>
-            <option>CompletedWithWarning</option>
-            <option>CompletionInProgress</option>
-            <option>Failed</option>
-            <option>InProgress</option>
-            <option>Queued</option>
-            <option>Synced</option>
-            <option>Suspended</option>
           </select>
           <div style="display:flex;gap:4px">
             <button class="ent-btn" onclick="mrsApplyFilter()" style="flex:1;justify-content:center;padding:5px 0;font-size:.78rem">Search</button>
@@ -5120,7 +5664,7 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     if (!data || !data.length) {
       if (updEl) updEl.textContent = label || 'No cohort data yet.';
       var tb = document.getElementById('cohort-tbody');
-      if (tb) { tb.innerHTML = '<tr><td colspan="10" style="padding:24px;text-align:center;color:#94a3b8">' + (label || 'No cohort data yet. Wait for first refresh.') + '</td></tr>'; }
+      if (tb) { tb.innerHTML = '<tr class="cohort-empty-row"><td colspan="10">' + (label || 'No cohort data yet. Wait for first refresh.') + '</td></tr>'; }
       return;
     }
     if (updEl) updEl.textContent = label || ('Updated ' + new Date().toLocaleTimeString());
@@ -5140,7 +5684,7 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
         })
         .catch(function() {
           var tb = document.getElementById('cohort-tbody');
-          if (tb) { tb.innerHTML = '<tr><td colspan="10" style="padding:24px;text-align:center;color:#ef4444">Failed to load cohort data.</td></tr>'; }
+          if (tb) { tb.innerHTML = '<tr class="cohort-empty-row"><td colspan="10" style="color:#ef4444;">Failed to load cohort data.</td></tr>'; }
         });
     } else {
       // Static report mode — use data injected at generation time
@@ -5159,23 +5703,25 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     var overallComp = total > 0 ? (totalComp / total * 100).toFixed(1) : '0.0';
     var overallFail = total > 0 ? (totalFail / total * 100).toFixed(1) : '0.0';
     el.innerHTML =
-      '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:14px 18px">' +
-        '<div style="font-size:.75rem;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">Total Mailboxes</div>' +
-        '<div style="font-size:1.6rem;font-weight:700;color:#1e293b">' + total + '</div>' +
+      '<div class="cohort-card cohort-card-total">' +
+        '<div class="cohort-card-label">Total Mailboxes</div>' +
+        '<div class="cohort-card-value">' + total + '</div>' +
+        '<div class="cohort-card-sub">Across all size buckets</div>' +
       '</div>' +
-      '<div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:14px 18px">' +
-        '<div style="font-size:.75rem;color:#166534;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">Overall Completion</div>' +
-        '<div style="font-size:1.6rem;font-weight:700;color:#166534">' + overallComp + '%</div>' +
-        '<div style="font-size:.78rem;color:#166534">' + totalComp + ' of ' + total + '</div>' +
+      '<div class="cohort-card cohort-card-good">' +
+        '<div class="cohort-card-label">Overall Completion</div>' +
+        '<div class="cohort-card-value">' + overallComp + '%</div>' +
+        '<div class="cohort-card-sub">' + totalComp + ' of ' + total + ' complete</div>' +
       '</div>' +
-      '<div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:14px 18px">' +
-        '<div style="font-size:.75rem;color:#9a3412;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">Active / In-Flight</div>' +
-        '<div style="font-size:1.6rem;font-weight:700;color:#9a3412">' + totalActive + '</div>' +
+      '<div class="cohort-card cohort-card-warn">' +
+        '<div class="cohort-card-label">Active / In-Flight</div>' +
+        '<div class="cohort-card-value">' + totalActive + '</div>' +
+        '<div class="cohort-card-sub">Currently syncing or queued</div>' +
       '</div>' +
-      '<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:14px 18px">' +
-        '<div style="font-size:.75rem;color:#991b1b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">Overall Failure Rate</div>' +
-        '<div style="font-size:1.6rem;font-weight:700;color:#991b1b">' + overallFail + '%</div>' +
-        '<div style="font-size:.78rem;color:#991b1b">' + totalFail + ' failed</div>' +
+      '<div class="cohort-card cohort-card-danger">' +
+        '<div class="cohort-card-label">Overall Failure Rate</div>' +
+        '<div class="cohort-card-value">' + overallFail + '%</div>' +
+        '<div class="cohort-card-sub">' + totalFail + ' failed</div>' +
       '</div>';
   }
 
@@ -5186,16 +5732,16 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
       var compColor = b.CompletionRate >= 80 ? '#166534' : b.CompletionRate >= 50 ? '#854d0e' : '#991b1b';
       var failColor = b.FailureRate   >=  5 ? '#991b1b' : b.FailureRate   >=  2 ? '#854d0e' : '#166534';
       var rateColor = b.AvgTransferRateMBmin >= 1 ? '#166534' : b.AvgTransferRateMBmin >= 0.3 ? '#854d0e' : '#94a3b8';
-      return '<tr style="border-bottom:1px solid #f1f5f9">' +
+      return '<tr>' +
         '<td style="padding:8px 12px;font-weight:600">'                              + b.Bucket + '</td>' +
         '<td style="padding:8px 12px;text-align:right">'                             + b.Count  + '</td>' +
         '<td style="padding:8px 12px;text-align:right;color:#64748b">'               + b.AvgSizeGB + ' GB</td>' +
         '<td style="padding:8px 12px;text-align:right">'                             + b.Active + '</td>' +
         '<td style="padding:8px 12px;text-align:right;color:#166534">'               + b.Completed + '</td>' +
         '<td style="padding:8px 12px;text-align:right;color:#991b1b">'               + b.Failed + '</td>' +
-        '<td style="padding:8px 12px;text-align:right;font-weight:600;color:' + compColor + '">' + b.CompletionRate + '%</td>' +
-        '<td style="padding:8px 12px;text-align:right;font-weight:600;color:' + failColor + '">' + b.FailureRate    + '%</td>' +
-        '<td style="padding:8px 12px;text-align:right;font-weight:600;color:' + rateColor + '">' + b.AvgTransferRateMBmin + '</td>' +
+        '<td style="padding:8px 12px;text-align:right;font-weight:700;color:' + compColor + '">' + b.CompletionRate + '%</td>' +
+        '<td style="padding:8px 12px;text-align:right;font-weight:700;color:' + failColor + '">' + b.FailureRate    + '%</td>' +
+        '<td style="padding:8px 12px;text-align:right;font-weight:700;color:' + rateColor + '">' + b.AvgTransferRateMBmin + '</td>' +
         '<td style="padding:8px 12px;text-align:right;color:#64748b">'               + b.AvgPercentComplete + '%</td>' +
       '</tr>';
     });
@@ -6629,18 +7175,17 @@ function initBatchComparison() {
       var selector = document.getElementById('batch-selector');
       if (!selector) return;
       if (!batches || batches.length === 0) {
-        selector.innerHTML = '<div style="color:#94a3b8;font-size:.82rem;">No batches found.</div>';
+        selector.innerHTML = '<div class="compare-loading-batches">No batches found.</div>';
         return;
       }
       if (!Array.isArray(batches)) batches = [batches];
       selector.innerHTML = batches.map(function(b) {
         var name  = b.Name  || b.name  || '';
         var count = b.Count || b.count || 0;
-        return '<label style="display:flex;align-items:center;gap:8px;padding:8px 10px;background:#fff;border:1px solid #e2e8f0;border-radius:6px;cursor:pointer;font-size:.85rem;transition:background .1s;"' +
-          ' onmouseover="this.style.background=\'#f1f5f9\'" onmouseout="this.style.background=\'#fff\'">' +
-          '<input type="checkbox" class="batch-checkbox" value="' + name + '" onchange="updateSelectedBatches()" style="width:14px;height:14px;cursor:pointer;">' +
-          '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + name + '">' + name + '</span>' +
-          '<span style="color:#94a3b8;font-size:.75rem;flex-shrink:0;">' + count + '</span>' +
+        return '<label class="compare-batch-item">' +
+          '<input type="checkbox" class="batch-checkbox compare-batch-checkbox" value="' + name + '" onchange="updateSelectedBatches()">' +
+          '<span class="compare-batch-name" title="' + name + '">' + name + '</span>' +
+          '<span class="compare-batch-count">' + count + '</span>' +
         '</label>';
       }).join('');
       var st = loadBatchCompareUiState();
@@ -6662,6 +7207,12 @@ function initBatchComparison() {
 function updateSelectedBatches() {
   var checkboxes = document.querySelectorAll('.batch-checkbox:checked');
   selectedBatches = Array.from(checkboxes).map(function(cb) { return cb.value; });
+  document.querySelectorAll('.batch-checkbox').forEach(function(cb) {
+    var row = cb.closest('label');
+    if (!row) return;
+    if (cb.checked) row.classList.add('compare-batch-selected');
+    else row.classList.remove('compare-batch-selected');
+  });
   var hint = document.getElementById('compare-selection-hint');
   if (hint) {
     hint.textContent = selectedBatches.length === 0
@@ -6695,12 +7246,12 @@ function loadBatchComparison(options) {
   resultsEl.style.display = 'none';
   loadingEl.style.display = 'block';
   loadingEl.innerHTML = cacheOnly
-    ? '<div style="font-size:2rem;margin-bottom:10px;">?</div>Loading cached batch comparison data.'
-    : '<div style="font-size:2rem;margin-bottom:10px;">?</div>Requesting batch data from Exchange.';
+    ? '<div class="compare-state-icon">?</div><div>Loading cached batch comparison data.</div>'
+    : '<div class="compare-state-icon">?</div><div>Requesting batch data from Exchange.</div>';
 
   function showError(message) {
     loadingEl.style.display = 'none';
-    emptyEl.innerHTML = '<div style="font-size:2rem;margin-bottom:10px;">??</div>' +
+    emptyEl.innerHTML = '<div class="compare-state-icon">!</div>' +
       '<div style="color:#ef4444;">' + message + '</div>';
     emptyEl.style.display = 'block';
   }
@@ -6732,13 +7283,13 @@ function loadBatchComparison(options) {
     loadingEl.style.display = 'none';
     if (!ready || ready.length === 0) {
       if (cacheOnly) {
-        emptyEl.innerHTML = '<div style="font-size:2rem;margin-bottom:10px;">??</div>' +
+        emptyEl.innerHTML = '<div class="compare-state-icon">!</div>' +
           '<div>No cached comparison data found. Click <strong>Analyze / Compare Selected</strong> to refresh.</div>';
       } else if (timedOut) {
-        emptyEl.innerHTML = '<div style="font-size:2rem;margin-bottom:10px;">??</div>' +
+        emptyEl.innerHTML = '<div class="compare-state-icon">!</div>' +
           '<div style="color:#ef4444;">Timed out waiting for batch data. The main loop may be busy - try again.</div>';
       } else {
-        emptyEl.innerHTML = '<div style="font-size:2rem;margin-bottom:10px;">??</div>' +
+        emptyEl.innerHTML = '<div class="compare-state-icon">!</div>' +
           '<div style="color:#ef4444;">Could not load data: ' +
           (missing || []).map(function(r) { return '<strong>' + r.batchName + '</strong> (' + ((r.data && r.data.error) || 'not found') + ')'; }).join(', ') +
           '</div>';
@@ -6814,7 +7365,7 @@ function renderBatchComparison(batches) {
   // Update table headers
   var thead = document.querySelector('#comparison-table thead tr');
   thead.innerHTML = '<th>Metric</th>' + batches.map(function(b) {
-    var note = b.DataSource === 'batch' ? ' <span title="Rate/size data not in current scope" style="color:#f59e0b;font-size:.75rem;">⚠ no rate</span>' : '';
+    var note = b.DataSource === 'batch' ? ' <span title="Rate/size data not in current scope" class="compare-partial-note">no rate</span>' : '';
     return '<th>' + b.BatchName + note + '</th>';
   }).join('');
 
@@ -6905,15 +7456,14 @@ function renderBatchComparison(batches) {
   var tbody = document.getElementById('comparison-tbody');
   tbody.innerHTML = metrics.map(function(m) {
     if (m.section) {
-      return '<tr style="background:#f1f5f9;"><td colspan="' + (batches.length + 1) + '" style="padding:6px 10px;font-size:.72rem;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.06em;">' + m.label + '</td></tr>';
+      return '<tr class="compare-section-row"><td colspan="' + (batches.length + 1) + '"><span class="compare-section-label">' + m.label + '</span></td></tr>';
     }
     var cells = batches.map(function(b) {
       var val = b[m.key];
-      var style = '';
-      if (m.highlight && val > 0) style = 'color:#ef4444;font-weight:600;';
-      return '<td style="' + style + '">' + m.format(val, b) + '</td>';
+      var cls = m.highlight && val > 0 ? 'compare-cell-alert' : '';
+      return '<td class="' + cls + '">' + m.format(val, b) + '</td>';
     }).join('');
-    return '<tr><td style="font-weight:500;color:#374151;">' + m.label + '</td>' + cells + '</tr>';
+    return '<tr><td class="compare-metric-label">' + m.label + '</td>' + cells + '</tr>';
   }).join('');
 
   // Render comparison chart — status breakdown stacked bar
@@ -7838,7 +8388,7 @@ $(if($ListenerPort -gt 0){
 
     <div class='watch-btn-row'>
 
-      <button class='wbtn wbtn-p' style='flex:1' onclick='apiSwitch()'>Apply &amp; Refresh</button>
+      <button class='wbtn wbtn-p' style='flex:1' onclick='apiSwitch()'>Apply Filters (Cache)</button>
 
       <button class='wbtn wbtn-s' onclick='apiSwitchAll()'>All</button>
 
@@ -8540,7 +9090,11 @@ function apiCall(endpoint, method, body) {
     var search = document.getElementById('mrs-search');
     var status = document.getElementById('mrs-status-filter');
     if (search) search.value = st.search || '';
-    if (status) status.value = st.status || 'All';
+    if (status) {
+      var restored = st.status || 'All';
+      status.value = restored;
+      status.setAttribute('data-pending-status', restored);
+    }
     mrsState.currentAlias = st.currentAlias || null;
     mrsState.currentProp = st.currentProp || null;
     mrsState.treeExpanded = st.treeExpanded && typeof st.treeExpanded === 'object' ? st.treeExpanded : {};
@@ -8649,6 +9203,90 @@ function apiCall(endpoint, method, body) {
     return '#64748b';
   }
 
+  function mrsStatusPriority(s) {
+    var order = {
+      InProgress: 1, AutoSuspended: 2, Suspended: 3, Queued: 4,
+      Failed: 5, CompletionFailed: 6, IncrementalFailed: 7,
+      Synced: 8, CompletedWithWarning: 9, CompletedWithWarnings: 10, CompletedWithSkippedItems: 11, Completed: 12
+    };
+    return Object.prototype.hasOwnProperty.call(order, s) ? order[s] : 99;
+  }
+
+  function mrsUniqueStatuses(statuses) {
+    var seen = {};
+    var out = [];
+    (statuses || []).forEach(function(s) {
+      var v = String(s || '').trim();
+      if (!v || seen[v]) return;
+      seen[v] = true;
+      out.push(v);
+    });
+    out.sort(function(a, b) {
+      var pa = mrsStatusPriority(a);
+      var pb = mrsStatusPriority(b);
+      if (pa !== pb) return pa - pb;
+      return a.localeCompare(b);
+    });
+    return out;
+  }
+
+  function mrsUpdateStatusFilterOptions(statuses, preferredStatus) {
+    var sel = document.getElementById('mrs-status-filter');
+    if (!sel) return { selected: 'All', changed: false };
+
+    var pending = sel.getAttribute('data-pending-status');
+    var wanted = preferredStatus || pending || sel.value || 'All';
+    var uniq = mrsUniqueStatuses(statuses);
+    var html = '<option value="All">All Statuses</option>' + uniq.map(function(s) {
+      return '<option value="' + s.replace(/"/g, '&quot;') + '">' + s + '</option>';
+    }).join('');
+    sel.innerHTML = html;
+
+    var selected = (wanted !== 'All' && uniq.indexOf(wanted) !== -1) ? wanted : 'All';
+    var changed = selected !== wanted;
+    sel.value = selected;
+    sel.removeAttribute('data-pending-status');
+    return { selected: selected, changed: changed };
+  }
+
+  function mrsToArray(v) {
+    if (Array.isArray(v)) return v;
+    if (v === null || v === undefined) return [];
+    return [v];
+  }
+
+  function mrsFilterItemsByStatus(items, status) {
+    if (!status || status === 'All') return mrsToArray(items);
+    var want = String(status).trim().toLowerCase();
+    return mrsToArray(items).filter(function(i) {
+      return String((i && i.Status) || '').trim().toLowerCase() === want;
+    });
+  }
+
+  function mrsResolveListResponse(resp, requestedStatus) {
+    var items = mrsToArray(resp && resp.items);
+    var allItems = mrsToArray(resp && resp.allItems);
+    if (!allItems.length) allItems = items.slice();
+    var statuses = (resp && resp.availableStatuses !== undefined)
+      ? mrsToArray(resp.availableStatuses)
+      : mrsUniqueStatuses(allItems.map(function(i) { return i && i.Status; }));
+    var update = mrsUpdateStatusFilterOptions(statuses, requestedStatus);
+    var selected = update.selected || 'All';
+
+    // Enforce selected status locally so UI remains correct even if API returns an unfiltered list.
+    if (selected === 'All') {
+      if (update.changed) items = allItems.slice();
+    } else {
+      items = mrsFilterItemsByStatus(allItems.length ? allItems : items, selected);
+    }
+    return {
+      items: items,
+      allItems: allItems,
+      availableStatuses: statuses,
+      selectedStatus: selected
+    };
+  }
+
   // ── On tab activate ─────────────────────────────────────────────
   function mrsOnTabActivate() {
     console.log('[MRS] tab activated. lastFetchTime=', mrsState.lastFetchTime,
@@ -8698,15 +9336,19 @@ function apiCall(endpoint, method, body) {
 
   // ── Fetch move request list ─────────────────────────────────────
   function mrsLoadListFromCache(done) {
-    var search = encodeURIComponent((document.getElementById('mrs-search') || {}).value || '');
-    var status = encodeURIComponent((document.getElementById('mrs-status-filter') || {}).value || 'All');
+    var searchVal = (document.getElementById('mrs-search') || {}).value || '';
+    var statusVal = (document.getElementById('mrs-status-filter') || {}).value || 'All';
+    var search = encodeURIComponent(searchVal);
+    var status = encodeURIComponent(statusVal);
     var url = '/api/mrs/move-requests?search=' + search + '&status=' + status;
     apiCall(url, 'GET', null).then(function(resp) {
-      var items = (resp && Array.isArray(resp.items)) ? resp.items : [];
+      var resolved = mrsResolveListResponse(resp, statusVal);
+      var items = resolved.items || [];
       if (items.length > 0 || (resp && resp.cacheTime)) {
         mrsState.listItems = items;
         mrsRenderList(items);
       }
+      mrsSaveUiState();
       if (done) done({ hasCache: !!(resp && resp.cacheTime), items: items });
     }).catch(function(err) {
       console.warn('[MRS] mrsLoadListFromCache error:', err);
@@ -8739,8 +9381,10 @@ function apiCall(endpoint, method, body) {
       tbody.innerHTML = '<tr><td colspan="3" style="padding:16px;text-align:center;color:#ef4444">Timed out. Try again.</td></tr>';
       return;
     }
-    var search = encodeURIComponent(document.getElementById('mrs-search').value || '');
-    var status = encodeURIComponent(document.getElementById('mrs-status-filter').value || 'All');
+    var searchVal = document.getElementById('mrs-search').value || '';
+    var statusVal = document.getElementById('mrs-status-filter').value || 'All';
+    var search = encodeURIComponent(searchVal);
+    var status = encodeURIComponent(statusVal);
     var url = '/api/mrs/move-requests?search=' + search + '&status=' + status;
     apiCall(url, 'GET', null).then(function(resp) {
       // Wait until cacheTime is set AND is newer than when we posted (avoids stale data on Refresh)
@@ -8750,7 +9394,8 @@ function apiCall(endpoint, method, body) {
         setTimeout(function() { mrsPollList(startTime, pollSince); }, 1500);
         return;
       }
-      mrsState.listItems = resp.items || [];
+      var resolved = mrsResolveListResponse(resp, statusVal);
+      mrsState.listItems = resolved.items || [];
       console.log('[MRS] mrsPollList: resolved', mrsState.listItems.length, 'items');
       mrsRenderList(mrsState.listItems);
       mrsSaveUiState();
@@ -8809,11 +9454,16 @@ function apiCall(endpoint, method, body) {
   // ── Apply filter to already-cached list (no EXO re-fetch) ──────
   function mrsApplyFilter() {
     mrsSaveUiState();
-    var search = encodeURIComponent(document.getElementById('mrs-search').value || '');
-    var status = encodeURIComponent(document.getElementById('mrs-status-filter').value || 'All');
+    var searchVal = document.getElementById('mrs-search').value || '';
+    var statusVal = document.getElementById('mrs-status-filter').value || 'All';
+    var search = encodeURIComponent(searchVal);
+    var status = encodeURIComponent(statusVal);
     apiCall('/api/mrs/move-requests?search=' + search + '&status=' + status, 'GET', null).then(function(resp) {
       if (resp && resp.items) {
-        mrsRenderList(resp.items);
+        var resolved = mrsResolveListResponse(resp, statusVal);
+        mrsState.listItems = resolved.items || [];
+        mrsRenderList(mrsState.listItems);
+        mrsSaveUiState();
       }
     }).catch(function(){});
   }
@@ -10227,26 +10877,50 @@ function Start-WatchListener {
                         try {
                             $cache     = $State['MRSMoveRequestCache']
                             $cacheTime = $State['MRSMoveRequestCacheTime']
-                            $items     = @(if ($cache) { $cache } else { @() })
-                            $qs        = if ($req.Url.Query) { [System.Web.HttpUtility]::ParseQueryString($req.Url.Query) } else { $null }
-                            $searchVal = if ($qs) { $qs['search'] } else { $null }
-                            $statusVal = if ($qs) { $qs['status'] } else { $null }
+                            $itemsRaw  = @(if ($cache) { $cache } else { @() })
+                            $rawQuery  = $null
+                            if ($req.RawUrl -match '\?(.*)$') {
+                                $rawQuery = $Matches[1]
+                            } elseif ($req.Url.Query) {
+                                $rawQuery = $req.Url.Query.TrimStart('?')
+                            }
+                            $qs        = if ($rawQuery) { [System.Web.HttpUtility]::ParseQueryString($rawQuery) } else { $null }
+                            $searchVal = if ($qs) { "$($qs['search'])" } else { '' }
+                            $statusVal = if ($qs) { "$($qs['status'])" } else { '' }
+                            $searchVal = $searchVal.Trim()
+                            $statusVal = $statusVal.Trim()
+                            $searchItems = @($itemsRaw)
                             if ($searchVal) {
                                 $sv = $searchVal.ToLower()
-                                $items = @($items | Where-Object {
+                                $searchItems = @($searchItems | Where-Object {
                                     ("$($_.Name)".ToLower()      -like "*$sv*") -or
                                     ("$($_.Alias)".ToLower()     -like "*$sv*") -or
                                     ("$($_.BatchName)".ToLower() -like "*$sv*")
                                 })
                             }
+                            $availableStatuses = @(
+                                $searchItems |
+                                    ForEach-Object { "$($_.Status)".Trim() } |
+                                    Where-Object { $_ -and $_ -ne '' } |
+                                    Sort-Object -Unique
+                            )
+                            $items = @($searchItems)
                             if ($statusVal -and $statusVal -ne 'All') {
-                                $items = @($items | Where-Object { "$($_.Status)" -eq $statusVal })
+                                $statusNeedle = $statusVal.ToLowerInvariant()
+                                $items = @($items | Where-Object {
+                                    "$($_.Status)".Trim().ToLowerInvariant() -eq $statusNeedle
+                                })
                             }
-                            $payload = @{ cacheTime = $cacheTime; items = $items } | ConvertTo-Json -Depth 3 -Compress
+                            $payload = @{
+                                cacheTime = $cacheTime
+                                items = $items
+                                allItems = $searchItems
+                                availableStatuses = $availableStatuses
+                            } | ConvertTo-Json -Depth 4 -Compress
                             $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
                         } catch {
                             $errMsg = $_.Exception.Message -replace '"', "'"
-                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"error`":`"$errMsg`",`"cacheTime`":null,`"items`":[]}")
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"error`":`"$errMsg`",`"cacheTime`":null,`"items`":[],`"allItems`":[],`"availableStatuses`":[]}")
                         }
                     }
                     elseif ($path -eq '/api/mrs/fetch-statistics' -and $req.HttpMethod -eq 'POST') {
@@ -10720,9 +11394,9 @@ function Invoke-MigrationReport {
     Write-Console "All reports generated successfully." -Level SUCCESS
     Write-Console "Output directory: $ReportPath"       -Level SUCCESS
 
-    # Attach raw stats for trend extraction (only when IncludeDetailReport was used)
-    if ($detectedDetailReport -and $goodStats) {
-        $summary | Add-Member -NotePropertyName RawStats -NotePropertyValue $goodStats -Force
+    # Attach raw stats for cache-first re-rendering and trend extraction.
+    if ($goodStats) {
+        $summary | Add-Member -NotePropertyName RawStats -NotePropertyValue @($goodStats) -Force
     }
 
     return $summary
@@ -10867,6 +11541,7 @@ if ($MyInvocation.InvocationName -ne '.') {
             IncludeDetailReport = $IncludeDetailReport.IsPresent
             IncludeDetailInScheduled = $IncludeDetailInScheduledReport.IsPresent
             IsPaused      = $false
+            RenderFromCacheNext = $false
             AlertConfig   = @{
                 smtpServer = $SmtpServer
                 smtpPort = $SmtpPort
@@ -11002,7 +11677,37 @@ if ($MyInvocation.InvocationName -ne '.') {
                     Write-Console "$($settingsList -join ' | ')" -Level Settings -NoTimestamp
                 }
 
-                $result = Invoke-MigrationReport @invokeParams
+                $renderFromCache = [bool]$watchState['RenderFromCacheNext']
+                $watchState['RenderFromCacheNext'] = $false
+                $usedCacheRender = $false
+
+                if ($renderFromCache -and $watchState['CachedRawStats'] -and @($watchState['CachedRawStats']).Count -gt 0) {
+                    $cacheInvokeParams = @{
+                        CachedRawStats      = @($watchState['CachedRawStats'])
+                        StatusFilter        = if ($invokeParams.ContainsKey('StatusFilter')) { $invokeParams.StatusFilter } else { 'All' }
+                        IncludeCompleted    = [bool]($invokeParams.ContainsKey('IncludeCompleted') -and $invokeParams.IncludeCompleted)
+                        Percentile          = if ($invokeParams.ContainsKey('Percentile')) { [int]$invokeParams.Percentile } else { 90 }
+                        MinSizeGBForScoring = if ($invokeParams.ContainsKey('MinSizeGBForScoring')) { [double]$invokeParams.MinSizeGBForScoring } else { 0.1 }
+                        ReportPath          = $invokeParams.ReportPath
+                        ReportName          = $invokeParams.ReportName
+                        AutoRefreshSeconds  = if ($invokeParams.ContainsKey('AutoRefreshSeconds')) { [int]$invokeParams.AutoRefreshSeconds } else { 0 }
+                        ListenerPort        = if ($invokeParams.ContainsKey('ListenerPort')) { [int]$invokeParams.ListenerPort } else { 0 }
+                        ListenerBaseUrl     = if ($invokeParams.ContainsKey('ListenerBaseUrl')) { "$($invokeParams.ListenerBaseUrl)" } else { '' }
+                        SkipHtml            = [bool]($invokeParams.ContainsKey('SkipHtml') -and $invokeParams.SkipHtml)
+                        SkipCsv             = [bool]($invokeParams.ContainsKey('SkipCsv') -and $invokeParams.SkipCsv)
+                    }
+                    if ($invokeParams.ContainsKey('Mailbox'))            { $cacheInvokeParams['Mailbox']            = $invokeParams.Mailbox }
+                    if ($invokeParams.ContainsKey('MigrationBatchName')) { $cacheInvokeParams['MigrationBatchName'] = $invokeParams.MigrationBatchName }
+                    if ($invokeParams.ContainsKey('SinceDate'))          { $cacheInvokeParams['SinceDate']          = $invokeParams.SinceDate }
+
+                    $result = Invoke-MigrationReportFromCache @cacheInvokeParams
+                    $usedCacheRender = $true
+                } else {
+                    if ($renderFromCache) {
+                        Write-Console "Cached data is not available yet - falling back to live Exchange refresh." -Level Warn -NoTimestamp
+                    }
+                    $result = Invoke-MigrationReport @invokeParams
+                }
 
                 $watchState['LastRefresh']  = Get-Date
                 $watchState['IsRefreshing'] = $false
@@ -11010,21 +11715,23 @@ if ($MyInvocation.InvocationName -ne '.') {
                     $watchState['MailboxCount'] = $result.MailboxCount
                     $watchState['Throughput'] = $result.TotalThroughputGBPerHour
                     $watchState['CachedMailboxes'] = $result.PerMailboxDetail
-                    # Refresh tenant-wide batch list from EXO so new batches appear in browser selector
-                    try {
-                        $allMovesForBatches = Get-MoveRequest -ErrorAction Stop
-                        $watchState['Batches'] = @(
-                            $allMovesForBatches |
-                                Group-Object { "$($_.BatchName)" -replace '^MigrationService:','' } |
-                                Where-Object { $_.Name } |
-                                Sort-Object Name |
-                                ForEach-Object { @{ Name = $_.Name; Count = $_.Count } }
-                        )
-                        $watchState['AllRawMoves'] = @($allMovesForBatches)
-                    } catch {
-                        Write-Console "Could not refresh batch list: $_" -Level Warn -NoTimestamp
+                    # Refresh tenant-wide batch list only after live Exchange refresh.
+                    if (-not $usedCacheRender) {
+                        try {
+                            $allMovesForBatches = Get-MoveRequest -ErrorAction Stop
+                            $watchState['Batches'] = @(
+                                $allMovesForBatches |
+                                    Group-Object { "$($_.BatchName)" -replace '^MigrationService:','' } |
+                                    Where-Object { $_.Name } |
+                                    Sort-Object Name |
+                                    ForEach-Object { @{ Name = $_.Name; Count = $_.Count } }
+                            )
+                            $watchState['AllRawMoves'] = @($allMovesForBatches)
+                        } catch {
+                            Write-Console "Could not refresh batch list: $_" -Level Warn -NoTimestamp
+                        }
                     }
-                    # Cache raw stats for trend extraction (when IncludeDetailReport is enabled)
+                    # Cache raw stats for trend extraction and cache-first filtering.
                     if ($result.RawStats) {
                         $watchState['CachedRawStats'] = $result.RawStats
                         # Pre-process trend data for each mailbox (since Get-MigrationTrend isn't available in runspace)
@@ -11345,8 +12052,11 @@ if ($MyInvocation.InvocationName -ne '.') {
                                 $invokeParams.Remove('SinceDate')
                                 $watchState['CurrentSinceDate'] = ''
                             }
+                            $watchState['RenderFromCacheNext'] = $true
+                            Write-Console "Applying scope/date filters from cache. Use 'Refresh Now' to fetch latest Exchange data." -Level API -NoTimestamp
                         }
                         elseif ($cmd.Action -eq 'refresh') {
+                            $watchState['RenderFromCacheNext'] = $false
                             Write-Console "Manual refresh requested" -Level API -NoTimestamp
                         }
                         elseif ($cmd.Action -eq 'fetchBatchStats') {
@@ -11433,6 +12143,7 @@ if ($MyInvocation.InvocationName -ne '.') {
                                 $invokeParams.StatusFilter = 'All'
                             }
                             $watchState['CurrentStatusFilter'] = $invokeParams.StatusFilter
+                            $watchState['RenderFromCacheNext'] = $true
                             Write-Console "Status Filter changed to $($invokeParams.StatusFilter)" -Level API -NoTimestamp
                         }
                         elseif ($cmd.Action -eq 'UpdatePaused') {
@@ -11489,7 +12200,7 @@ if ($MyInvocation.InvocationName -ne '.') {
                             $watchState['LastAlert'] = (Get-Date).ToString('HH:mm:ss')
                         }
                         # Mark that we should break to refresh after processing all commands
-                        if ($cmd.Action -eq 'refresh' -or $cmd.Action -eq 'switch') {
+                        if ($cmd.Action -eq 'refresh' -or $cmd.Action -eq 'switch' -or $cmd.Action -eq 'UpdateStatusFilter') {
                             $shouldBreak = $true
                         }
                     }
@@ -11514,5 +12225,3 @@ if ($MyInvocation.InvocationName -ne '.') {
         Invoke-MigrationReport @invokeParams
     }
 }
-
-
