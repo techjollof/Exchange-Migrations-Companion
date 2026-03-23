@@ -912,6 +912,521 @@ function Invoke-MigrationRetry {
     }
 }
 
+function Get-BatchReportDerivedTrend {
+    <#
+    .SYNOPSIS
+        Builds a lightweight trend series from MigrationBatch Report.Entries.
+        Used as fallback when watch-mode snapshot trend is flat or unavailable.
+    .PARAMETER ReportEntries
+        The MigrationBatch Report.Entries collection.
+    .PARAMETER TotalCountHint
+        Optional total mailbox count from Get-MigrationBatch.
+    #>
+    param(
+        [object[]]$ReportEntries,
+        [int]$TotalCountHint = 0
+    )
+
+    $result = [ordered]@{
+        Points               = @()
+        EntryCount           = 0
+        TransitionEventCount = 0
+        FailureEventCount    = 0
+        ProcessedUsers       = 0
+    }
+    if (-not $ReportEntries -or @($ReportEntries).Count -eq 0) { return $result }
+
+    $sorted = @(
+        $ReportEntries |
+            Where-Object { $_ -and $_.CreationTime } |
+            Sort-Object {
+                try { [datetime]$_.CreationTime } catch { [datetime]::MinValue }
+            }
+    )
+    $result.EntryCount = $sorted.Count
+    if ($sorted.Count -eq 0) { return $result }
+
+    $statusCounts = @{}
+    $transitionEvents = 0
+    $failureEvents = 0
+    $processedCumulative = 0
+    $points = [System.Collections.ArrayList]@()
+
+    $activeKeys = @('StatusSyncing','StatusStarting','StatusIncrementalSyncing','IncrementalSyncing','StatusCompleting','Completing')
+    $syncedKeys = @('StatusSynced','Synced','IncrementalSynced')
+    $finalizedKeys = @('StatusCompleted','Completed','CompletionSynced')
+    $failedKeys = @('StatusFailed','Failed','IncrementalFailed','CompletionFailed')
+    $pendingKeys = @('StatusValidating','Validating','StatusQueued','Queued','Unapproved','StatusProvisioning','Provisioning','StatusProvisionUpdating','ProvisionUpdating')
+    $stoppedKeys = @('Stopped','Stopping','IncrementalStopped')
+    $inFlightKeys = @('StatusValidating','Validating','StatusStarting','Starting','StatusSyncing','Syncing','StatusIncrementalSyncing','IncrementalSyncing','Removing','StatusRemoving','StatusCompleting','Completing')
+    $syncedNetKeys = @('StatusSynced','Synced','IncrementalSynced','StatusCompleted','Completed','CompletionSynced')
+    $failedNetKeys = @('StatusFailed','Failed','IncrementalFailed','CompletionFailed')
+    $completionBlockedKeys = @('CompletionBlocked','StatusCompletionBlocked')
+    $unapprovedKeys = @('Unapproved','StatusUnapproved')
+
+    foreach ($entry in $sorted) {
+        $ts = $null
+        try { $ts = [datetime]$entry.CreationTime } catch { continue }
+
+        # Entries from Import-Clixml often carry text in Message.LocalizedString.
+        $msgText = ''
+        if ($entry.PSObject.Properties['Message'] -and $entry.Message) {
+            if ($entry.Message -is [string]) {
+                $msgText = "$($entry.Message)"
+            } elseif ($entry.Message.PSObject.Properties['LocalizedString']) {
+                $msgText = "$($entry.Message.LocalizedString)"
+            } else {
+                $msgText = "$($entry.Message)"
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($msgText) -and $entry.PSObject.Properties['LocalizedString'] -and $entry.LocalizedString) {
+            if ($entry.LocalizedString -is [string]) {
+                $msgText = "$($entry.LocalizedString)"
+            } elseif ($entry.LocalizedString.PSObject.Properties['LocalizedString']) {
+                $msgText = "$($entry.LocalizedString.LocalizedString)"
+            } else {
+                $msgText = "$($entry.LocalizedString)"
+            }
+        }
+        $msgText = ($msgText -replace '[\r\n]+', ' ').Trim()
+
+        $processedDelta = 0
+        if ($msgText -match 'Processed\s+(\d+)\s+migration users') {
+            try { $processedDelta = [int]$Matches[1] } catch {}
+        }
+        $processedCumulative += $processedDelta
+
+        $hadTransition = $false
+        $transitionRaw = ''
+        if ($msgText -match "transitions:\s*'([^']*)'") {
+            $transitionRaw = "$($Matches[1])".Trim()
+        }
+        if (-not [string]::IsNullOrWhiteSpace($transitionRaw) -and $transitionRaw -ne '.') {
+            $deltaMatches = [regex]::Matches($transitionRaw, '([A-Za-z][A-Za-z0-9_]*)\s*->\s*([+-]?\d+)')
+            foreach ($m in $deltaMatches) {
+                $k = "$($m.Groups[1].Value)"
+                $d = 0
+                try { $d = [int]$m.Groups[2].Value } catch { $d = 0 }
+                if (-not $statusCounts.ContainsKey($k)) { $statusCounts[$k] = 0 }
+                $statusCounts[$k] = [int]$statusCounts[$k] + $d
+                if ([int]$statusCounts[$k] -lt 0) { $statusCounts[$k] = 0 }
+                $hadTransition = $true
+            }
+        }
+        if ($hadTransition) { $transitionEvents++ }
+
+        $isFailureEvent = (
+            ("$($entry.Type)" -eq '4') -or
+            ("$($entry.EntryType)" -match 'Fail') -or
+            (-not [string]::IsNullOrWhiteSpace("$($entry.Failure)"))
+        )
+        if ($isFailureEvent) { $failureEvents++ }
+
+        $active = 0; foreach ($k in $activeKeys) { if ($statusCounts.ContainsKey($k)) { $active += [int]$statusCounts[$k] } }
+        $synced = 0; foreach ($k in $syncedKeys) { if ($statusCounts.ContainsKey($k)) { $synced += [int]$statusCounts[$k] } }
+        $finalized = 0; foreach ($k in $finalizedKeys) { if ($statusCounts.ContainsKey($k)) { $finalized += [int]$statusCounts[$k] } }
+        $failed = 0; foreach ($k in $failedKeys) { if ($statusCounts.ContainsKey($k)) { $failed += [int]$statusCounts[$k] } }
+        $pending = 0; foreach ($k in $pendingKeys) { if ($statusCounts.ContainsKey($k)) { $pending += [int]$statusCounts[$k] } }
+        $stopped = 0; foreach ($k in $stoppedKeys) { if ($statusCounts.ContainsKey($k)) { $stopped += [int]$statusCounts[$k] } }
+        $inFlight = 0; foreach ($k in $inFlightKeys) { if ($statusCounts.ContainsKey($k)) { $inFlight += [int]$statusCounts[$k] } }
+        $syncedNet = 0; foreach ($k in $syncedNetKeys) { if ($statusCounts.ContainsKey($k)) { $syncedNet += [int]$statusCounts[$k] } }
+        $failedNet = 0; foreach ($k in $failedNetKeys) { if ($statusCounts.ContainsKey($k)) { $failedNet += [int]$statusCounts[$k] } }
+        $completionBlocked = 0; foreach ($k in $completionBlockedKeys) { if ($statusCounts.ContainsKey($k)) { $completionBlocked += [int]$statusCounts[$k] } }
+        $unapproved = 0; foreach ($k in $unapprovedKeys) { if ($statusCounts.ContainsKey($k)) { $unapproved += [int]$statusCounts[$k] } }
+
+        $derivedTotal = if ($TotalCountHint -gt 0) {
+            [int]$TotalCountHint
+        } else {
+            ($active + $synced + $finalized + $failed + $pending + $stopped)
+        }
+        if ($derivedTotal -lt 0) { $derivedTotal = 0 }
+
+        $shouldAppend = ($points.Count -eq 0) -or $hadTransition -or ($processedDelta -gt 0) -or $isFailureEvent
+        if ($shouldAppend) {
+            $pt = [ordered]@{
+                Timestamp                 = $ts.ToString('yyyy-MM-ddTHH:mm:ss')
+                SyncedCount               = [int]$synced
+                FinalizedCount            = [int]$finalized
+                ActiveCount               = [int]$active
+                PendingCount              = [int]$pending
+                StoppedCount              = [int]$stopped
+                FailedCount               = [int]$failed
+                CompletedWithWarningCount = 0
+                TotalCount                = [int]$derivedTotal
+                ProcessedCount            = [int]$processedDelta
+                CumulativeProcessed       = [int]$processedCumulative
+                InFlightCount             = [int]$inFlight
+                SyncedNetCount            = [int]$syncedNet
+                FailedNetCount            = [int]$failedNet
+                CompletionBlockedCount    = [int]$completionBlocked
+                UnapprovedCount           = [int]$unapproved
+                PendingStoppedCount       = [int]($pending + $stopped)
+                FailureEvents             = [int]$failureEvents
+                Source                    = 'report'
+            }
+            if ($points.Count -gt 0 -and "$($points[$points.Count - 1].Timestamp)" -eq "$($pt.Timestamp)") {
+                $points[$points.Count - 1] = $pt
+            } else {
+                [void]$points.Add($pt)
+            }
+        }
+    }
+
+    # Keep response payload bounded for browser rendering and API transfer.
+    $maxPoints = 280
+    if ($points.Count -gt $maxPoints) {
+        $reduced = [System.Collections.ArrayList]@()
+        $step = [Math]::Ceiling($points.Count / [double]$maxPoints)
+        for ($i = 0; $i -lt $points.Count; $i += $step) {
+            [void]$reduced.Add($points[$i])
+        }
+        $lastSrc = $points[$points.Count - 1]
+        if ($reduced.Count -eq 0 -or "$($reduced[$reduced.Count - 1].Timestamp)" -ne "$($lastSrc.Timestamp)") {
+            [void]$reduced.Add($lastSrc)
+        }
+        $points = $reduced
+    }
+
+    $result.Points = @($points)
+    $result.TransitionEventCount = $transitionEvents
+    $result.FailureEventCount = $failureEvents
+    $result.ProcessedUsers = $processedCumulative
+    return $result
+}
+
+function Get-FailureRemediationSuggestion {
+    param(
+        [string]$FailureType,
+        [string]$Message
+    )
+    switch -Regex ($FailureType) {
+        'UserAlreadyHasDemotedArchiveException' {
+            return 'Remove disabled archive object in target (Set-MailUser -RemoveDisabledArchive or Set-Mailbox -RemoveDisabledArchive), then retry move request.'
+        }
+        'TargetDeliveryDomainMismatchPermanentException' {
+            return 'Fix target SMTP proxy/domain alignment with target delivery domain and verify accepted domain/proxy stamping before retry.'
+        }
+        default {
+            if ($Message -match 'SMTP proxy') {
+                return 'Verify target SMTP proxy/accepted domain mapping and retry.'
+            }
+            if ($Message -match 'archive') {
+                return 'Resolve archive state mismatch before retrying the move.'
+            }
+            return 'Review failure stack/details, resolve root cause, then retry affected users.'
+        }
+    }
+}
+
+function Get-BatchDiagnosticInsights {
+    param([object]$DiagnosticInfo)
+
+    $result = [ordered]@{
+        Summary            = [ordered]@{
+            Status              = ''
+            LegacyStatus        = ''
+            State               = ''
+            StateLastUpdated    = ''
+            SameStatusCount     = ''
+            TransientErrorCount = ''
+            TotalRowCount       = ''
+            Direction           = ''
+            DataConsistencyScore= ''
+            BatchFlags          = ''
+        }
+        Segments           = @()
+        StatusDistribution = @()
+        RawSnippet         = ''
+    }
+
+    $diagText = "$DiagnosticInfo".Trim()
+    if ([string]::IsNullOrWhiteSpace($diagText)) { return $result }
+
+    $result.RawSnippet = if ($diagText.Length -gt 320) { $diagText.Substring(0, 320) + ' ...' } else { $diagText }
+
+    try {
+        # Prefer explicit XML block if extra wrappers/noise exist.
+        $xmlText = $diagText
+        $m = [regex]::Match($diagText, '(?s)<MigrationJob\b.*</MigrationJob>')
+        if ($m.Success) { $xmlText = $m.Value }
+
+        [xml]$xmlDoc = New-Object System.Xml.XmlDocument
+        $xmlDoc.LoadXml($xmlText)
+
+        function NodeText {
+            param([xml]$XmlDoc, [string]$XPath)
+            $n = $XmlDoc.SelectSingleNode($XPath)
+            if ($n) { return "$($n.InnerText)" }
+            return ''
+        }
+
+        $result.Summary = [ordered]@{
+            Status               = (NodeText $xmlDoc '//status')
+            LegacyStatus         = (NodeText $xmlDoc '//legacyStatus')
+            State                = (NodeText $xmlDoc '//state')
+            StateLastUpdated     = (NodeText $xmlDoc '//stateLastUpdated')
+            SameStatusCount      = (NodeText $xmlDoc '//SameStatusCount')
+            TransientErrorCount  = (NodeText $xmlDoc '//transientErrorCount')
+            TotalRowCount        = (NodeText $xmlDoc '//totalRowCount')
+            Direction            = (NodeText $xmlDoc '//direction')
+            DataConsistencyScore = (NodeText $xmlDoc '//dataConsistencyScore')
+            BatchFlags           = (NodeText $xmlDoc '//batchFlags')
+        }
+
+        $statusHistory = (NodeText $xmlDoc '//statusHistory')
+        $vals = [System.Collections.ArrayList]@()
+        foreach ($part in ($statusHistory -split ';')) {
+            if ($part -match '^\s*\d+\s*:\s*([\d,]+)\s*$') {
+                [void]$vals.Add([int](($Matches[1] -replace ',', '')))
+            }
+        }
+
+        $segments = [System.Collections.ArrayList]@()
+        for ($i = 0; $i -lt ($vals.Count - 1); $i += 2) {
+            [void]$segments.Add([ordered]@{
+                Segment    = [int](($i / 2) + 1)
+                StatusCode = [int]$vals[$i]
+                Duration   = [int]$vals[$i + 1]
+            })
+        }
+        $result.Segments = @($segments)
+        $result.StatusDistribution = @(
+            $result.Segments |
+                Group-Object StatusCode |
+                Sort-Object Name |
+                ForEach-Object {
+                    [ordered]@{
+                        StatusCode   = [int]$_.Name
+                        SegmentCount = [int]$_.Count
+                        DurationSum  = [int](($_.Group | Measure-Object Duration -Sum).Sum)
+                    }
+                }
+        )
+    } catch {
+        # Keep raw snippet for UI even when DiagnosticInfo cannot be parsed as XML.
+    }
+
+    return $result
+}
+
+function Get-BatchFailureIntelligence {
+    <#
+    .SYNOPSIS
+        Builds full Failure Intelligence payload from Report.Failures and DiagnosticInfo.
+    #>
+    param(
+        [object[]]$ReportFailures,
+        [string]$BatchName = '',
+        [string]$BatchStatus = '',
+        [object]$DiagnosticInfo = $null
+    )
+
+    $diag = Get-BatchDiagnosticInsights -DiagnosticInfo $DiagnosticInfo
+
+    $result = [ordered]@{
+        TotalFailures        = 0
+        PermanentFailures    = 0
+        RetryableFailures    = 0
+        UniqueSignatures     = 0
+        AffectedMailboxes    = 0
+        FirstFailureTime     = ''
+        LastFailureTime      = ''
+        TopFailureTypes      = @()
+        TopSignatures        = @()
+        TimelineData         = @()
+        Events               = @()
+        Summary              = [ordered]@{
+            Batch                   = $BatchName
+            Status                  = $BatchStatus
+            TotalFailures           = 0
+            UniqueSignatures        = 0
+            PermanentFailures       = 0
+            RetryableFailures       = 0
+            UniqueAffectedMailboxes = 0
+            FirstFailure            = ''
+            LastFailure             = ''
+        }
+        DiagSummary          = $diag.Summary
+        DiagSegments         = @($diag.Segments)
+        DiagStatusDist       = @($diag.StatusDistribution)
+        DiagRawSnippet       = "$($diag.RawSnippet)"
+    }
+
+    $fails = @($ReportFailures | Where-Object { $_ })
+    if ($fails.Count -eq 0) { return $result }
+
+    $typeCounts = @{}
+    $sigMap = @{}
+    $mailboxSet = @{}
+    $events = [System.Collections.ArrayList]@()
+    $perm = 0
+    $retry = 0
+    $firstTs = $null
+    $lastTs = $null
+
+    foreach ($f in $fails) {
+        $fType = "$($f.FailureType)".Trim()
+        if ([string]::IsNullOrWhiteSpace($fType)) { $fType = 'UnknownFailureType' }
+        $msg = "$($f.Message)"
+        $hash = "$($f.FailureHash)"
+        $code = "$($f.FailureCode)"
+        $sig = "$fType|$hash|$code"
+
+        if (-not $typeCounts.ContainsKey($fType)) { $typeCounts[$fType] = 0 }
+        $typeCounts[$fType] = [int]$typeCounts[$fType] + 1
+
+        if (-not $sigMap.ContainsKey($sig)) {
+            $sigMap[$sig] = [ordered]@{
+                Signature     = $sig
+                FailureType   = $fType
+                FailureHash   = $hash
+                FailureCode   = $code
+                Count         = 0
+                Permanent     = 0
+                Retryable     = 0
+                MailboxSet    = @{}
+                SampleMessage = ''
+                Remediation   = ''
+            }
+        }
+        $sigMap[$sig].Count = [int]$sigMap[$sig].Count + 1
+
+        $isPermanent = $false
+        if ($fType -match 'Permanent' -or $msg -match "doesn't have an SMTP proxy") { $isPermanent = $true }
+        if ($isPermanent) {
+            $perm++
+            $sigMap[$sig].Permanent = [int]$sigMap[$sig].Permanent + 1
+        } else {
+            $retry++
+            $sigMap[$sig].Retryable = [int]$sigMap[$sig].Retryable + 1
+        }
+
+        $mailboxToken = ''
+        if ($msg -match "User '([^']+)'") {
+            $mailboxToken = "$($Matches[1])".Trim()
+        }
+        if ($mailboxToken) {
+            $mailboxSet[$mailboxToken] = $true
+            $sigMap[$sig].MailboxSet[$mailboxToken] = $true
+        }
+
+        if ([string]::IsNullOrWhiteSpace("$($sigMap[$sig].SampleMessage)")) {
+            $sigMap[$sig].SampleMessage = $msg
+            $sigMap[$sig].Remediation = Get-FailureRemediationSuggestion -FailureType $fType -Message $msg
+        }
+
+        $ts = $null
+        try { $ts = [datetime]$f.Timestamp } catch {}
+        if ($ts) {
+            if (-not $firstTs -or $ts -lt $firstTs) { $firstTs = $ts }
+            if (-not $lastTs -or $ts -gt $lastTs) { $lastTs = $ts }
+        }
+        $tsStr = if ($ts) { $ts.ToString('yyyy-MM-ddTHH:mm:ss') } else { '' }
+        $hourBucket = if ($ts) { $ts.ToString('yyyy-MM-dd HH:00') } else { '' }
+
+        $excTypes = ''
+        if ($f.PSObject.Properties['ExceptionTypesInt'] -and $f.ExceptionTypesInt) {
+            $excTypes = (@($f.ExceptionTypesInt) | ForEach-Object { "$_" }) -join ', '
+        } elseif ($f.PSObject.Properties['ExceptionTypes'] -and $f.ExceptionTypes) {
+            $excTypes = (@($f.ExceptionTypes) | ForEach-Object { "$($_.value)" }) -join ', '
+        }
+
+        [void]$events.Add([ordered]@{
+            Timestamp     = $tsStr
+            TimestampHour = $hourBucket
+            FailureType   = $fType
+            FailureHash   = $hash
+            FailureCode   = $code
+            ExceptionTypes= $excTypes
+            IsPermanent   = [bool]$isPermanent
+            MailboxToken  = $mailboxToken
+            Message       = $msg
+            DataContext   = "$($f.DataContext)"
+            Signature     = $sig
+            Remediation   = (Get-FailureRemediationSuggestion -FailureType $fType -Message $msg)
+        })
+    }
+
+    $timelineMap = [ordered]@{}
+    foreach ($e in @($events | Sort-Object Timestamp)) {
+        $bucket = "$($e.TimestampHour)"
+        if ([string]::IsNullOrWhiteSpace($bucket)) { $bucket = 'Unknown' }
+        if (-not $timelineMap.Contains($bucket)) {
+            $timelineMap[$bucket] = [ordered]@{
+                Bucket    = $bucket
+                Count     = 0
+                Permanent = 0
+                Retryable = 0
+            }
+        }
+        $timelineMap[$bucket].Count++
+        if ($e.IsPermanent) { $timelineMap[$bucket].Permanent++ } else { $timelineMap[$bucket].Retryable++ }
+    }
+
+    $topTypes = @(
+        $typeCounts.GetEnumerator() |
+            Sort-Object Value -Descending |
+            Select-Object -First 12 |
+            ForEach-Object {
+                [ordered]@{
+                    FailureType = "$($_.Key)"
+                    Count       = [int]$_.Value
+                }
+            }
+    )
+
+    $topSigs = @(
+        $sigMap.GetEnumerator() |
+            ForEach-Object {
+                $v = $_.Value
+                [ordered]@{
+                    Signature     = "$($v.Signature)"
+                    FailureType   = "$($v.FailureType)"
+                    FailureHash   = "$($v.FailureHash)"
+                    FailureCode   = "$($v.FailureCode)"
+                    Count         = [int]$v.Count
+                    Permanent     = [int]$v.Permanent
+                    Retryable     = [int]$v.Retryable
+                    Mailboxes     = (@($v.MailboxSet.Keys | Sort-Object) -join ', ')
+                    SampleMessage = "$($v.SampleMessage)"
+                    Remediation   = "$($v.Remediation)"
+                }
+            } |
+            Sort-Object Count -Descending |
+            Select-Object -First 40
+    )
+
+    $sortedEvents = @($events | Sort-Object Timestamp)
+    $maxEvents = 1000
+    if ($sortedEvents.Count -gt $maxEvents) {
+        $sortedEvents = @($sortedEvents | Select-Object -Last $maxEvents)
+    }
+
+    $result.TotalFailures      = [int]$fails.Count
+    $result.PermanentFailures  = [int]$perm
+    $result.RetryableFailures  = [int]$retry
+    $result.UniqueSignatures   = [int]$sigMap.Count
+    $result.AffectedMailboxes  = [int]$mailboxSet.Count
+    $result.FirstFailureTime   = if ($firstTs) { $firstTs.ToString('yyyy-MM-ddTHH:mm:ss') } else { '' }
+    $result.LastFailureTime    = if ($lastTs) { $lastTs.ToString('yyyy-MM-ddTHH:mm:ss') } else { '' }
+    $result.TopFailureTypes    = @($topTypes)
+    $result.TopSignatures      = @($topSigs)
+    $result.TimelineData       = @($timelineMap.Values)
+    $result.Events             = @($sortedEvents)
+    $result.Summary            = [ordered]@{
+        Batch                   = $BatchName
+        Status                  = $BatchStatus
+        TotalFailures           = [int]$fails.Count
+        UniqueSignatures        = [int]$sigMap.Count
+        PermanentFailures       = [int]$perm
+        RetryableFailures       = [int]$retry
+        UniqueAffectedMailboxes = [int]$mailboxSet.Count
+        FirstFailure            = if ($firstTs) { $firstTs.ToString('yyyy-MM-dd HH:mm:ss') } else { '' }
+        LastFailure             = if ($lastTs) { $lastTs.ToString('yyyy-MM-dd HH:mm:ss') } else { '' }
+    }
+    return $result
+}
+
 function Invoke-BatchStatsRefresh {
     <#
     .SYNOPSIS
@@ -923,8 +1438,10 @@ function Invoke-BatchStatsRefresh {
     .PARAMETER CachedMailboxes
         Per-mailbox detail array used to supplement with rate/size data.
     .PARAMETER BatchNames
-        If specified, fetches ONLY these batches using Get-MigrationBatch -Identity -IncludeReport.
-        If omitted, fetches ALL batches without -IncludeReport (lightweight startup cache).
+        If specified, fetches ONLY these batches using:
+        Get-MigrationBatch -Identity <Batch> -IncludeReport -DiagnosticInfo "Verbose,showtimeline,showtimeslots,reports" -ResultSize Unlimited
+        If omitted, fetches ALL batches using:
+        Get-MigrationBatch -IncludeReport -DiagnosticInfo "Verbose,showtimeline,showtimeslots,reports" -ResultSize Unlimited
     #>
     param(
         [Parameter(Mandatory)]
@@ -934,18 +1451,23 @@ function Invoke-BatchStatsRefresh {
     )
 
     $onDemand = $BatchNames -and $BatchNames.Count -gt 0
+    $diagInfo = 'Verbose,showtimeline,showtimeslots,reports'
 
     if ($onDemand) {
-        # Fetch only the requested batches with full report data
+        # Fetch only the requested batches with full report + diagnostics data
         $allBatches = foreach ($name in $BatchNames) {
-            try { Get-MigrationBatch -Identity $name -IncludeReport -ErrorAction Stop }
-            catch { Write-Console "BatchStatsRefresh: could not fetch batch '$name' — $_" -Level Warn -NoTimestamp }
+            try {
+                Get-MigrationBatch -Identity $name -IncludeReport -DiagnosticInfo $diagInfo -ResultSize Unlimited -ErrorAction Stop
+            }
+            catch { Write-Console "BatchStatsRefresh: could not fetch batch '$name' - $_" -Level Warn -NoTimestamp }
         }
     } else {
-        # Startup: fetch all batches, no -IncludeReport (fast, basic counts only)
-        try { $allBatches = Get-MigrationBatch -ErrorAction Stop }
+        # Fetch all batches with full report + diagnostics data
+        try {
+            $allBatches = Get-MigrationBatch -IncludeReport -DiagnosticInfo $diagInfo -ResultSize Unlimited -ErrorAction Stop
+        }
         catch {
-            Write-Console "BatchStatsRefresh: Get-MigrationBatch failed — $_" -Level Warn -NoTimestamp
+            Write-Console "BatchStatsRefresh: Get-MigrationBatch failed - $_" -Level Warn -NoTimestamp
             return
         }
     }
@@ -1024,6 +1546,37 @@ function Invoke-BatchStatsRefresh {
             $dataSource         = 'full'
         }
 
+        # Build report-derived timeline from Report.Entries (if available).
+        $reportDerivedTrend = @()
+        $reportEntryCount = 0
+        $reportTransitionCount = 0
+        $reportFailureEvents = 0
+        $reportProcessedUsers = 0
+        $diagInfoPayload = $null
+        if ($mb.PSObject.Properties['DiagnosticInfo']) { $diagInfoPayload = $mb.DiagnosticInfo }
+        $failureIntel = Get-BatchFailureIntelligence -ReportFailures @() -BatchName $batchName -BatchStatus "$($mb.Status)" -DiagnosticInfo $diagInfoPayload
+        try {
+            $entries = @()
+            $failures = @()
+            if ($mb.PSObject.Properties['Report'] -and $mb.Report -and $mb.Report.PSObject.Properties['Entries']) {
+                $entries = @($mb.Report.Entries)
+            }
+            if ($mb.PSObject.Properties['Report'] -and $mb.Report -and $mb.Report.PSObject.Properties['Failures']) {
+                $failures = @($mb.Report.Failures)
+            }
+            if ($entries.Count -gt 0) {
+                $trendInfo = Get-BatchReportDerivedTrend -ReportEntries $entries -TotalCountHint ([int]$mb.TotalCount)
+                if ($trendInfo) {
+                    $reportDerivedTrend = @($trendInfo.Points)
+                    $reportEntryCount = [int]$trendInfo.EntryCount
+                    $reportTransitionCount = [int]$trendInfo.TransitionEventCount
+                    $reportFailureEvents = [int]$trendInfo.FailureEventCount
+                    $reportProcessedUsers = [int]$trendInfo.ProcessedUsers
+                }
+            }
+            $failureIntel = Get-BatchFailureIntelligence -ReportFailures $failures -BatchName $batchName -BatchStatus "$($mb.Status)" -DiagnosticInfo $diagInfoPayload
+        } catch {}
+
         $cache[$batchName] = @{
             ok                        = $true
             BatchName                 = $batchName
@@ -1050,7 +1603,17 @@ function Invoke-BatchStatsRefresh {
             MoveEfficiency            = $moveEfficiency
             DataSource                = $dataSource
             CachedAt                  = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss')
-            # Migration content/item filters — null means not explicitly configured (use Exchange default)
+            ReportDerivedTrend        = @($reportDerivedTrend)
+            ReportEntryCount          = $reportEntryCount
+            ReportTransitionCount     = $reportTransitionCount
+            ReportFailureEvents       = $reportFailureEvents
+            ReportProcessedUsers      = $reportProcessedUsers
+            FailureIntelligence       = $failureIntel
+            FailureTotal              = [int]$failureIntel.TotalFailures
+            FailurePermanent          = [int]$failureIntel.PermanentFailures
+            FailureRetryable          = [int]$failureIntel.RetryableFailures
+            FailureUniqueSignatures   = [int]$failureIntel.UniqueSignatures
+            # Migration content/item filters - null means not explicitly configured (use Exchange default)
             SkipMail                  = if ($null -ne $mb.SkipMail      -and "$($mb.SkipMail)"      -ne '') { [bool]$mb.SkipMail }      else { $null }
             SkipCalendar              = if ($null -ne $mb.SkipCalendar  -and "$($mb.SkipCalendar)"  -ne '') { [bool]$mb.SkipCalendar }  else { $null }
             SkipContacts              = if ($null -ne $mb.SkipContacts  -and "$($mb.SkipContacts)"  -ne '') { [bool]$mb.SkipContacts }  else { $null }
@@ -4324,10 +4887,27 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     line-height:1.45;
     margin-bottom:10px;
   }
+  .compare-action-row {
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:8px;
+    margin-bottom:6px;
+  }
   .compare-run-btn {
     width:100%;
     justify-content:center;
-    margin-bottom:6px;
+    margin-bottom:0;
+  }
+  .compare-refresh-btn {
+    width:100%;
+    justify-content:center;
+    border:1px solid #bfdbfe !important;
+    background:#eff6ff !important;
+    color:#1d4ed8 !important;
+  }
+  .compare-refresh-btn:hover {
+    background:#dbeafe !important;
+    border-color:#93c5fd !important;
   }
   .compare-selection-hint {
     font-size:.75rem;
@@ -4423,6 +5003,41 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     flex-direction:column;
     gap:16px;
   }
+  .compare-view-tabs {
+    display:flex;
+    gap:4px;
+    align-items:flex-end;
+    margin:2px 0 12px;
+    border-bottom:2px solid #e2e8f0;
+    padding-bottom:0;
+    overflow-x:auto;
+  }
+  .compare-view-tab {
+    border:none;
+    background:none;
+    color:#475569;
+    border-radius:8px 8px 0 0;
+    border-bottom:3px solid transparent;
+    margin-bottom:-2px;
+    padding:10px 16px;
+    font-size:.84rem;
+    font-weight:600;
+    letter-spacing:.01em;
+    cursor:pointer;
+    white-space:nowrap;
+    transition:all .15s;
+  }
+  .compare-view-tab:hover {
+    color:#1e40af;
+    background:#f1f5f9;
+  }
+  .compare-view-tab.active {
+    color:#1e40af;
+    border-bottom-color:#1e40af;
+    background:#fff;
+  }
+  .compare-view-panel { display:none; }
+  .compare-view-panel.active { display:block; }
   .compare-note {
     padding:10px 14px;
     background:#fffbeb;
@@ -4498,6 +5113,328 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
   }
   #batch-trend-section .compare-chart-wrap {
     height:260px;
+  }
+  #batch-trend-details-table {
+    width:100%;
+    border-collapse:collapse;
+    font-size:.8rem;
+  }
+  #batch-trend-details-table thead th {
+    position:sticky;
+    top:0;
+    z-index:1;
+    white-space:nowrap;
+    background:#f1f5f9;
+    text-transform:uppercase;
+    letter-spacing:.05em;
+    font-size:.68rem;
+    color:#64748b;
+  }
+  #batch-trend-details-table tbody td {
+    white-space:nowrap;
+    padding:8px 10px;
+    border-top:1px solid #e5e7eb;
+    color:#334155;
+  }
+  #batch-trend-details-table tbody tr:nth-child(even) td {
+    background:#fcfdff;
+  }
+  .batch-trend-meta {
+    display:grid;
+    grid-template-columns:repeat(auto-fit,minmax(130px,1fr));
+    gap:8px;
+    margin:0 0 10px;
+  }
+  .batch-trend-chip {
+    border:1px solid #e2e8f0;
+    border-radius:8px;
+    background:#f8fafc;
+    padding:7px 9px;
+    min-height:44px;
+  }
+  .batch-trend-chip-label {
+    font-size:.65rem;
+    font-weight:700;
+    text-transform:uppercase;
+    letter-spacing:.06em;
+    color:#64748b;
+  }
+  .batch-trend-chip-value {
+    margin-top:2px;
+    font-size:.9rem;
+    font-weight:700;
+    color:#0f172a;
+    line-height:1.2;
+    overflow:hidden;
+    text-overflow:ellipsis;
+    white-space:nowrap;
+  }
+  .batch-trend-chip.ok { background:#f0fdf4; border-color:#bbf7d0; }
+  .batch-trend-chip.ok .batch-trend-chip-label,
+  .batch-trend-chip.ok .batch-trend-chip-value { color:#166534; }
+  .batch-trend-chip.warn { background:#fff7ed; border-color:#fed7aa; }
+  .batch-trend-chip.warn .batch-trend-chip-label,
+  .batch-trend-chip.warn .batch-trend-chip-value { color:#b45309; }
+  .batch-trend-chip.neutral { background:#eff6ff; border-color:#bfdbfe; }
+  .batch-trend-chip.neutral .batch-trend-chip-label,
+  .batch-trend-chip.neutral .batch-trend-chip-value { color:#1d4ed8; }
+  #compare-failure-section .compare-chart-wrap {
+    height:240px;
+  }
+  .compare-failure-summary {
+    display:grid;
+    grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
+    gap:8px;
+    margin-bottom:10px;
+  }
+  .compare-failure-kpi {
+    border:1px solid #e2e8f0;
+    border-radius:8px;
+    background:#f8fafc;
+    padding:8px 10px;
+  }
+  .compare-failure-kpi-label {
+    font-size:.67rem;
+    font-weight:700;
+    text-transform:uppercase;
+    letter-spacing:.06em;
+    color:#64748b;
+  }
+  .compare-failure-kpi-value {
+    margin-top:2px;
+    font-size:1.02rem;
+    font-weight:800;
+    color:#0f172a;
+    line-height:1.1;
+  }
+  .compare-failure-kpi.danger { background:#fef2f2; border-color:#fecaca; }
+  .compare-failure-kpi.danger .compare-failure-kpi-label,
+  .compare-failure-kpi.danger .compare-failure-kpi-value { color:#b91c1c; }
+  .compare-failure-kpi.warn { background:#fff7ed; border-color:#fed7aa; }
+  .compare-failure-kpi.warn .compare-failure-kpi-label,
+  .compare-failure-kpi.warn .compare-failure-kpi-value { color:#b45309; }
+  .compare-failure-kpi.neutral { background:#eff6ff; border-color:#bfdbfe; }
+  .compare-failure-kpi.neutral .compare-failure-kpi-label,
+  .compare-failure-kpi.neutral .compare-failure-kpi-value { color:#1d4ed8; }
+  #compare-failure-table {
+    width:100%;
+    border-collapse:collapse;
+    font-size:.81rem;
+  }
+  #compare-failure-table thead th {
+    position:sticky;
+    top:0;
+    z-index:1;
+    white-space:nowrap;
+    background:#f1f5f9;
+  }
+  #compare-failure-table tbody td {
+    white-space:nowrap;
+    vertical-align:top;
+    padding:8px 10px;
+    border-top:1px solid #e5e7eb;
+  }
+  #compare-failure-table tbody tr:nth-child(even) td {
+    background:#fcfdff;
+  }
+  .compare-failure-type-list {
+    max-width:520px;
+    white-space:normal;
+    color:#334155;
+    line-height:1.35;
+    font-size:.78rem;
+  }
+  .compare-failure-tag {
+    display:inline-flex;
+    align-items:center;
+    margin:2px 4px 2px 0;
+    border:1px solid #dbe3ee;
+    background:#f8fafc;
+    border-radius:999px;
+    padding:2px 8px;
+    font-size:.72rem;
+    color:#334155;
+  }
+  .compare-toolbar-row {
+    display:flex;
+    align-items:center;
+    justify-content:flex-start;
+    gap:10px;
+    margin-bottom:10px;
+  }
+  .compare-focus-wrap {
+    display:inline-flex;
+    align-items:center;
+    gap:8px;
+    padding:6px 10px;
+    border:1px solid #e2e8f0;
+    border-radius:8px;
+    background:#f8fafc;
+  }
+  .compare-focus-wrap label {
+    font-size:.72rem;
+    font-weight:700;
+    color:#64748b;
+    text-transform:uppercase;
+    letter-spacing:.05em;
+  }
+  .compare-focus-select {
+    border:1px solid #cbd5e1;
+    border-radius:6px;
+    background:#fff;
+    color:#1e293b;
+    font-size:.82rem;
+    padding:4px 8px;
+    min-width:240px;
+    max-width:460px;
+  }
+  .compare-kv-grid {
+    display:grid;
+    grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+    gap:8px;
+    margin-bottom:10px;
+  }
+  .compare-kv-box {
+    border:1px solid #e2e8f0;
+    border-radius:8px;
+    padding:8px 10px;
+    background:#f8fafc;
+  }
+  .compare-kv-key {
+    font-size:.66rem;
+    font-weight:700;
+    color:#64748b;
+    text-transform:uppercase;
+    letter-spacing:.06em;
+  }
+  .compare-kv-value {
+    margin-top:3px;
+    font-size:.98rem;
+    font-weight:700;
+    color:#0f172a;
+    line-height:1.15;
+    word-break:break-word;
+  }
+  .compare-legend {
+    display:flex;
+    gap:12px;
+    flex-wrap:wrap;
+    margin-bottom:7px;
+    color:#334155;
+    font-size:.78rem;
+  }
+  .compare-legend-item { white-space:nowrap; }
+  .compare-dot {
+    width:10px;
+    height:10px;
+    border-radius:2px;
+    display:inline-block;
+    margin-right:6px;
+    vertical-align:middle;
+  }
+  .compare-chart-wrap.compare-chart-lg { height:330px; }
+  .compare-chart-wrap.compare-chart-md { height:250px; }
+  .compare-chart-wrap.compare-chart-sm { height:220px; }
+  .compare-small-note {
+    color:#475569;
+    font-size:.78rem;
+    line-height:1.45;
+    word-break:break-word;
+  }
+  .compare-raw-snippet {
+    margin-top:6px;
+    max-height:130px;
+    overflow:auto;
+    border:1px solid #e2e8f0;
+    border-radius:8px;
+    background:#f8fafc;
+    color:#334155;
+    font-family:Consolas, "Courier New", monospace;
+    font-size:.72rem;
+    line-height:1.35;
+    padding:8px 10px;
+    white-space:pre-wrap;
+    word-break:break-word;
+  }
+  .compare-small-note code {
+    background:#f1f5f9;
+    border:1px solid #e2e8f0;
+    border-radius:4px;
+    padding:1px 5px;
+    font-size:.75rem;
+  }
+  .compare-dual-grid {
+    display:grid;
+    grid-template-columns:1.2fr .8fr;
+    gap:10px;
+  }
+  .compare-card-lite {
+    border:1px solid #e2e8f0;
+    border-radius:10px;
+    padding:10px;
+    background:#fff;
+  }
+  .compare-scroll-wrap {
+    max-height:320px;
+    overflow:auto;
+    border:1px solid #e2e8f0;
+    border-radius:10px;
+  }
+  .compare-mini-table {
+    width:100%;
+    border-collapse:collapse;
+    font-size:.76rem;
+  }
+  .compare-mini-table thead th {
+    position:sticky;
+    top:0;
+    z-index:1;
+    background:#f1f5f9;
+    color:#334155;
+    border-bottom:1px solid #e2e8f0;
+    padding:7px 8px;
+    text-align:left;
+    white-space:nowrap;
+  }
+  .compare-mini-table tbody td {
+    border-top:1px solid #e5e7eb;
+    padding:7px 8px;
+    vertical-align:top;
+    color:#334155;
+  }
+  .compare-mini-table tbody tr:nth-child(even) td {
+    background:#fcfdff;
+  }
+  .compare-badge {
+    display:inline-block;
+    padding:2px 8px;
+    border-radius:999px;
+    font-size:.68rem;
+    font-weight:700;
+    line-height:1.2;
+  }
+  .compare-badge-perm { background:#fee2e2; color:#991b1b; }
+  .compare-badge-ret { background:#dcfce7; color:#166534; }
+  .compare-msg-col {
+    max-width:520px;
+    color:#334155;
+    line-height:1.35;
+    word-break:break-word;
+  }
+  .compare-rem-col {
+    color:#1e293b;
+    line-height:1.35;
+    min-width:220px;
+    word-break:break-word;
+  }
+  .compare-small-col {
+    color:#64748b;
+    font-size:.72rem;
+    word-break:break-word;
+  }
+  @media (max-width: 1140px) {
+    .compare-dual-grid { grid-template-columns:1fr; }
+    .compare-focus-select { min-width:180px; max-width:100%; }
   }
   .cohort-shell {
     display:flex;
@@ -4634,6 +5571,20 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
   body.dark-mode .compare-batch-item:hover { background:#334155; border-color:#475569; }
   body.dark-mode .compare-batch-selected { background:#1d4ed8; border-color:#60a5fa; color:#fff; }
   body.dark-mode .compare-batch-count { background:#1e293b; border-color:#475569; color:#cbd5e1; }
+  body.dark-mode .compare-refresh-btn {
+    background:#1e3a8a !important;
+    border-color:#3b82f6 !important;
+    color:#dbeafe !important;
+  }
+  body.dark-mode .compare-refresh-btn:hover {
+    background:#1d4ed8 !important;
+    border-color:#60a5fa !important;
+    color:#fff !important;
+  }
+  body.dark-mode .compare-view-tabs { border-bottom-color:#475569; }
+  body.dark-mode .compare-view-tab { background:none; color:#cbd5e1; }
+  body.dark-mode .compare-view-tab:hover { background:#334155; color:#dbeafe; }
+  body.dark-mode .compare-view-tab.active { background:#1e293b; border-bottom-color:#60a5fa; color:#93c5fd; }
   body.dark-mode .compare-title,
   body.dark-mode .cohort-title { color:#f1f5f9; }
   body.dark-mode .compare-subtitle,
@@ -4647,6 +5598,55 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
   body.dark-mode .compare-table-wrap,
   body.dark-mode .cohort-table-wrap { border-color:#334155; }
   body.dark-mode .compare-section-row td { background:#334155; border-color:#475569; }
+  body.dark-mode .compare-failure-kpi { background:#1f2937; border-color:#334155; }
+  body.dark-mode .compare-failure-kpi .compare-failure-kpi-label { color:#94a3b8; }
+  body.dark-mode .compare-failure-kpi .compare-failure-kpi-value { color:#e2e8f0; }
+  body.dark-mode .compare-failure-kpi.danger { background:rgba(185,28,28,.18); border-color:rgba(248,113,113,.45); }
+  body.dark-mode .compare-failure-kpi.warn { background:rgba(180,83,9,.2); border-color:rgba(251,191,36,.4); }
+  body.dark-mode .compare-failure-kpi.neutral { background:rgba(29,78,216,.2); border-color:rgba(96,165,250,.45); }
+  body.dark-mode #compare-failure-table thead th { background:#334155; color:#cbd5e1; border-color:#475569; }
+  body.dark-mode #compare-failure-table tbody td { border-color:#334155; color:#e2e8f0; }
+  body.dark-mode #compare-failure-table tbody tr:nth-child(even) td { background:#1f2937; }
+  body.dark-mode .compare-failure-type-list { color:#cbd5e1; }
+  body.dark-mode .compare-failure-tag { background:#111827; border-color:#374151; color:#cbd5e1; }
+  body.dark-mode .batch-trend-chip { background:#1f2937; border-color:#334155; }
+  body.dark-mode .batch-trend-chip-label { color:#94a3b8; }
+  body.dark-mode .batch-trend-chip-value { color:#e2e8f0; }
+  body.dark-mode .batch-trend-chip.ok { background:rgba(22,101,52,.22); border-color:rgba(74,222,128,.4); }
+  body.dark-mode .batch-trend-chip.warn { background:rgba(180,83,9,.2); border-color:rgba(251,191,36,.38); }
+  body.dark-mode .batch-trend-chip.neutral { background:rgba(29,78,216,.2); border-color:rgba(96,165,250,.42); }
+  body.dark-mode #batch-trend-details-table thead th { background:#334155; color:#cbd5e1; border-color:#475569; }
+  body.dark-mode #batch-trend-details-table tbody td { border-color:#334155; color:#e2e8f0; }
+  body.dark-mode #batch-trend-details-table tbody tr:nth-child(even) td { background:#1f2937; }
+  body.dark-mode .compare-focus-wrap,
+  body.dark-mode .compare-kv-box,
+  body.dark-mode .compare-card-lite { background:#1f2937; border-color:#334155; }
+  body.dark-mode .compare-focus-wrap label,
+  body.dark-mode .compare-kv-key,
+  body.dark-mode .compare-small-col { color:#94a3b8; }
+  body.dark-mode .compare-focus-select {
+    background:#0f172a;
+    border-color:#475569;
+    color:#e2e8f0;
+  }
+  body.dark-mode .compare-kv-value,
+  body.dark-mode .compare-rem-col,
+  body.dark-mode .compare-msg-col { color:#e2e8f0; }
+  body.dark-mode .compare-legend,
+  body.dark-mode .compare-small-note { color:#cbd5e1; }
+  body.dark-mode .compare-small-note code { background:#111827; border-color:#374151; color:#cbd5e1; }
+  body.dark-mode .compare-raw-snippet {
+    background:#111827;
+    border-color:#334155;
+    color:#cbd5e1;
+  }
+  body.dark-mode .compare-scroll-wrap,
+  body.dark-mode .compare-mini-table thead th { border-color:#334155; }
+  body.dark-mode .compare-mini-table thead th { background:#334155; color:#cbd5e1; }
+  body.dark-mode .compare-mini-table tbody td { border-color:#334155; color:#e2e8f0; }
+  body.dark-mode .compare-mini-table tbody tr:nth-child(even) td { background:#1f2937; }
+  body.dark-mode .compare-badge-perm { background:rgba(185,28,28,.22); color:#fca5a5; }
+  body.dark-mode .compare-badge-ret { background:rgba(22,101,52,.24); color:#86efac; }
 
   /* MRS Explorer UI refresh */
   .mrs-panel {
@@ -4782,7 +5782,100 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     overflow-y:auto;
     white-space:nowrap;
   }
+  .mrs-center-tabs {
+    display:flex;
+    gap:6px;
+    padding:8px 10px;
+    border-bottom:1px solid #e2e8f0;
+    background:#f8fafc;
+    flex:0 0 auto;
+  }
+  .mrs-center-tab {
+    border:1px solid #cbd5e1;
+    background:#fff;
+    color:#334155;
+    border-radius:8px;
+    padding:4px 10px;
+    font-size:.74rem;
+    font-weight:600;
+    cursor:pointer;
+  }
+  .mrs-center-tab.active {
+    background:#dbeafe;
+    border-color:#93c5fd;
+    color:#1d4ed8;
+  }
   #mrs-report-viewer { padding:8px 12px 12px; }
+  #mrs-failure-viewer { padding:10px 12px 12px; }
+  .mrs-fi-empty {
+    color:#94a3b8;
+    font-size:.8rem;
+    font-style:italic;
+    padding:4px 0 10px;
+  }
+  .mrs-fi-grid {
+    display:grid;
+    grid-template-columns:repeat(auto-fit,minmax(160px,1fr));
+    gap:8px;
+    margin-bottom:10px;
+  }
+  .mrs-fi-kpi {
+    border:1px solid #dbeafe;
+    border-radius:10px;
+    background:#eff6ff;
+    padding:8px 10px;
+  }
+  .mrs-fi-kpi-label { font-size:.7rem;color:#1d4ed8;font-weight:700;text-transform:uppercase;letter-spacing:.03em; }
+  .mrs-fi-kpi-value { font-size:.86rem;color:#1e3a8a;font-weight:700;margin-top:2px;word-break:break-word; }
+  .mrs-fi-section {
+    margin-top:10px;
+    border:1px solid #e2e8f0;
+    border-radius:8px;
+    overflow:hidden;
+    background:#fff;
+  }
+  .mrs-fi-section-head {
+    padding:6px 10px;
+    font-size:.74rem;
+    font-weight:700;
+    color:#334155;
+    background:#f8fafc;
+    border-bottom:1px solid #e2e8f0;
+  }
+  .mrs-fi-table-wrap { overflow-x:auto; }
+  .mrs-fi-table {
+    width:100%;
+    border-collapse:collapse;
+    font-size:.74rem;
+  }
+  .mrs-fi-table thead th {
+    text-align:left;
+    padding:5px 8px;
+    border-bottom:1px solid #e2e8f0;
+    background:#f1f5f9;
+    color:#475569;
+    white-space:nowrap;
+  }
+  .mrs-fi-table tbody td {
+    padding:5px 8px;
+    border-bottom:1px solid #f1f5f9;
+    color:#1e293b;
+    vertical-align:top;
+  }
+  .mrs-fi-table tbody tr { cursor:pointer; }
+  .mrs-fi-table tbody tr:hover { background:#f8fafc; }
+  .mrs-fi-diag {
+    max-height:180px;
+    overflow:auto;
+    margin:0;
+    padding:8px 10px;
+    font-family:monospace;
+    font-size:.72rem;
+    white-space:pre-wrap;
+    word-break:break-word;
+    color:#0f172a;
+    background:#f8fafc;
+  }
   .mrs-collection-item { white-space:nowrap; }
   #mrs-entry-detail {
     flex:1;
@@ -5128,7 +6221,7 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     <button class="main-tab active" onclick="switchMain('perf',this)">📊 Performance Analysis</button>
     <button class="main-tab"        onclick="switchMain('mbx', this)">📬 Mailbox Detail</button>
     <button class="main-tab"        onclick="switchMain('trends', this)" id="tab-trends" style="display:none">📈 Migration Trends</button>
-    <button class="main-tab"        onclick="switchMain('compare', this)" id="tab-compare" style="display:none">📋 Compare Batch </button>
+    <button class="main-tab"        onclick="switchMain('compare', this)" id="tab-compare" style="display:none">📋 Batch Analysis </button>
     <button class="main-tab"        onclick="switchMain('retry', this)" id="tab-retry" style="display:none">🔄 Auto-Retry</button>
     <button class="main-tab"        onclick="switchMain('cohort', this)" id="tab-cohort">🪣 Cohort Analysis</button>
     <button class="main-tab"        onclick="switchMain('mrs', this)"   id="tab-mrs">🔍 MRS Explorer</button>
@@ -5536,8 +6629,11 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
         <div class="compare-side">
           <div class="compare-side-head">
             <div class="compare-title">Batch Comparison</div>
-            <div class="compare-subtitle">Select one or more batches and run a side-by-side analysis.</div>
-            <button class="ent-btn compare-run-btn" onclick="loadBatchComparison()">Analyze / Compare Selected</button>
+            <div class="compare-subtitle">Select one or more batches and run side-by-side analysis from cache, or refresh to fetch latest Exchange data.</div>
+            <div class="compare-action-row">
+              <button class="ent-btn compare-run-btn" onclick="analyzeSelectedBatches()">Analyze/Compare</button>
+              <button class="ent-btn compare-refresh-btn" onclick="refreshBatchComparisonData()">Refresh from Server</button>
+            </div>
             <div id="compare-selection-hint" class="compare-selection-hint">0 batches selected</div>
           </div>
           <div class="compare-batch-list-wrap">
@@ -5559,35 +6655,180 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
               <div id="compare-raw-note" class="compare-note" style="display:none;">
                 Note: one or more batches are outside the current watch scope. Status counts come directly from Exchange (authoritative); transfer rate, size, and efficiency are only available for mailboxes loaded in the active scope.
               </div>
-              <div class="compare-section">
-                <div class="compare-section-title">Performance Comparison</div>
-                <!-- Fixed-height wrapper prevents Chart.js growing the canvas on each redraw -->
-                <div class="compare-chart-wrap">
-                  <canvas id="chart-batch-compare"></canvas>
+
+              <div class="compare-view-tabs">
+                <button id="compare-tab-performance" class="compare-view-tab active" onclick="setCompareView('performance')">📊 Performance Analysis</button>
+                <button id="compare-tab-trend" class="compare-view-tab" onclick="setCompareView('trend')">📈 Batch Progress Over Time</button>
+                <button id="compare-tab-failure" class="compare-view-tab" onclick="setCompareView('failure')">⚠️ Failure Intelligence</button>
+              </div>
+
+              <div id="compare-view-performance" class="compare-view-panel active" data-compare-view="performance">
+                <div class="compare-section">
+                  <div class="compare-section-title">Performance Comparison</div>
+                  <!-- Fixed-height wrapper prevents Chart.js growing the canvas on each redraw -->
+                  <div class="compare-chart-wrap">
+                    <canvas id="chart-batch-compare"></canvas>
+                  </div>
+                </div>
+                <div class="compare-section">
+                  <div class="compare-section-title">Metric Breakdown</div>
+                  <div class="compare-table-wrap">
+                    <table id="comparison-table" style="width:100%">
+                      <thead><tr><th>Metric</th></tr></thead>
+                      <tbody id="comparison-tbody"></tbody>
+                    </table>
+                  </div>
                 </div>
               </div>
-              <div class="compare-section">
-                <div class="compare-section-title">Metric Breakdown</div>
-                <div class="compare-table-wrap">
-                  <table id="comparison-table" style="width:100%">
-                    <thead><tr><th>Metric</th></tr></thead>
-                    <tbody id="comparison-tbody"></tbody>
-                  </table>
+
+              <div id="compare-view-trend" class="compare-view-panel" data-compare-view="trend">
+                <div id="batch-trend-section" class="compare-section">
+                  <div class="compare-section-title">Batch Progress Over Time</div>
+                  <div class="compare-toolbar-row">
+                    <div class="compare-focus-wrap">
+                      <label for="batch-trend-focus">Focus Batch</label>
+                      <select id="batch-trend-focus" class="compare-focus-select" onchange="onCompareTrendFocusChanged()"></select>
+                    </div>
+                  </div>
+                  <div id="batch-trend-empty" style="display:none;color:#94a3b8;font-size:.82rem;padding:20px 0;text-align:center;">No report-entry trend data available for the selected batch.</div>
+                  <div id="batch-trend-preview" style="display:none;">
+                    <div id="batch-trend-summary" class="compare-kv-grid"></div>
+
+                    <div class="compare-legend">
+                      <span class="compare-legend-item"><span class="compare-dot" style="background:#3b82f6"></span>In-Flight (Validating/Starting/Syncing/Removing)</span>
+                      <span class="compare-legend-item"><span class="compare-dot" style="background:#22c55e"></span>Synced+Completed (Net)</span>
+                      <span class="compare-legend-item"><span class="compare-dot" style="background:#ef4444"></span>Failed (Net)</span>
+                      <span class="compare-legend-item"><span class="compare-dot" style="background:#f59e0b"></span>CompletionBlocked</span>
+                      <span class="compare-legend-item"><span class="compare-dot" style="background:#8b5cf6"></span>Unapproved</span>
+                    </div>
+                    <div class="compare-chart-wrap compare-chart-lg">
+                      <canvas id="chart-batch-trend-transitions"></canvas>
+                    </div>
+
+                    <div class="compare-legend" style="margin-top:12px;">
+                      <span class="compare-legend-item"><span class="compare-dot" style="background:#06b6d4"></span>Cumulative Processed users from report entries</span>
+                    </div>
+                    <div class="compare-chart-wrap compare-chart-md">
+                      <canvas id="chart-batch-trend-processed"></canvas>
+                    </div>
+
+                    <div class="compare-small-note" style="margin-top:10px;">
+                      <strong>Interpretation:</strong>
+                      Transition-derived lines are built from <code>Report.Entries</code> deltas (for example: <code>StatusSyncing -&gt; -1</code>, <code>StatusSynced -&gt; 1</code>), so they reflect engine state movements and avoid flat snapshot-only curves.
+                    </div>
+                  </div>
                 </div>
               </div>
-              <!-- Batch trend over time -->
-              <div id="batch-trend-section" class="compare-section">
-                <div class="compare-section-title">Batch Progress Over Time</div>
-                <div id="batch-trend-empty" style="display:none;color:#94a3b8;font-size:.82rem;padding:20px 0;text-align:center;">No trend data yet - data points are collected each refresh cycle.</div>
-                <div class="compare-chart-wrap">
-                  <canvas id="chart-batch-trend"></canvas>
+
+              <div id="compare-view-failure" class="compare-view-panel" data-compare-view="failure">
+                <div id="compare-failure-section" class="compare-section">
+                  <div class="compare-section-title">Failure Intelligence</div>
+                  <div class="compare-toolbar-row">
+                    <div class="compare-focus-wrap">
+                      <label for="compare-failure-focus">Focus Batch</label>
+                      <select id="compare-failure-focus" class="compare-focus-select" onchange="onCompareFailureFocusChanged()"></select>
+                    </div>
+                  </div>
+                  <div id="compare-failure-empty" style="display:none;color:#94a3b8;font-size:.82rem;padding:18px 0;text-align:center;">No failure or diagnostic detail available for the selected batch.</div>
+                  <div id="compare-failure-content" style="display:none;">
+                    <div id="compare-failure-summary" class="compare-failure-summary"></div>
+
+                    <div class="compare-dual-grid">
+                      <div class="compare-card-lite">
+                        <div class="compare-legend">
+                          <span class="compare-legend-item"><span class="compare-dot" style="background:#2563eb"></span>Total failures/hour</span>
+                          <span class="compare-legend-item"><span class="compare-dot" style="background:#dc2626"></span>Permanent</span>
+                          <span class="compare-legend-item"><span class="compare-dot" style="background:#16a34a"></span>Retryable</span>
+                        </div>
+                        <div class="compare-chart-wrap compare-chart-md">
+                          <canvas id="chart-batch-failure-timeline"></canvas>
+                        </div>
+                      </div>
+                      <div class="compare-card-lite">
+                        <div class="compare-legend">
+                          <span class="compare-legend-item"><span class="compare-dot" style="background:#7c3aed"></span>Top Failure Types</span>
+                        </div>
+                        <div class="compare-chart-wrap compare-chart-md">
+                          <canvas id="chart-batch-failure-types"></canvas>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div class="compare-card-lite" style="margin-top:10px;">
+                      <div style="font-weight:700;font-size:14px;margin-bottom:8px;">DiagnosticInfo Insights</div>
+                      <div id="compare-failure-diag-kpis" class="compare-failure-summary"></div>
+                      <div class="compare-dual-grid" style="margin-top:10px;">
+                        <div>
+                          <div class="compare-legend">
+                            <span class="compare-legend-item"><span class="compare-dot" style="background:#0ea5e9"></span>Status history segment duration</span>
+                          </div>
+                          <div class="compare-chart-wrap compare-chart-sm">
+                            <canvas id="chart-batch-failure-diag"></canvas>
+                          </div>
+                        </div>
+                        <div>
+                          <div class="compare-legend">
+                            <span class="compare-legend-item"><span class="compare-dot" style="background:#1d4ed8"></span>Status code distribution</span>
+                          </div>
+                          <div class="compare-scroll-wrap" style="max-height:220px;">
+                            <table class="compare-mini-table">
+                              <thead><tr><th>StatusCode</th><th>Segments</th><th>Total Duration</th></tr></thead>
+                              <tbody id="compare-failure-diag-dist-tbody"></tbody>
+                            </table>
+                          </div>
+                        </div>
+                      </div>
+                      <div class="compare-small-note" style="margin-top:8px;"><strong>Raw snippet</strong></div>
+                      <div id="compare-failure-diag-raw" class="compare-raw-snippet"></div>
+                    </div>
+
+                    <div class="compare-card-lite" style="margin-top:10px;">
+                      <div style="font-weight:700;font-size:14px;margin-bottom:8px;">Root Cause Signatures</div>
+                      <div class="compare-scroll-wrap">
+                        <table class="compare-mini-table">
+                          <thead>
+                            <tr>
+                              <th>Failure Type</th>
+                              <th>Hash/Code</th>
+                              <th>Count</th>
+                              <th>Class</th>
+                              <th>Affected Mailboxes</th>
+                              <th>Suggested Action</th>
+                              <th>Sample Message</th>
+                            </tr>
+                          </thead>
+                          <tbody id="compare-failure-signature-tbody"></tbody>
+                        </table>
+                      </div>
+                    </div>
+
+                    <div class="compare-card-lite" style="margin-top:10px;">
+                      <div style="font-weight:700;font-size:14px;margin-bottom:8px;">Failure Event Timeline (Raw)</div>
+                      <div class="compare-scroll-wrap" style="max-height:280px;">
+                        <table class="compare-mini-table">
+                          <thead>
+                            <tr>
+                              <th>Timestamp</th>
+                              <th>Type</th>
+                              <th>Mailbox</th>
+                              <th>FailureHash</th>
+                              <th>FailureCode</th>
+                              <th>Class</th>
+                              <th>Message</th>
+                            </tr>
+                          </thead>
+                          <tbody id="compare-failure-event-tbody"></tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
 
             <div id="comparison-empty" class="compare-state">
               <div class="compare-state-icon">i</div>
-              <div>Select 1 or more batches from the list on the left, then click <strong>Analyze / Compare Selected</strong>.</div>
+              <div>Select 1 or more batches from the list on the left, then click <strong>Analyze/Compare</strong> or <strong>Refresh from Server</strong>.</div>
             </div>
           </div>
         </div>
@@ -5844,6 +7085,11 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
                 <span class="mrs-pane-tag">Panel C</span>
                 <span class="mrs-pane-name">Value / Report Viewer</span>
               </div>
+              <div class="mrs-center-tabs">
+                <button id="mrs-center-tab-value" class="mrs-center-tab active" onclick="mrsSetCenterMode('value')">Value</button>
+                <button id="mrs-center-tab-entries" class="mrs-center-tab" onclick="mrsOpenReportEntries()">Report Entries</button>
+                <button id="mrs-center-tab-failure" class="mrs-center-tab" onclick="mrsOpenFailureIntelligence()">Failure Intelligence</button>
+              </div>
               <div id="mrs-panel-c-scroll">
               <div id="mrs-center-label" style="display:none;font-size:.78rem;font-weight:600;color:#475569"></div>
               <div id="mrs-center-content"><span style="color:#94a3b8;font-style:italic">No mailbox selected. Select a mailbox in Panel A.</span></div>
@@ -5880,6 +7126,9 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
                   </table>
                 </div>
                 <div id="mrs-entries-count" style="font-size:.72rem;color:#64748b;margin-top:6px"></div>
+              </div>
+              <div id="mrs-failure-viewer" style="display:none">
+                <div class="mrs-fi-empty">Select a mailbox in Panel A to view failure intelligence.</div>
               </div>
               </div>
               <!-- Panel D now lives inside Panel C -->
@@ -7641,12 +8890,21 @@ function updateTrendCharts(data) {
 // ══════════════════════════════════════════════════════════════════
 var batchCompareChart = null;
 var batchTrendChart   = null;
+var batchFailureChart = null;
+var batchTrendTransitionChart = null;
+var batchTrendProcessedChart = null;
+var batchFailureTimelineChart = null;
+var batchFailureTypesChart = null;
+var batchFailureDiagChart = null;
 var selectedBatches = [];
 var batchDataCache = {};
 var batchCompareRestoreDone = false;
+var compareActiveView = 'performance';
+var compareTrendFocusBatch = '';
+var compareFailureFocusBatch = '';
 
 function loadBatchCompareUiState() {
-  var defaults = { selectedBatches: [], lastCompared: [] };
+  var defaults = { selectedBatches: [], lastCompared: [], compareView: 'performance' };
   try {
     var raw = localStorage.getItem('batchCompareUiStateV1');
     if (!raw) return defaults;
@@ -7654,7 +8912,8 @@ function loadBatchCompareUiState() {
     if (!parsed || typeof parsed !== 'object') return defaults;
     var selected = Array.isArray(parsed.selectedBatches) ? parsed.selectedBatches : [];
     var compared = Array.isArray(parsed.lastCompared) ? parsed.lastCompared : [];
-    return { selectedBatches: selected, lastCompared: compared };
+    var view = (parsed.compareView === 'trend' || parsed.compareView === 'failure') ? parsed.compareView : 'performance';
+    return { selectedBatches: selected, lastCompared: compared, compareView: view };
   } catch (_) {
     return defaults;
   }
@@ -7669,9 +8928,35 @@ function saveBatchCompareUiState(extra) {
   try {
     localStorage.setItem('batchCompareUiStateV1', JSON.stringify({
       selectedBatches: Array.isArray(selectedBatches) ? selectedBatches.slice() : [],
-      lastCompared: lastCompared
+      lastCompared: lastCompared,
+      compareView: compareActiveView
     }));
   } catch (_) {}
+}
+
+function setCompareView(view, skipSave) {
+  var next = (view === 'trend' || view === 'failure') ? view : 'performance';
+  compareActiveView = next;
+
+  var tabs = document.querySelectorAll('.compare-view-tab');
+  tabs.forEach(function(btn) {
+    var bid = btn && btn.id ? btn.id : '';
+    var active =
+      (next === 'performance' && bid === 'compare-tab-performance') ||
+      (next === 'trend' && bid === 'compare-tab-trend') ||
+      (next === 'failure' && bid === 'compare-tab-failure');
+    btn.classList.toggle('active', !!active);
+  });
+
+  var panels = document.querySelectorAll('.compare-view-panel');
+  panels.forEach(function(panel) {
+    var pv = panel.getAttribute('data-compare-view') || '';
+    var active = (pv === next);
+    panel.classList.toggle('active', !!active);
+    panel.style.display = active ? '' : 'none';
+  });
+
+  if (!skipSave) { saveBatchCompareUiState(); }
 }
 
 function applyBatchSelectionFromState(names) {
@@ -7684,11 +8969,12 @@ function applyBatchSelectionFromState(names) {
 }
 
 function compareOnTabActivate() {
+  var state = loadBatchCompareUiState();
+  setCompareView(state.compareView || 'performance', true);
   if (batchCompareRestoreDone) return;
   var checkboxes = document.querySelectorAll('.batch-checkbox');
   if (!checkboxes || checkboxes.length === 0) return;
   batchCompareRestoreDone = true;
-  var state = loadBatchCompareUiState();
   var restoreSelection = (state.selectedBatches && state.selectedBatches.length > 0)
     ? state.selectedBatches
     : state.lastCompared;
@@ -7708,6 +8994,8 @@ function initBatchComparison() {
   // Show the comparison tab
   var tab = document.getElementById('tab-compare');
   if (tab) tab.style.display = '';
+  var state = loadBatchCompareUiState();
+  setCompareView(state.compareView || 'performance', true);
 
   // Load batch list
   fetch(apiBase + '/api/batches')
@@ -7764,6 +9052,16 @@ function updateSelectedBatches() {
     hint.style.color = selectedBatches.length >= 1 ? '#3b82f6' : '#94a3b8';
   }
   saveBatchCompareUiState();
+  // Re-run comparison automatically from cache whenever selection changes
+  loadBatchComparison({ forceRefresh: false, cacheOnly: true, silent: true });
+}
+
+function analyzeSelectedBatches() {
+  loadBatchComparison({ forceRefresh: false, cacheOnly: true, silent: false });
+}
+
+function refreshBatchComparisonData() {
+  loadBatchComparison({ forceRefresh: true, cacheOnly: false, silent: false });
 }
 
 function loadBatchComparison(options) {
@@ -7827,7 +9125,7 @@ function loadBatchComparison(options) {
     if (!ready || ready.length === 0) {
       if (cacheOnly) {
         emptyEl.innerHTML = '<div class="compare-state-icon">!</div>' +
-          '<div>No cached comparison data found. Click <strong>Analyze / Compare Selected</strong> to refresh.</div>';
+          '<div>No cached comparison data found. Click <strong>Refresh from Server</strong> to fetch latest batch data.</div>';
       } else if (timedOut) {
         emptyEl.innerHTML = '<div class="compare-state-icon">!</div>' +
           '<div style="color:#ef4444;">Timed out waiting for batch data. The main loop may be busy - try again.</div>';
@@ -7842,7 +9140,8 @@ function loadBatchComparison(options) {
     }
     resultsEl.style.display = 'block';
     renderBatchComparison(ready);
-    loadBatchTrend(batchesToFetch);
+    renderCompareFailureIntelligence(ready);
+    loadBatchTrend(batchesToFetch, ready);
     saveBatchCompareUiState({ lastCompared: batchesToFetch.slice() });
   }
 
@@ -8098,126 +9397,512 @@ function renderBatchCompareChart(batches) {
 // ══════════════════════════════════════════════════════════════════
 // MIGRATION TRENDS PANEL
 // ══════════════════════════════════════════════════════════════════
-var selectedTrendMailbox = null;
+function renderCompareFailureIntelligence(batches) {
+  window.__compareFailureBatches = Array.isArray(batches) ? batches.slice() : [];
+  var focusSel = document.getElementById('compare-failure-focus');
+  if (!focusSel) return;
 
-function loadBatchTrend(batchNames) {
-  var apiBase = window.WATCH_API_BASE;
-  if (!apiBase || !batchNames || batchNames.length === 0) return;
+  var names = window.__compareFailureBatches.map(function(b) { return b && b.BatchName ? b.BatchName : ''; }).filter(Boolean);
+  if (names.length === 0) {
+    focusSel.innerHTML = '';
+    renderCompareFailureFocused();
+    return;
+  }
 
-  var emptyEl  = document.getElementById('batch-trend-empty');
-  var chartDiv = document.querySelector('#batch-trend-section > div[style*="relative"]');
+  if (!compareFailureFocusBatch || names.indexOf(compareFailureFocusBatch) === -1) {
+    compareFailureFocusBatch = names[0];
+  }
 
-  var url = apiBase + '/api/batch-trend?' +
-    batchNames.map(function(b) { return 'batch=' + encodeURIComponent(b); }).join('&');
+  focusSel.innerHTML = names.map(function(name) {
+    var sel = name === compareFailureFocusBatch ? ' selected' : '';
+    return '<option value="' + compareEscHtml(name) + '"' + sel + '>' + compareEscHtml(name) + '</option>';
+  }).join('');
 
-  fetch(url)
-    .then(function(r) { return r.json(); })
-    .then(function(data) {
-      var hasData = false;
-      Object.keys(data).forEach(function(k) {
-        if (data[k] && data[k].length > 1) hasData = true;
-      });
-      if (!hasData) {
-        if (emptyEl) { emptyEl.style.display = ''; }
-        if (chartDiv) { chartDiv.style.visibility = 'hidden'; }
-        return;
-      }
-      if (emptyEl)  { emptyEl.style.display = 'none'; }
-      if (chartDiv) { chartDiv.style.visibility = ''; }
-      renderBatchTrendChart(data);
-    })
-    .catch(function(e) { console.log('loadBatchTrend error:', e); });
+  renderCompareFailureFocused();
 }
 
-function renderBatchTrendChart(trendData) {
+function onCompareFailureFocusChanged() {
+  var focusSel = document.getElementById('compare-failure-focus');
+  if (!focusSel) return;
+  compareFailureFocusBatch = focusSel.value || '';
+  renderCompareFailureFocused();
+}
+
+function compareEscHtml(value) {
+  var s = String(value === null || value === undefined ? '' : value);
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function compareNum(value) {
+  var n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function compareFmtTs(value) {
+  if (!value) return '-';
+  try {
+    var d = new Date(value);
+    if (!isNaN(d.getTime())) return d.toLocaleString();
+  } catch (_) {}
+  return String(value);
+}
+
+function destroyFailureCharts() {
+  if (batchFailureTimelineChart) { batchFailureTimelineChart.destroy(); batchFailureTimelineChart = null; }
+  if (batchFailureTypesChart) { batchFailureTypesChart.destroy(); batchFailureTypesChart = null; }
+  if (batchFailureDiagChart) { batchFailureDiagChart.destroy(); batchFailureDiagChart = null; }
+}
+
+function renderCompareFailureFocused() {
+  var batches = window.__compareFailureBatches || [];
+  var emptyEl = document.getElementById('compare-failure-empty');
+  var contentEl = document.getElementById('compare-failure-content');
+  var summaryEl = document.getElementById('compare-failure-summary');
+  var diagKpiEl = document.getElementById('compare-failure-diag-kpis');
+  var diagDistTbody = document.getElementById('compare-failure-diag-dist-tbody');
+  var diagRawEl = document.getElementById('compare-failure-diag-raw');
+  var sigTbody = document.getElementById('compare-failure-signature-tbody');
+  var evTbody = document.getElementById('compare-failure-event-tbody');
+  if (!emptyEl || !contentEl || !summaryEl || !diagKpiEl || !diagDistTbody || !diagRawEl || !sigTbody || !evTbody) return;
+
+  var focused = null;
+  for (var i = 0; i < batches.length; i++) {
+    if (batches[i] && batches[i].BatchName === compareFailureFocusBatch) { focused = batches[i]; break; }
+  }
+  if (!focused && batches.length > 0) {
+    focused = batches[0];
+    compareFailureFocusBatch = focused.BatchName || '';
+    var sel = document.getElementById('compare-failure-focus');
+    if (sel) sel.value = compareFailureFocusBatch;
+  }
+
+  if (!focused) {
+    destroyFailureCharts();
+    contentEl.style.display = 'none';
+    emptyEl.style.display = '';
+    emptyEl.textContent = 'No batch selected.';
+    return;
+  }
+
+  var fi = (focused.FailureIntelligence && typeof focused.FailureIntelligence === 'object') ? focused.FailureIntelligence : {};
+  var summary = (fi.Summary && typeof fi.Summary === 'object') ? fi.Summary : {};
+  var timeline = Array.isArray(fi.TimelineData) ? fi.TimelineData : [];
+  var topTypes = Array.isArray(fi.TopFailureTypes) ? fi.TopFailureTypes : [];
+  var topSigs = Array.isArray(fi.TopSignatures) ? fi.TopSignatures : [];
+  var events = Array.isArray(fi.Events) ? fi.Events : [];
+  var diagSummary = (fi.DiagSummary && typeof fi.DiagSummary === 'object') ? fi.DiagSummary : {};
+  var diagSegments = Array.isArray(fi.DiagSegments) ? fi.DiagSegments : [];
+  var diagDist = Array.isArray(fi.DiagStatusDist) ? fi.DiagStatusDist : [];
+  var diagRaw = fi.DiagRawSnippet || '';
+
+  var totalFailures = compareNum(fi.TotalFailures || focused.FailureTotal);
+  var hasDiagSummary = Object.keys(diagSummary || {}).some(function(k) { return !!diagSummary[k]; });
+  var hasData = totalFailures > 0 || timeline.length > 0 || topSigs.length > 0 || diagSegments.length > 0 || diagDist.length > 0 || !!diagRaw || hasDiagSummary;
+  if (!hasData) {
+    destroyFailureCharts();
+    contentEl.style.display = 'none';
+    emptyEl.style.display = '';
+    emptyEl.textContent = 'No failure or diagnostic detail available for the selected batch.';
+    return;
+  }
+
+  emptyEl.style.display = 'none';
+  contentEl.style.display = '';
+
+  var summaryRows = [
+    ['Batch', focused.BatchName || summary.Batch || '-'],
+    ['Status', summary.Status || focused.Status || '-'],
+    ['Total Failures', summary.TotalFailures != null ? summary.TotalFailures : totalFailures],
+    ['Unique Signatures', summary.UniqueSignatures != null ? summary.UniqueSignatures : (fi.UniqueSignatures || 0)],
+    ['Permanent', summary.PermanentFailures != null ? summary.PermanentFailures : (fi.PermanentFailures || 0)],
+    ['Retryable', summary.RetryableFailures != null ? summary.RetryableFailures : (fi.RetryableFailures || 0)],
+    ['Affected Mailboxes', summary.UniqueAffectedMailboxes != null ? summary.UniqueAffectedMailboxes : (fi.AffectedMailboxes || 0)],
+    ['First Failure', summary.FirstFailure || compareFmtTs(fi.FirstFailureTime)],
+    ['Last Failure', summary.LastFailure || compareFmtTs(fi.LastFailureTime)]
+  ];
+  summaryEl.innerHTML = summaryRows.map(function(row) {
+    return '<div class="compare-failure-kpi neutral">' +
+      '<div class="compare-failure-kpi-label">' + compareEscHtml(row[0]) + '</div>' +
+      '<div class="compare-failure-kpi-value">' + compareEscHtml(row[1]) + '</div>' +
+      '</div>';
+  }).join('');
+
+  var diagRows = [
+    ['Diag Status', diagSummary.Status || '-'],
+    ['Legacy Status', diagSummary.LegacyStatus || '-'],
+    ['State', diagSummary.State || '-'],
+    ['State Updated', diagSummary.StateLastUpdated || '-'],
+    ['SameStatusCount', diagSummary.SameStatusCount || '-'],
+    ['Transient Errors', diagSummary.TransientErrorCount || '-'],
+    ['Total Rows', diagSummary.TotalRowCount || '-'],
+    ['Direction', diagSummary.Direction || '-'],
+    ['DataConsistency', diagSummary.DataConsistencyScore || '-'],
+    ['BatchFlags', diagSummary.BatchFlags || '-']
+  ];
+  diagKpiEl.innerHTML = diagRows.map(function(row) {
+    return '<div class="compare-failure-kpi">' +
+      '<div class="compare-failure-kpi-label">' + compareEscHtml(row[0]) + '</div>' +
+      '<div class="compare-failure-kpi-value">' + compareEscHtml(row[1]) + '</div>' +
+      '</div>';
+  }).join('');
+
+  if (diagDist.length === 0) {
+    diagDistTbody.innerHTML = '<tr><td colspan="3" style="text-align:center;color:#94a3b8;padding:10px;">No status distribution available.</td></tr>';
+  } else {
+    diagDistTbody.innerHTML = diagDist.map(function(d) {
+      return '<tr>' +
+        '<td>' + compareEscHtml(d.StatusCode) + '</td>' +
+        '<td>' + compareEscHtml(d.SegmentCount) + '</td>' +
+        '<td>' + compareEscHtml(d.DurationSum) + '</td>' +
+        '</tr>';
+    }).join('');
+  }
+  diagRawEl.textContent = diagRaw || '-';
+
+  if (topSigs.length === 0) {
+    sigTbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:12px;">No signature data available.</td></tr>';
+  } else {
+    sigTbody.innerHTML = topSigs.map(function(s) {
+      var isPerm = compareNum(s.Permanent) > 0;
+      var cls = isPerm ? '<span class="compare-badge compare-badge-perm">permanent</span>' : '<span class="compare-badge compare-badge-ret">retryable</span>';
+      var hashCode = (s.FailureHash || '-') + ' / ' + (s.FailureCode || '-');
+      return '<tr>' +
+        '<td><strong>' + compareEscHtml(s.FailureType || '-') + '</strong></td>' +
+        '<td class="compare-small-col">' + compareEscHtml(hashCode) + '</td>' +
+        '<td>' + compareEscHtml(s.Count) + '</td>' +
+        '<td>' + cls + '</td>' +
+        '<td class="compare-small-col">' + compareEscHtml(s.Mailboxes || '-') + '</td>' +
+        '<td class="compare-rem-col">' + compareEscHtml(s.Remediation || '-') + '</td>' +
+        '<td class="compare-msg-col">' + compareEscHtml(s.SampleMessage || '-') + '</td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  if (events.length === 0) {
+    evTbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:12px;">No raw failure events available.</td></tr>';
+  } else {
+    evTbody.innerHTML = events.map(function(e) {
+      var cls = e.IsPermanent ? '<span class="compare-badge compare-badge-perm">permanent</span>' : '<span class="compare-badge compare-badge-ret">retryable</span>';
+      return '<tr>' +
+        '<td class="compare-small-col">' + compareEscHtml(compareFmtTs(e.Timestamp)) + '</td>' +
+        '<td>' + compareEscHtml(e.FailureType || '-') + '</td>' +
+        '<td class="compare-small-col">' + compareEscHtml(e.MailboxToken || '-') + '</td>' +
+        '<td class="compare-small-col">' + compareEscHtml(e.FailureHash || '-') + '</td>' +
+        '<td class="compare-small-col">' + compareEscHtml(e.FailureCode || '-') + '</td>' +
+        '<td>' + cls + '</td>' +
+        '<td class="compare-msg-col">' + compareEscHtml(e.Message || '-') + '</td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  var timelineCanvas = document.getElementById('chart-batch-failure-timeline');
+  var typesCanvas = document.getElementById('chart-batch-failure-types');
+  var diagCanvas = document.getElementById('chart-batch-failure-diag');
+  if (!timelineCanvas || !typesCanvas || !diagCanvas) return;
+
   loadChartJs(function() {
-    var ctx = document.getElementById('chart-batch-trend');
-    if (!ctx) return;
-    if (batchTrendChart) { batchTrendChart.destroy(); batchTrendChart = null; }
+    destroyFailureCharts();
+    var isDark = document.body.classList.contains('dark-mode');
+    var gridColor = isDark ? 'rgba(148,163,184,0.2)' : 'rgba(0,0,0,0.08)';
+    var textColor = isDark ? '#94a3b8' : '#64748b';
 
-    var isDark  = document.body.classList.contains('dark-mode');
-    var bNames  = Object.keys(trendData);
-    var palette = ['#3b82f6','#22c55e','#f59e0b','#ef4444','#8b5cf6','#06b6d4','#f97316'];
+    batchFailureTimelineChart = new Chart(timelineCanvas, {
+      type: 'line',
+      data: {
+        labels: timeline.map(function(t) { return (t.Bucket || '').toString(); }),
+        datasets: [
+          { label: 'Total', data: timeline.map(function(t) { return compareNum(t.Count); }), borderColor: '#2563eb', backgroundColor: 'rgba(37,99,235,0.08)', tension: 0.2, borderWidth: 2, pointRadius: 2, fill: false },
+          { label: 'Permanent', data: timeline.map(function(t) { return compareNum(t.Permanent); }), borderColor: '#dc2626', backgroundColor: 'rgba(220,38,38,0.08)', tension: 0.2, borderWidth: 2, pointRadius: 2, fill: false },
+          { label: 'Retryable', data: timeline.map(function(t) { return compareNum(t.Retryable); }), borderColor: '#16a34a', backgroundColor: 'rgba(22,163,74,0.08)', tension: 0.2, borderWidth: 2, pointRadius: 2, fill: false }
+        ]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { position: 'bottom', labels: { color: textColor, boxWidth: 12, font: { size: 11 } } } },
+        scales: {
+          x: { grid: { color: gridColor }, ticks: { color: textColor, maxTicksLimit: 8 } },
+          y: { beginAtZero: true, grid: { color: gridColor }, ticks: { color: textColor, precision: 0 } }
+        }
+      }
+    });
 
-    if (bNames.length === 1) {
-      // Single batch: stacked area by status breakdown
-      var bn  = bNames[0];
-      var pts = trendData[bn];
-      var labels = pts.map(function(p) { return p.Timestamp ? p.Timestamp.replace('T',' ').slice(0,16) : ''; });
-      batchTrendChart = new Chart(ctx, {
-        type: 'line',
-        data: {
-          labels: labels,
-          datasets: [
-            { label: 'Synced / Finalized',
-              data: pts.map(function(p) { return (p.SyncedCount||0) + (p.FinalizedCount||0); }),
-              backgroundColor: 'rgba(34,197,94,0.25)', borderColor: '#22c55e', fill: true, tension: 0.3, borderWidth: 2, pointRadius: 2 },
-            { label: 'Active',
-              data: pts.map(function(p) { return p.ActiveCount || 0; }),
-              backgroundColor: 'rgba(59,130,246,0.2)', borderColor: '#3b82f6', fill: true, tension: 0.3, borderWidth: 2, pointRadius: 2 },
-            { label: 'Pending / Stopped',
-              data: pts.map(function(p) { return (p.PendingCount||0) + (p.StoppedCount||0); }),
-              backgroundColor: 'rgba(245,158,11,0.2)', borderColor: '#f59e0b', fill: true, tension: 0.3, borderWidth: 2, pointRadius: 2 },
-            { label: 'Failed',
-              data: pts.map(function(p) { return p.FailedCount || 0; }),
-              backgroundColor: 'rgba(239,68,68,0.2)', borderColor: '#ef4444', fill: true, tension: 0.3, borderWidth: 2, pointRadius: 2 }
-          ]
-        },
-        options: {
-          responsive: true, maintainAspectRatio: false,
-          plugins: {
-            legend: { position: 'bottom', labels: { color: isDark ? '#94a3b8' : '#64748b', boxWidth: 12, font: { size: 11 } } },
-            title:  { display: true, text: bn + ' \u2014 Mailbox Status Over Time', color: isDark ? '#e2e8f0' : '#1e293b', font: { size: 12, weight: '600' } }
-          },
-          scales: {
-            x: { stacked: true, ticks: { color: isDark ? '#94a3b8' : '#64748b', maxTicksLimit: 8, maxRotation: 30 },
-                 grid: { color: isDark ? 'rgba(148,163,184,0.15)' : 'rgba(0,0,0,0.08)' } },
-            y: { stacked: true, beginAtZero: true, ticks: { color: isDark ? '#94a3b8' : '#64748b', stepSize: 1 },
-                 grid: { color: isDark ? 'rgba(148,163,184,0.15)' : 'rgba(0,0,0,0.08)' },
-                 title: { display: true, text: 'Mailboxes', color: isDark ? '#94a3b8' : '#64748b', font: { size: 11 } } }
-          }
+    batchFailureTypesChart = new Chart(typesCanvas, {
+      type: 'bar',
+      data: {
+        labels: topTypes.slice(0, 8).map(function(t) { return t.FailureType || 'Unknown'; }),
+        datasets: [{
+          label: 'Count',
+          data: topTypes.slice(0, 8).map(function(t) { return compareNum(t.Count); }),
+          backgroundColor: 'rgba(124,58,237,0.75)',
+          borderColor: '#7c3aed',
+          borderWidth: 1
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false, indexAxis: 'y',
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { beginAtZero: true, grid: { color: gridColor }, ticks: { color: textColor, precision: 0 } },
+          y: { grid: { color: gridColor }, ticks: { color: textColor } }
         }
-      });
-    } else {
-      // Multiple batches: one Active line per batch
-      var allTs = [];
-      bNames.forEach(function(bn) {
-        (trendData[bn] || []).forEach(function(p) {
-          if (p.Timestamp && allTs.indexOf(p.Timestamp) === -1) allTs.push(p.Timestamp);
-        });
-      });
-      allTs.sort();
-      var labels = allTs.map(function(t) { return t.replace('T',' ').slice(0,16); });
-      var datasets = bNames.map(function(bn, idx) {
-        var ptMap = {};
-        (trendData[bn] || []).forEach(function(p) { if (p.Timestamp) ptMap[p.Timestamp] = p; });
-        return {
-          label: bn,
-          data: allTs.map(function(t) { return ptMap[t] ? (ptMap[t].ActiveCount || 0) : null; }),
-          borderColor: palette[idx % palette.length], backgroundColor: 'transparent',
-          spanGaps: true, tension: 0.3, borderWidth: 2, pointRadius: 2
-        };
-      });
-      batchTrendChart = new Chart(ctx, {
-        type: 'line',
-        data: { labels: labels, datasets: datasets },
-        options: {
-          responsive: true, maintainAspectRatio: false,
-          plugins: {
-            legend: { position: 'bottom', labels: { color: isDark ? '#94a3b8' : '#64748b', boxWidth: 12, font: { size: 11 } } },
-            title:  { display: true, text: 'Active Mailboxes Over Time \u2014 Batch Comparison', color: isDark ? '#e2e8f0' : '#1e293b', font: { size: 12, weight: '600' } }
-          },
-          scales: {
-            x: { ticks: { color: isDark ? '#94a3b8' : '#64748b', maxTicksLimit: 8, maxRotation: 30 },
-                 grid: { color: isDark ? 'rgba(148,163,184,0.15)' : 'rgba(0,0,0,0.08)' } },
-            y: { beginAtZero: true, ticks: { color: isDark ? '#94a3b8' : '#64748b', stepSize: 1 },
-                 grid: { color: isDark ? 'rgba(148,163,184,0.15)' : 'rgba(0,0,0,0.08)' },
-                 title: { display: true, text: 'Active Mailboxes', color: isDark ? '#94a3b8' : '#64748b', font: { size: 11 } } }
-          }
+      }
+    });
+
+    batchFailureDiagChart = new Chart(diagCanvas, {
+      type: 'line',
+      data: {
+        labels: diagSegments.map(function(s) { return String(s.StatusCode || '-') + '/' + String(s.Segment || '-'); }),
+        datasets: [{
+          label: 'Duration',
+          data: diagSegments.map(function(s) { return compareNum(s.Duration); }),
+          borderColor: '#0ea5e9',
+          backgroundColor: 'rgba(14,165,233,0.1)',
+          borderWidth: 2,
+          tension: 0.2,
+          pointRadius: 1.8,
+          fill: false
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { grid: { color: gridColor }, ticks: { color: textColor, maxTicksLimit: 10 } },
+          y: { beginAtZero: true, grid: { color: gridColor }, ticks: { color: textColor, precision: 0 } }
         }
-      });
-    }
+      }
+    });
   });
+}
+
+var selectedTrendMailbox = null;
+
+function batchTrendHasMovement(points) {
+  if (!Array.isArray(points) || points.length < 2) return false;
+  var keys = ['inFlight','syncedNet','failedNet','unapproved','completionBlocked','processedCum'];
+  var base = points[0] || {};
+  for (var i = 1; i < points.length; i++) {
+    var p = points[i] || {};
+    for (var k = 0; k < keys.length; k++) {
+      var key = keys[k];
+      if ((compareNum(p[key])) !== (compareNum(base[key]))) return true;
+    }
+  }
+  return false;
+}
+
+function destroyBatchTrendCharts() {
+  if (batchTrendTransitionChart) { batchTrendTransitionChart.destroy(); batchTrendTransitionChart = null; }
+  if (batchTrendProcessedChart) { batchTrendProcessedChart.destroy(); batchTrendProcessedChart = null; }
+}
+
+function buildTransitionDerivedPoints(batchStat) {
+  var src = Array.isArray(batchStat && batchStat.ReportDerivedTrend) ? batchStat.ReportDerivedTrend : [];
+  var points = [];
+  src.forEach(function(p, idx) {
+    if (!p) return;
+    var ts = p.Timestamp || '';
+    points.push({
+      idx: idx + 1,
+      ts: ts,
+      inFlight: compareNum(p.InFlightCount != null ? p.InFlightCount : (compareNum(p.ActiveCount) + compareNum(p.PendingCount) + compareNum(p.StoppedCount))),
+      syncedNet: compareNum(p.SyncedNetCount != null ? p.SyncedNetCount : Math.max(compareNum(p.SyncedCount), compareNum(p.FinalizedCount))),
+      failedNet: compareNum(p.FailedNetCount != null ? p.FailedNetCount : p.FailedCount),
+      unapproved: compareNum(p.UnapprovedCount),
+      completionBlocked: compareNum(p.CompletionBlockedCount),
+      processedCum: compareNum(p.CumulativeProcessed)
+    });
+  });
+  return points;
+}
+
+function fillBatchTrendSummary(batchStat, points) {
+  var summaryEl = document.getElementById('batch-trend-summary');
+  if (!summaryEl) return;
+  var firstEvent = points.length > 0 ? compareFmtTs(points[0].ts) : '-';
+  var lastEvent = points.length > 0 ? compareFmtTs(points[points.length - 1].ts) : '-';
+  var rows = [
+    ['Batch', batchStat.BatchName || '-'],
+    ['Total', compareNum(batchStat.TotalCount)],
+    ['Synced', compareNum(batchStat.SyncedCount)],
+    ['Finalized', compareNum(batchStat.FinalizedCount)],
+    ['Failed', compareNum(batchStat.FailedCount)],
+    ['Active', compareNum(batchStat.ActiveCount)],
+    ['Pending', compareNum(batchStat.PendingCount)],
+    ['Transition Events', compareNum(batchStat.ReportTransitionCount)],
+    ['First Event', firstEvent],
+    ['Last Event', lastEvent]
+  ];
+  summaryEl.innerHTML = rows.map(function(row) {
+    return '<div class="compare-kv-box"><div class="compare-kv-key">' + compareEscHtml(row[0]) + '</div><div class="compare-kv-value">' + compareEscHtml(row[1]) + '</div></div>';
+  }).join('');
+}
+
+function onCompareTrendFocusChanged() {
+  var sel = document.getElementById('batch-trend-focus');
+  if (!sel) return;
+  compareTrendFocusBatch = sel.value || '';
+  renderCompareTrendFocused();
+}
+
+function renderCompareTrendFocused() {
+  var batchStats = window.__compareTrendBatches || [];
+  var emptyEl = document.getElementById('batch-trend-empty');
+  var previewEl = document.getElementById('batch-trend-preview');
+  if (!emptyEl || !previewEl) return;
+
+  var focused = null;
+  for (var i = 0; i < batchStats.length; i++) {
+    if (batchStats[i] && batchStats[i].BatchName === compareTrendFocusBatch) {
+      focused = batchStats[i];
+      break;
+    }
+  }
+  if (!focused && batchStats.length > 0) {
+    focused = batchStats[0];
+    compareTrendFocusBatch = focused.BatchName || '';
+    var sel2 = document.getElementById('batch-trend-focus');
+    if (sel2) sel2.value = compareTrendFocusBatch;
+  }
+
+  if (!focused) {
+    destroyBatchTrendCharts();
+    previewEl.style.display = 'none';
+    emptyEl.style.display = '';
+    emptyEl.textContent = 'No report-entry trend data available for the selected batch.';
+    return;
+  }
+
+  var points = buildTransitionDerivedPoints(focused);
+  fillBatchTrendSummary(focused, points);
+  if (points.length === 0) {
+    destroyBatchTrendCharts();
+    previewEl.style.display = 'none';
+    emptyEl.style.display = '';
+    emptyEl.textContent = 'No report-entry trend data available for the selected batch.';
+    return;
+  }
+
+  emptyEl.style.display = 'none';
+  previewEl.style.display = '';
+
+  var chart1 = document.getElementById('chart-batch-trend-transitions');
+  var chart2 = document.getElementById('chart-batch-trend-processed');
+  if (!chart1 || !chart2) return;
+
+  loadChartJs(function() {
+    destroyBatchTrendCharts();
+    var isDark = document.body.classList.contains('dark-mode');
+    var gridColor = isDark ? 'rgba(148,163,184,0.2)' : 'rgba(0,0,0,0.08)';
+    var textColor = isDark ? '#94a3b8' : '#64748b';
+    var labels = points.map(function(p) {
+      if (!p.ts) return '';
+      try {
+        var d = new Date(p.ts);
+        if (!isNaN(d.getTime())) {
+          var mm = String(d.getMonth() + 1).padStart(2, '0');
+          var dd = String(d.getDate()).padStart(2, '0');
+          var hh = String(d.getHours()).padStart(2, '0');
+          var mi = String(d.getMinutes()).padStart(2, '0');
+          return mm + '/' + dd + ' ' + hh + ':' + mi;
+        }
+      } catch (_) {}
+      return String(p.ts).replace('T', ' ').slice(5, 16);
+    });
+
+    var allVals = [];
+    points.forEach(function(p) {
+      allVals.push(compareNum(p.inFlight), compareNum(p.syncedNet), compareNum(p.failedNet), compareNum(p.unapproved), compareNum(p.completionBlocked));
+    });
+    var minVal = Math.min.apply(null, allVals.concat([0]));
+    var maxVal = Math.max.apply(null, allVals.concat([1]));
+
+    batchTrendTransitionChart = new Chart(chart1, {
+      type: 'line',
+      data: {
+        labels: labels,
+        datasets: [
+          { label: 'InFlight', data: points.map(function(p) { return compareNum(p.inFlight); }), borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,.08)', borderWidth: 2, pointRadius: 1.5, tension: 0.2, fill: false },
+          { label: 'SyncedNet', data: points.map(function(p) { return compareNum(p.syncedNet); }), borderColor: '#22c55e', backgroundColor: 'rgba(34,197,94,.08)', borderWidth: 2, pointRadius: 1.5, tension: 0.2, fill: false },
+          { label: 'FailedNet', data: points.map(function(p) { return compareNum(p.failedNet); }), borderColor: '#ef4444', backgroundColor: 'rgba(239,68,68,.08)', borderWidth: 2, pointRadius: 1.5, tension: 0.2, fill: false },
+          { label: 'CompletionBlocked', data: points.map(function(p) { return compareNum(p.completionBlocked); }), borderColor: '#f59e0b', backgroundColor: 'rgba(245,158,11,.08)', borderWidth: 2, pointRadius: 1.5, tension: 0.2, fill: false },
+          { label: 'Unapproved', data: points.map(function(p) { return compareNum(p.unapproved); }), borderColor: '#8b5cf6', backgroundColor: 'rgba(139,92,246,.08)', borderWidth: 2, pointRadius: 1.5, tension: 0.2, fill: false }
+        ]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { position: 'bottom', labels: { color: textColor, boxWidth: 12, font: { size: 11 } } } },
+        scales: {
+          x: { grid: { color: gridColor }, ticks: { color: textColor, maxTicksLimit: 8 } },
+          y: {
+            beginAtZero: minVal >= 0,
+            min: minVal < 0 ? minVal : 0,
+            suggestedMax: maxVal,
+            grid: { color: gridColor },
+            ticks: { color: textColor, precision: 0 }
+          }
+        }
+      }
+    });
+
+    batchTrendProcessedChart = new Chart(chart2, {
+      type: 'line',
+      data: {
+        labels: labels,
+        datasets: [{
+          label: 'ProcessedCumulative',
+          data: points.map(function(p) { return compareNum(p.processedCum); }),
+          borderColor: '#06b6d4',
+          backgroundColor: 'rgba(6,182,212,.1)',
+          borderWidth: 2,
+          pointRadius: 1.5,
+          tension: 0.2,
+          fill: false
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { position: 'bottom', labels: { color: textColor, boxWidth: 12, font: { size: 11 } } } },
+        scales: {
+          x: { grid: { color: gridColor }, ticks: { color: textColor, maxTicksLimit: 8 } },
+          y: { beginAtZero: true, grid: { color: gridColor }, ticks: { color: textColor, precision: 0 } }
+        }
+      }
+    });
+  });
+}
+
+function loadBatchTrend(batchNames, batchStats) {
+  window.__compareTrendBatches = Array.isArray(batchStats) ? batchStats.slice() : [];
+  var focusSel = document.getElementById('batch-trend-focus');
+  if (!focusSel) return;
+
+  var names = window.__compareTrendBatches.map(function(b) { return b && b.BatchName ? b.BatchName : ''; }).filter(Boolean);
+  if (names.length === 0 && Array.isArray(batchNames)) {
+    names = batchNames.filter(Boolean);
+  }
+
+  if (names.length === 0) {
+    focusSel.innerHTML = '';
+    renderCompareTrendFocused();
+    return;
+  }
+
+  if (!compareTrendFocusBatch || names.indexOf(compareTrendFocusBatch) === -1) {
+    compareTrendFocusBatch = names[0];
+  }
+
+  focusSel.innerHTML = names.map(function(name) {
+    var selected = name === compareTrendFocusBatch ? ' selected' : '';
+    return '<option value="' + compareEscHtml(name) + '"' + selected + '>' + compareEscHtml(name) + '</option>';
+  }).join('');
+
+  renderCompareTrendFocused();
 }
 
 function exportTrendsCSV() {
@@ -9607,23 +11292,90 @@ function mrsApiUrl(endpoint) {
     currentAlias    : null,   // alias or 'imported:filename' key of selected item
     currentStats    : null,   // parsed JSON stats object
     currentProp     : null,   // selected property path in Panel B tree
+    centerMode      : 'value',// Panel C mode: value | entries | failure
     allEntries      : [],     // full Report.Entries array for current selection
     filteredEntries : [],     // entries after filter
     filteredEntryIndexes : [],// source indexes for filtered report entries
     collectionItems : [],     // current Panel C collection/list values
     collectionProp  : '',     // currently selected property path for Panel C
+    failureEvents   : [],     // normalized failure events for current mailbox
+    failureTopTypes : [],     // top failure type distribution for current mailbox
     treeExpanded    : {},     // expanded object nodes in Panel B tree
     listItems       : [],     // cached move request list
     lastFetchTime   : 0,      // ms timestamp of last successful list load (0 = never)
     pollTimer       : null,
+    importPollTimers: {},     // keyed timer handles for XML import polling
+    importPollTokens: {},     // keyed generation token to cancel stale poll chains
     layoutReady     : false,
     uiRestored      : false,
     selectToken     : 0
   };
 
+  function mrsDescribeDataShape(data) {
+    if (data === null || data === undefined) return 'none';
+    if (typeof data === 'string') return 'string(' + data.length + ')';
+    if (Array.isArray(data)) return 'array(' + data.length + ')';
+    if (typeof data === 'object') {
+      try {
+        var k = Object.keys(data);
+        if (k.length <= 20) return 'object(' + k.join(',') + ')';
+        return 'object(' + k.length + ' keys)';
+      } catch (_) {
+        return 'object(?)';
+      }
+    }
+    return typeof data;
+  }
+
+  function mrsStopImportPoll(key) {
+    if (!key) return;
+    if (mrsState.importPollTimers[key]) {
+      clearTimeout(mrsState.importPollTimers[key]);
+      delete mrsState.importPollTimers[key];
+    }
+  }
+
+  function mrsScheduleImportPoll(key, startTime, filename, token, delayMs) {
+    if (!key) return;
+    var currentToken = mrsState.importPollTokens[key];
+    if (currentToken !== token) return;
+    mrsStopImportPoll(key);
+    mrsState.importPollTimers[key] = setTimeout(function() {
+      delete mrsState.importPollTimers[key];
+      mrsPollImport(key, startTime, filename, token);
+    }, Math.max(1200, delayMs || 1800));
+  }
+
   function mrsClamp(val, min, max) {
     return Math.max(min, Math.min(max, val));
   }
+
+  function mrsSetCenterMode(mode, skipSave) {
+    var next = (mode === 'entries' || mode === 'failure') ? mode : 'value';
+    mrsState.centerMode = next;
+    var center = document.getElementById('mrs-center-content');
+    var report = document.getElementById('mrs-report-viewer');
+    var failure = document.getElementById('mrs-failure-viewer');
+    if (center) center.style.display = (next === 'value') ? '' : 'none';
+    if (report) report.style.display = (next === 'entries') ? '' : 'none';
+    if (failure) failure.style.display = (next === 'failure') ? '' : 'none';
+    var tabValue = document.getElementById('mrs-center-tab-value');
+    var tabEntries = document.getElementById('mrs-center-tab-entries');
+    var tabFailure = document.getElementById('mrs-center-tab-failure');
+    if (tabValue) tabValue.classList.toggle('active', next === 'value');
+    if (tabEntries) tabEntries.classList.toggle('active', next === 'entries');
+    if (tabFailure) tabFailure.classList.toggle('active', next === 'failure');
+    if (next === 'value' && center) {
+      var hasContent = String(center.innerHTML || '').trim().length > 0;
+      if (!hasContent) {
+        center.innerHTML = mrsState.currentStats
+          ? '<span style="color:#94a3b8;font-style:italic">Select a property in Panel B to view value details.</span>'
+          : '<span style="color:#94a3b8;font-style:italic">No mailbox selected. Select a mailbox in Panel A.</span>';
+      }
+    }
+    if (!skipSave) mrsSaveUiState();
+  }
+  window.mrsSetCenterMode = mrsSetCenterMode;
 
   function mrsCreateDefaultCommandState() {
     return {
@@ -10067,7 +11819,15 @@ function mrsApiUrl(endpoint) {
   }
 
   function mrsLoadUiState() {
-    var defaults = { search: '', status: 'All', currentAlias: null, currentProp: null, treeExpanded: {}, commandState: mrsCreateDefaultCommandState() };
+    var defaults = {
+      search: '',
+      status: 'All',
+      currentAlias: null,
+      currentProp: null,
+      centerMode: 'value',
+      treeExpanded: {},
+      commandState: mrsCreateDefaultCommandState()
+    };
     try {
       var raw = localStorage.getItem('mrsExplorerUiStateV1');
       if (!raw) return defaults;
@@ -10078,6 +11838,7 @@ function mrsApiUrl(endpoint) {
         status: parsed.status || 'All',
         currentAlias: parsed.currentAlias || null,
         currentProp: parsed.currentProp || null,
+        centerMode: (parsed.centerMode === 'entries' || parsed.centerMode === 'failure') ? parsed.centerMode : 'value',
         treeExpanded: parsed.treeExpanded && typeof parsed.treeExpanded === 'object' ? parsed.treeExpanded : {},
         commandState: parsed.commandState && typeof parsed.commandState === 'object' ? parsed.commandState : defaults.commandState
       };
@@ -10093,6 +11854,7 @@ function mrsApiUrl(endpoint) {
         status: (document.getElementById('mrs-status-filter') || {}).value || 'All',
         currentAlias: mrsState.currentAlias || null,
         currentProp: mrsState.currentProp || null,
+        centerMode: mrsState.centerMode || 'value',
         treeExpanded: mrsState.treeExpanded || {},
         commandState: mrsCmdState
       }));
@@ -10113,9 +11875,11 @@ function mrsApiUrl(endpoint) {
     mrsInitCommandToolbar();
     mrsState.currentAlias = st.currentAlias || null;
     mrsState.currentProp = st.currentProp || null;
+    mrsState.centerMode = (st.centerMode === 'entries' || st.centerMode === 'failure') ? st.centerMode : 'value';
     mrsState.treeExpanded = st.treeExpanded && typeof st.treeExpanded === 'object' ? st.treeExpanded : {};
     mrsSyncIdentityFromPanelSelection();
     mrsUpdateCommandPreviewBar();
+    mrsSetCenterMode(mrsState.centerMode, true);
   }
 
   function mrsInitResizableLayout() {
@@ -10522,12 +12286,14 @@ function mrsApiUrl(endpoint) {
         mrsState.currentProp = null;
       }
     }
-    if (!mrsState.currentProp) {
-      document.getElementById('mrs-report-viewer').style.display = 'none';
+    if (!mrsState.currentProp && mrsState.centerMode === 'value') {
       document.getElementById('mrs-center-content').innerHTML =
         '<span style="color:#94a3b8;font-style:italic">Select a property in Panel B to view value details.</span>';
       mrsShowEntryDetail('');
     }
+    if (mrsState.centerMode === 'entries') mrsOpenReportEntries();
+    else if (mrsState.centerMode === 'failure') mrsRenderFailureIntelligence();
+    else mrsSetCenterMode('value', true);
     mrsSaveUiState();
   }
 
@@ -10648,7 +12414,7 @@ function mrsApiUrl(endpoint) {
       var cacheMs = resp && resp.cacheTime ? new Date(resp.cacheTime).getTime() : 0;
       console.log('[MRS] poll stats:', alias, '| ok=', resp && resp.ok, '| cacheTime=', resp && resp.cacheTime,
         '| cacheMs=', cacheMs, '| pollSince=', pollSince, '| diff=', cacheMs - pollSince,
-        '| dataKeys=', resp && resp.data ? Object.keys(resp.data) : 'none',
+        '| data=', mrsDescribeDataShape(resp && resp.data),
         '| error=', resp && resp.error, '| availableKeys=', resp && resp.availableKeys);
       if (!resp || !resp.ok) {
         mrsSetNodePath(alias + ' > waiting for server cache.');
@@ -10687,8 +12453,7 @@ function mrsApiUrl(endpoint) {
     var center = document.getElementById('mrs-center-content');
     if (empty) empty.style.display = 'none';
     if (area) area.style.display = 'flex';
-
-    document.getElementById('mrs-report-viewer').style.display = 'none';
+    mrsSetCenterMode(mrsState.centerMode || 'value', true);
 
     if (show) {
       detailPanel.style.flex = '0 0 auto';
@@ -10696,18 +12461,23 @@ function mrsApiUrl(endpoint) {
         detailPanel.style.height = (mrsClamp(mrsLoadLayout().detailHeight, 120, 360)) + 'px';
       }
       detailPanel.style.display = '';
-      center.innerHTML = '';
+      if (mrsState.centerMode === 'value' && !mrsState.currentProp) {
+        center.innerHTML = '<span style="color:#94a3b8;font-style:italic">Select a property in Panel B to view value details.</span>';
+      }
     } else {
       if (tree) {
         tree.innerHTML = '<li style="padding:12px 10px;color:#94a3b8;font-size:.8rem">No mailbox selected. Properties will appear here.</li>';
       }
       center.innerHTML = '<span style="color:#94a3b8;font-style:italic">No mailbox selected. Select a mailbox in Panel A.</span>';
+      var failureView = document.getElementById('mrs-failure-viewer');
+      if (failureView) failureView.innerHTML = '<div class="mrs-fi-empty">Select a mailbox in Panel A to view failure intelligence.</div>';
       detailPanel.style.flex = '0 0 auto';
       if (!detailPanel.style.height || detailPanel.style.height === 'auto') {
         detailPanel.style.height = (mrsClamp(mrsLoadLayout().detailHeight, 120, 360)) + 'px';
       }
       detailPanel.style.display = '';
       detailText.textContent = 'Panel D - Entry Detail\nSelect a property or report row to populate this panel.';
+      mrsSetCenterMode('value', true);
     }
   }
 
@@ -10788,8 +12558,10 @@ function mrsApiUrl(endpoint) {
   window.mrsToggleTreeNode = mrsToggleTreeNode;
 
   function mrsRenderPropertyTree(stats) {
-    console.log('[MRS] mrsRenderPropertyTree called. stats type=', typeof stats,
-      'keys=', stats ? Object.keys(stats).length : 'null/undefined');
+    if (typeof stats === 'string') {
+      try { stats = JSON.parse(stats); } catch (_) {}
+    }
+    console.log('[MRS] mrsRenderPropertyTree called. stats=', mrsDescribeDataShape(stats));
     var ul = document.getElementById('mrs-property-tree');
     if (!ul) { console.error('[MRS] mrs-property-tree element not found!'); return; }
 
@@ -10958,7 +12730,7 @@ function mrsApiUrl(endpoint) {
 
   function renderMRSScalar(propName, val) {
     var content = document.getElementById('mrs-center-content');
-    document.getElementById('mrs-report-viewer').style.display = 'none';
+    mrsSetCenterMode('value', true);
     mrsState.collectionItems = [];
     mrsState.collectionProp = '';
     if (val === null || val === undefined || val === '') {
@@ -10987,7 +12759,7 @@ function mrsApiUrl(endpoint) {
 
   function renderMRSCollection(propName, items) {
     var content = document.getElementById('mrs-center-content');
-    document.getElementById('mrs-report-viewer').style.display = 'none';
+    mrsSetCenterMode('value', true);
     mrsState.collectionItems = Array.isArray(items) ? items : [];
     mrsState.collectionProp = propName || '';
     if (!items || items.length === 0) {
@@ -11009,6 +12781,7 @@ function mrsApiUrl(endpoint) {
 
   function mrsSelectProperty(prop) {
     if (!mrsState.currentStats) return;
+    mrsSetCenterMode('value', true);
     mrsState.currentProp = prop;
     mrsSaveUiState();
     document.querySelectorAll('.mrs-tree-item').forEach(function(li){ li.style.background = ''; });
@@ -11086,9 +12859,340 @@ function mrsApiUrl(endpoint) {
   function mrsEntryTime(entry) { return mrsEntryField(entry, ['CreationTime', 'Timestamp', 'TimeStamp']); }
   function mrsEntryDuration(entry) { return mrsEntryField(entry, ['Duration']); }
 
+  function mrsEscHtml(value) {
+    return String(value === null || value === undefined ? '' : value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function mrsFiFmtTs(value) {
+    if (!value) return '-';
+    try {
+      var d = new Date(value);
+      if (!isNaN(d.getTime())) return d.toLocaleString();
+    } catch (_) {}
+    return String(value);
+  }
+
+  function mrsFiToArray(value) {
+    if (!value) return [];
+    if (Array.isArray(value)) return value;
+    if (typeof value !== 'object') return [];
+    var keys = Object.keys(value);
+    if (!keys.length) return [];
+    if (keys.every(function(k) { return /^\d+$/.test(k); })) {
+      return keys.sort(function(a, b) { return parseInt(a, 10) - parseInt(b, 10); }).map(function(k) { return value[k]; });
+    }
+    if (Array.isArray(value.Items)) return value.Items;
+    if (Array.isArray(value.Entries)) return value.Entries;
+    if (Array.isArray(value.Failures)) return value.Failures;
+    return [value];
+  }
+
+  function mrsFiDiagText(stats) {
+    if (!stats || typeof stats !== 'object') return '';
+    var raw = stats.DiagnosticInfo;
+    if ((raw === null || raw === undefined) && stats.Report && typeof stats.Report === 'object') raw = stats.Report.DiagnosticInfo;
+    if (raw === null || raw === undefined) return '';
+    if (typeof raw === 'string') return raw;
+    var scalar = mrsScalarFromObject(raw);
+    if (scalar !== null) return String(scalar);
+    if (raw.__Text) return String(raw.__Text);
+    try { return JSON.stringify(raw, null, 2); } catch (_) {}
+    return String(raw);
+  }
+
+  function mrsFiDiagTag(text, tagName) {
+    if (!text) return '';
+    try {
+      var rx = new RegExp('<' + tagName + '[^>]*>([\\s\\S]*?)</' + tagName + '>', 'i');
+      var m = text.match(rx);
+      return m && m[1] ? String(m[1]).trim() : '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function mrsFiIsPermanent(flagValue, typeValue, codeValue, msgValue) {
+    var flag = String(flagValue === null || flagValue === undefined ? '' : flagValue).toLowerCase();
+    if (flag === 'true' || flag === '1' || flag === 'yes' || flag === 'permanent') return true;
+    if (flag === 'false' || flag === '0' || flag === 'no' || flag === 'transient' || flag === 'retryable') return false;
+    var hay = [
+      String(typeValue || ''),
+      String(codeValue || ''),
+      String(msgValue || '')
+    ].join(' ').toLowerCase();
+    if (/transient|timeout|throttl|temporar|retry|backoff/.test(hay)) return false;
+    if (/permanent|notfound|corrupt|invalid|cannot|unsupported|forbidden|denied/.test(hay)) return true;
+    return false;
+  }
+
+  function mrsFiBuild(stats) {
+    var report = (stats && typeof stats === 'object' && stats.Report && typeof stats.Report === 'object') ? stats.Report : {};
+    var failureRows = mrsFiToArray(report.Failures);
+    var events = [];
+
+    failureRows.forEach(function(row, i) {
+      if (!row || typeof row !== 'object') return;
+      var ts = mrsEntryField(row, ['FailureTimestamp', 'Timestamp', 'TimeStamp', 'CreationTime', 'DateTime']);
+      var typ = mrsEntryField(row, ['FailureType', 'Type', 'EntryType', 'Category']);
+      var code = mrsEntryField(row, ['FailureCode', 'Code', 'ErrorCode', 'HResult']);
+      var hash = mrsEntryField(row, ['FailureHash', 'Hash']);
+      var msg = mrsEntryField(row, ['Message', 'Error', 'Failure', 'FailureMessage', 'LastFailure', 'Description', '__Text']);
+      var mailbox = mrsEntryField(row, ['MailboxIdentity', 'Mailbox', 'Identity', 'Alias', 'TargetMailbox']);
+      var permRaw = mrsEntryField(row, ['IsPermanent', 'Permanent', 'PermanentFailure']);
+      if (!ts && !typ && !code && !hash && !msg && !mailbox) return;
+      events.push({
+        Index: i,
+        Timestamp: ts || '',
+        FailureType: typ || 'Unknown',
+        FailureCode: code || '',
+        FailureHash: hash || '',
+        Message: msg || '',
+        MailboxToken: mailbox || (stats && (stats.Alias || stats.Identity || '')),
+        IsPermanent: mrsFiIsPermanent(permRaw, typ, code, msg),
+        Source: 'Report.Failures',
+        Raw: row
+      });
+    });
+
+    if (events.length === 0) {
+      var ts0 = mrsEntryField(stats, ['FailureTimestamp']);
+      var typ0 = mrsEntryField(stats, ['FailureType']);
+      var code0 = mrsEntryField(stats, ['FailureCode']);
+      var msg0 = mrsEntryField(stats, ['LastFailure', 'Message', 'StatusDetail']);
+      if (ts0 || typ0 || code0 || msg0) {
+        events.push({
+          Index: 0,
+          Timestamp: ts0 || '',
+          FailureType: typ0 || 'Mailbox Failure',
+          FailureCode: code0 || '',
+          FailureHash: '',
+          Message: msg0 || '',
+          MailboxToken: mrsEntryField(stats, ['Alias', 'Identity', 'DisplayName']),
+          IsPermanent: mrsFiIsPermanent('', typ0, code0, msg0),
+          Source: 'MailboxSummary',
+          Raw: {
+            FailureTimestamp: ts0 || '',
+            FailureType: typ0 || '',
+            FailureCode: code0 || '',
+            Message: msg0 || ''
+          }
+        });
+      }
+    }
+
+    if (events.length === 0) {
+      var entries = mrsFiToArray(report.Entries);
+      entries.forEach(function(row, i) {
+        if (!row || typeof row !== 'object') return;
+        var lvl = String(mrsEntryLevel(row) || '').toLowerCase();
+        var msgE = mrsEntryMessage(row);
+        var typeE = mrsEntryType(row);
+        var isFail = (lvl === 'failure' || lvl === 'error' || /fail|error|exception/.test(String(msgE || '').toLowerCase()));
+        if (!isFail) return;
+        events.push({
+          Index: i,
+          Timestamp: mrsEntryTime(row) || '',
+          FailureType: typeE || 'Report Entry',
+          FailureCode: '',
+          FailureHash: '',
+          Message: msgE || '',
+          MailboxToken: mrsEntryField(stats, ['Alias', 'Identity', 'DisplayName']),
+          IsPermanent: mrsFiIsPermanent('', typeE, '', msgE),
+          Source: 'Report.Entries',
+          Raw: row
+        });
+      });
+    }
+
+    events.sort(function(a, b) {
+      var ta = Date.parse(a.Timestamp || '') || 0;
+      var tb = Date.parse(b.Timestamp || '') || 0;
+      return tb - ta;
+    });
+
+    var byType = {};
+    var bySig = {};
+    var permanent = 0;
+    var retryable = 0;
+    events.forEach(function(e) {
+      var t = e.FailureType || 'Unknown';
+      if (!byType[t]) byType[t] = 0;
+      byType[t] += 1;
+      var sig = [e.FailureType || 'Unknown', e.FailureCode || '-', e.FailureHash || '-'].join('|');
+      if (!bySig[sig]) bySig[sig] = { Key: sig, FailureType: e.FailureType || 'Unknown', FailureCode: e.FailureCode || '-', FailureHash: e.FailureHash || '-', Count: 0, Permanent: 0, Retryable: 0, SampleMessage: e.Message || '' };
+      bySig[sig].Count += 1;
+      if (e.IsPermanent) {
+        permanent += 1;
+        bySig[sig].Permanent += 1;
+      } else {
+        retryable += 1;
+        bySig[sig].Retryable += 1;
+      }
+    });
+
+    var topTypes = Object.keys(byType).map(function(k) { return { FailureType: k, Count: byType[k] }; })
+      .sort(function(a, b) { return b.Count - a.Count; }).slice(0, 10);
+    var topSignatures = Object.keys(bySig).map(function(k) { return bySig[k]; })
+      .sort(function(a, b) { return b.Count - a.Count; }).slice(0, 15);
+
+    var diagRaw = mrsFiDiagText(stats);
+    var diagStatusCounts = {};
+    if (diagRaw) {
+      var rx = /<status[^>]*>([^<]+)<\/status>/gi;
+      var m;
+      while ((m = rx.exec(diagRaw)) !== null) {
+        var code = String(m[1] || '').trim();
+        if (!code) continue;
+        diagStatusCounts[code] = (diagStatusCounts[code] || 0) + 1;
+      }
+    }
+    var diagStatuses = Object.keys(diagStatusCounts).map(function(k) { return { Status: k, Count: diagStatusCounts[k] }; })
+      .sort(function(a, b) { return b.Count - a.Count; }).slice(0, 12);
+    var diagSummary = {
+      Status: mrsFiDiagTag(diagRaw, 'status'),
+      LegacyStatus: mrsFiDiagTag(diagRaw, 'legacyStatus'),
+      State: mrsFiDiagTag(diagRaw, 'state'),
+      StateUpdated: mrsFiDiagTag(diagRaw, 'stateLastUpdated'),
+      SameStatusCount: mrsFiDiagTag(diagRaw, 'sameStatusCount'),
+      TransientErrors: mrsFiDiagTag(diagRaw, 'transientErrorCount')
+    };
+
+    return {
+      events: events,
+      topTypes: topTypes,
+      topSignatures: topSignatures,
+      permanent: permanent,
+      retryable: retryable,
+      diagRaw: diagRaw,
+      diagSummary: diagSummary,
+      diagStatuses: diagStatuses
+    };
+  }
+
+  function mrsSelectFailureEvent(idx) {
+    var e = mrsState.failureEvents && mrsState.failureEvents[idx];
+    if (!e) return;
+    mrsShowEntryDetail(mrsDetailTextForValue(e.Raw || e));
+    mrsSetNodePath((mrsState.currentAlias || '') + ' > Failure Intelligence > Event[' + idx + ']');
+  }
+  window.mrsSelectFailureEvent = mrsSelectFailureEvent;
+
+  function mrsSelectFailureSignature(idx) {
+    var s = mrsState.failureTopTypes && mrsState.failureTopTypes[idx];
+    if (!s) return;
+    mrsShowEntryDetail(mrsDetailTextForValue(s));
+    mrsSetNodePath((mrsState.currentAlias || '') + ' > Failure Intelligence > TopType[' + idx + ']');
+  }
+  window.mrsSelectFailureSignature = mrsSelectFailureSignature;
+
+  function mrsRenderFailureIntelligence() {
+    var host = document.getElementById('mrs-failure-viewer');
+    if (!host) return;
+    if (!mrsState.currentStats || typeof mrsState.currentStats !== 'object') {
+      host.innerHTML = '<div class="mrs-fi-empty">No mailbox selected. Select a mailbox in Panel A.</div>';
+      return;
+    }
+
+    var fi = mrsFiBuild(mrsState.currentStats);
+    mrsState.failureEvents = fi.events || [];
+    mrsState.failureTopTypes = fi.topTypes || [];
+
+    var rows = [
+      ['Mailbox', mrsState.currentAlias || '-'],
+      ['Total Events', fi.events.length],
+      ['Permanent', fi.permanent],
+      ['Retryable', fi.retryable],
+      ['First Event', fi.events.length ? mrsFiFmtTs(fi.events[fi.events.length - 1].Timestamp) : '-'],
+      ['Last Event', fi.events.length ? mrsFiFmtTs(fi.events[0].Timestamp) : '-']
+    ];
+
+    var html = '<div class="mrs-fi-grid">' + rows.map(function(r) {
+      return '<div class="mrs-fi-kpi"><div class="mrs-fi-kpi-label">' + mrsEscHtml(r[0]) + '</div><div class="mrs-fi-kpi-value">' + mrsEscHtml(r[1]) + '</div></div>';
+    }).join('') + '</div>';
+
+    if (!fi.events.length && !fi.diagRaw) {
+      html += '<div class="mrs-fi-empty">No failure records found in this mailbox statistics payload. This can be normal for healthy requests.</div>';
+      host.innerHTML = html;
+      return;
+    }
+
+    html += '<div class="mrs-fi-section"><div class="mrs-fi-section-head">Top Failure Types</div><div class="mrs-fi-table-wrap"><table class="mrs-fi-table"><thead><tr><th>Type</th><th>Count</th></tr></thead><tbody>';
+    if (!fi.topTypes.length) {
+      html += '<tr><td colspan="2" style="color:#94a3b8">No grouped failure types available.</td></tr>';
+    } else {
+      html += fi.topTypes.map(function(t, idx) {
+        return '<tr onclick="mrsSelectFailureSignature(' + idx + ')"><td>' + mrsEscHtml(t.FailureType || '-') + '</td><td style="white-space:nowrap">' + mrsEscHtml(t.Count) + '</td></tr>';
+      }).join('');
+    }
+    html += '</tbody></table></div></div>';
+
+    html += '<div class="mrs-fi-section"><div class="mrs-fi-section-head">Recent Failure Events</div><div class="mrs-fi-table-wrap"><table class="mrs-fi-table"><thead><tr><th>Timestamp</th><th>Type</th><th>Code</th><th>Mailbox</th><th>Message</th></tr></thead><tbody>';
+    if (!fi.events.length) {
+      html += '<tr><td colspan="5" style="color:#94a3b8">No individual failure events available.</td></tr>';
+    } else {
+      html += fi.events.slice(0, 40).map(function(e, idx) {
+        var msg = e.Message || '';
+        var shortMsg = msg.length > 180 ? (msg.substring(0, 180) + '...') : msg;
+        return '<tr onclick="mrsSelectFailureEvent(' + idx + ')">' +
+          '<td style="white-space:nowrap">' + mrsEscHtml(mrsFiFmtTs(e.Timestamp)) + '</td>' +
+          '<td style="white-space:nowrap">' + mrsEscHtml(e.FailureType || '-') + '</td>' +
+          '<td style="white-space:nowrap">' + mrsEscHtml(e.FailureCode || '-') + '</td>' +
+          '<td style="white-space:nowrap">' + mrsEscHtml(e.MailboxToken || '-') + '</td>' +
+          '<td title="' + mrsEscHtml(msg) + '">' + mrsEscHtml(shortMsg) + '</td>' +
+          '</tr>';
+      }).join('');
+    }
+    html += '</tbody></table></div></div>';
+
+    html += '<div class="mrs-fi-section"><div class="mrs-fi-section-head">DiagnosticInfo Summary</div>';
+    html += '<div class="mrs-fi-grid" style="padding:8px 10px 0">';
+    [
+      ['Status', fi.diagSummary.Status || '-'],
+      ['Legacy Status', fi.diagSummary.LegacyStatus || '-'],
+      ['State', fi.diagSummary.State || '-'],
+      ['State Updated', fi.diagSummary.StateUpdated || '-'],
+      ['SameStatusCount', fi.diagSummary.SameStatusCount || '-'],
+      ['TransientErrors', fi.diagSummary.TransientErrors || '-']
+    ].forEach(function(r) {
+      html += '<div class="mrs-fi-kpi"><div class="mrs-fi-kpi-label">' + mrsEscHtml(r[0]) + '</div><div class="mrs-fi-kpi-value">' + mrsEscHtml(r[1]) + '</div></div>';
+    });
+    html += '</div>';
+    if (fi.diagStatuses.length) {
+      html += '<div class="mrs-fi-table-wrap" style="padding:8px 10px 0"><table class="mrs-fi-table"><thead><tr><th>Status Code</th><th>Count</th></tr></thead><tbody>';
+      html += fi.diagStatuses.map(function(s) {
+        return '<tr><td>' + mrsEscHtml(s.Status) + '</td><td>' + mrsEscHtml(s.Count) + '</td></tr>';
+      }).join('');
+      html += '</tbody></table></div>';
+    }
+    html += '<pre class="mrs-fi-diag">' + mrsEscHtml(fi.diagRaw ? String(fi.diagRaw).slice(0, 12000) : '-') + '</pre></div>';
+
+    host.innerHTML = html;
+  }
+
+  function mrsOpenFailureIntelligence() {
+    mrsSetCenterMode('failure');
+    mrsShowEntryDetail('Panel D - Entry Detail\nClick a failure row in Panel C to inspect full detail.');
+    mrsSetNodePath((mrsState.currentAlias || '') + ' > Failure Intelligence');
+    mrsRenderFailureIntelligence();
+  }
+  window.mrsOpenFailureIntelligence = mrsOpenFailureIntelligence;
+
   function mrsOpenReportEntries() {
-    if (!mrsState.currentStats || !mrsState.currentStats.Report) return;
-    mrsState.allEntries = mrsState.currentStats.Report.Entries || [];
+    mrsSetCenterMode('entries');
+    if (!mrsState.currentStats || !mrsState.currentStats.Report) {
+      mrsState.allEntries = [];
+      document.getElementById('mrs-entries-tbody').innerHTML = '<tr><td colspan="5" style="padding:16px;text-align:center;color:#94a3b8">No Report object in current mailbox stats</td></tr>';
+      document.getElementById('mrs-entries-count').textContent = 'Showing 0 of 0 entries';
+      mrsShowEntryDetail('Panel D - Entry Detail\nNo Report.Entries found for this mailbox.');
+      mrsSetNodePath((mrsState.currentAlias || '') + ' > Report > Entries');
+      return;
+    }
+    mrsState.allEntries = mrsFiToArray(mrsState.currentStats.Report.Entries);
 
     // Populate type filter with unique values
     var typeFilter = document.getElementById('mrs-entries-type-filter');
@@ -11104,7 +13208,6 @@ function mrsApiUrl(endpoint) {
     document.getElementById('mrs-entries-level-filter').value = 'All';
     document.getElementById('mrs-entries-search').value = '';
     document.getElementById('mrs-center-content').innerHTML = '';
-    document.getElementById('mrs-report-viewer').style.display = '';
     mrsShowEntryDetail('Panel D - Entry Detail\nSelect a report row to view full entry detail.');
     mrsSetNodePath(mrsState.currentAlias + ' > Report > Entries');
     mrsFilterEntries();
@@ -11229,7 +13332,9 @@ function mrsApiUrl(endpoint) {
         badge.textContent = 'Import queued…';
         var key = resp.key;
         console.log('[MRS] import queued with key:', key);
-        mrsPollImport(key, Date.now(), file.name);
+        mrsState.importPollTokens[key] = (mrsState.importPollTokens[key] || 0) + 1;
+        mrsStopImportPoll(key);
+        mrsPollImport(key, Date.now(), file.name, mrsState.importPollTokens[key]);
         // Add a virtual row in the list (dedup by alias); backend will persist it.
         var hasRow = (mrsState.listItems || []).some(function(it) {
           return String((it && it.Alias) || '') === key;
@@ -11249,22 +13354,28 @@ function mrsApiUrl(endpoint) {
   }
   window.mrsImportXml = mrsImportXml;
 
-  function mrsPollImport(key, startTime, filename) {
+  function mrsPollImport(key, startTime, filename, token) {
+    if (!key) return;
+    var currentToken = mrsState.importPollTokens[key] || 0;
+    if (currentToken !== token) return;
     if (Date.now() - startTime > 300000) {
       console.warn('[MRS] mrsPollImport timed out for key:', key);
       var badge = document.getElementById('mrs-session-status');
       badge.style.background = '#fee2e2'; badge.style.color = '#991b1b';
       badge.textContent = 'Import timed out';
+      mrsStopImportPoll(key);
+      delete mrsState.importPollTokens[key];
       return;
     }
     apiCall('/api/mrs/statistics?alias=' + encodeURIComponent(key), 'GET', null).then(function(resp) {
+      if ((mrsState.importPollTokens[key] || 0) !== token) return;
       console.log('[MRS] mrsPollImport:', key, 'ok=', resp && resp.ok);
       if (!resp || !resp.ok) {
         if (resp && resp.error === 'importing') {
           var waitBadge = document.getElementById('mrs-session-status');
           waitBadge.style.background = '#fef9c3'; waitBadge.style.color = '#854d0e';
           waitBadge.textContent = 'Importing (processing XML)...';
-          setTimeout(function() { mrsPollImport(key, startTime, filename); }, 1500);
+          mrsScheduleImportPoll(key, startTime, filename, token, 2200);
           return;
         }
         if (resp && resp.error && resp.error !== 'not found') {
@@ -11272,28 +13383,29 @@ function mrsApiUrl(endpoint) {
           var failBadge = document.getElementById('mrs-session-status');
           failBadge.style.background = '#fee2e2'; failBadge.style.color = '#991b1b';
           failBadge.textContent = 'Import failed';
+          mrsStopImportPoll(key);
+          delete mrsState.importPollTokens[key];
           return;
         }
-        setTimeout(function() { mrsPollImport(key, startTime, filename); }, 1500);
+        mrsScheduleImportPoll(key, startTime, filename, token, 2200);
         return;
       }
-      console.log('[MRS] mrsPollImport: import ready for', key, '— auto-selecting');
+      console.log('[MRS] mrsPollImport: import ready for', key, '- auto-selecting');
       var badge = document.getElementById('mrs-session-status');
       badge.style.background = '#dcfce7'; badge.style.color = '#166534';
       badge.textContent = 'Session Active';
+      mrsStopImportPoll(key);
+      delete mrsState.importPollTokens[key];
       // Auto-select the imported entry
       mrsState.currentAlias = key;
-      mrsState.currentStats = resp.data;
       mrsState.currentProp = null;
       mrsState.treeExpanded = {};
-      mrsSaveUiState();
       mrsSetImportLabel(filename);
-      mrsShowDetailArea(true);
-      mrsRenderPropertyTree(resp.data);
-      mrsSetNodePath(key);
+      mrsRenderMailboxStats(key, resp.data, false);
     }).catch(function(err) {
+      if ((mrsState.importPollTokens[key] || 0) !== token) return;
       console.error('[MRS] mrsPollImport network error:', err);
-      setTimeout(function() { mrsPollImport(key, startTime, filename); }, 2000);
+      mrsScheduleImportPoll(key, startTime, filename, token, 2600);
     });
   }
 
@@ -11780,7 +13892,7 @@ function Start-WatchListener {
                             } else {
                                 $cache = $State['BatchStatsCache']
                                 if ($cache -and $cache.ContainsKey($batchName)) {
-                                    $responseBytes = [System.Text.Encoding]::UTF8.GetBytes(($cache[$batchName] | ConvertTo-Json -Compress))
+                                    $responseBytes = [System.Text.Encoding]::UTF8.GetBytes(($cache[$batchName] | ConvertTo-Json -Depth 12 -Compress))
                                 } else {
                                     $responseBytes = [System.Text.Encoding]::UTF8.GetBytes(("{`"ok`":false,`"error`":`"Batch not found: $($batchName -replace '"','')`"}"))
                                 }
@@ -13380,7 +15492,8 @@ if ($MyInvocation.InvocationName -ne '.') {
                             Write-Console "Manual refresh requested" -Level API -NoTimestamp
                         }
                         elseif ($cmd.Action -eq 'fetchBatchStats') {
-                            # On-demand fetch for selected batches only — uses Get-MigrationBatch -Identity -IncludeReport
+                            # On-demand fetch for selected batches only - uses Get-MigrationBatch -Identity
+                            # with -IncludeReport -DiagnosticInfo "Verbose,showtimeline,showtimeslots,reports" -ResultSize Unlimited
                             if ($cmd.Batches -and @($cmd.Batches).Count -gt 0) {
                                 Write-Console "Fetching batch stats for: $($cmd.Batches -join ', ')" -Level API -NoTimestamp
                                 Invoke-BatchStatsRefresh -WatchState $watchState -BatchNames @($cmd.Batches) -CachedMailboxes $watchState['CachedMailboxes']
