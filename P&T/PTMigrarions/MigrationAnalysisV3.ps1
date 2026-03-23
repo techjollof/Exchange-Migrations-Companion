@@ -1245,6 +1245,16 @@ function ConvertTo-MRSStatisticsJson {
     return $obj | ConvertTo-Json -Depth 12 -Compress
 }
 
+function Ensure-MRSImportedItemsStore {
+    param([Parameter(Mandatory)][hashtable]$WatchState)
+    $store = $WatchState['MRSImportedItems']
+    if ($null -eq $store -or -not ($store -is [System.Collections.IDictionary])) {
+        $store = [System.Collections.Hashtable]::Synchronized(@{})
+        $WatchState['MRSImportedItems'] = $store
+    }
+    return $store
+}
+
 function Invoke-MRSMoveRequestRefresh {
     param([Parameter(Mandatory)][hashtable]$WatchState)
     try {
@@ -1345,6 +1355,11 @@ function Invoke-MRSStatisticsRefresh {
     try {
         # Imported XML entries are already in the cache - no EXO call needed.
         if ($Alias -like 'imported:*') {
+            $pendingKey = "MRSImportPending_$Alias"
+            if ($WatchState[$pendingKey]) {
+                Write-Console "MRSStatisticsRefresh: '$Alias' import still in progress." -Level Info -NoTimestamp
+                return
+            }
             $keys = Get-MRSStatsCacheKeys -Alias $Alias -ProfileSignature $ProfileSignature
             $legacyJson = $WatchState[$keys.LegacyJsonKey]
             if ($legacyJson) {
@@ -1480,14 +1495,39 @@ function Invoke-MRSXmlImport {
         [Parameter(Mandatory)][string]$TempPath,
         [Parameter(Mandatory)][string]$OriginalName
     )
+    $key = "imported:$OriginalName"
     try {
         $obj  = Import-Clixml -Path $TempPath
         $json = ConvertTo-MRSStatisticsJson -Stats $obj
-        $key  = "imported:$OriginalName"
+        if ($WatchState.ContainsKey("MRSImportError_$key")) { $WatchState.Remove("MRSImportError_$key") }
+        if ($WatchState.ContainsKey("MRSImportPending_$key")) { $WatchState.Remove("MRSImportPending_$key") }
+        $importStore = Ensure-MRSImportedItemsStore -WatchState $WatchState
+        $importStore[$key] = [ordered]@{
+            Name       = $OriginalName
+            DisplayName= $OriginalName
+            Alias      = $key
+            BatchName  = 'Imported XML'
+            Status     = 'Imported'
+            Source     = 'XML'
+            ImportedAt = (Get-Date).ToUniversalTime().ToString('o')
+        }
         $WatchState["MRSStatsJson_$key"] = $json
         $WatchState["MRSStatsTime_$key"] = (Get-Date).ToUniversalTime().ToString('o')
         Write-Console "MRSXmlImport: imported '$OriginalName' -> key '$key'." -Level Info -NoTimestamp
     } catch {
+        if ($WatchState.ContainsKey("MRSImportPending_$key")) { $WatchState.Remove("MRSImportPending_$key") }
+        $WatchState["MRSImportError_$key"] = "$($_.Exception.Message)"
+        $importStore = Ensure-MRSImportedItemsStore -WatchState $WatchState
+        $importStore[$key] = [ordered]@{
+            Name       = $OriginalName
+            DisplayName= $OriginalName
+            Alias      = $key
+            BatchName  = 'Imported XML'
+            Status     = 'ImportFailed'
+            Source     = 'XML'
+            ImportedAt = (Get-Date).ToUniversalTime().ToString('o')
+            Error      = "$($_.Exception.Message)"
+        }
         Write-Console "MRSXmlImport failed for '$OriginalName': $($_.Exception.Message)" -Level Warn -NoTimestamp
     } finally {
         if (Test-Path $TempPath) { Remove-Item $TempPath -Force -ErrorAction SilentlyContinue }
@@ -2252,6 +2292,9 @@ function Get-MoveRequests {
         $count = @($moves).Count
         if ($count -eq 0) {
             Write-Console "No move requests matched the specified filters." -Level WARN
+            if ($effectiveStatusFilter -eq 'All' -and -not $IncludeCompleted) {
+            Write-Console "Hint: 'Exclude Completed' is ON. Completed-only scopes will return no rows." -Level WARN
+            }
         } else {
             Write-Console "Found $count move request(s)." -Level SUCCESS
         }
@@ -2377,7 +2420,7 @@ function Invoke-MigrationReportFromCache {
         [bool]$IncludeCompleted,
         [string[]]$Mailbox,
         [string]$MigrationBatchName,
-        [datetime]$SinceDate,
+        [Nullable[datetime]]$SinceDate = $null,
 
         [int]$Percentile = 90,
         [double]$MinSizeGBForScoring = 0.1,
@@ -2391,9 +2434,21 @@ function Invoke-MigrationReportFromCache {
         [bool]$SkipCsv
     )
 
-    $stats = Get-CachedMoveStats -Stats $CachedRawStats -StatusFilter $StatusFilter -IncludeCompleted:$IncludeCompleted -Mailbox $Mailbox -MigrationBatchName $MigrationBatchName -SinceDate $SinceDate
+    $cacheFilterParams = @{
+        Stats              = $CachedRawStats
+        StatusFilter       = $StatusFilter
+        IncludeCompleted   = $IncludeCompleted
+        Mailbox            = $Mailbox
+        MigrationBatchName = $MigrationBatchName
+    }
+    if ($null -ne $SinceDate) { $cacheFilterParams['SinceDate'] = $SinceDate }
+
+    $stats = Get-CachedMoveStats @cacheFilterParams
     if (-not $stats -or @($stats).Count -eq 0) {
         Write-Console 'No cached data matched the selected filters. Click Refresh Now to fetch latest data from Exchange.' -Level Warn
+        if ($StatusFilter -eq 'All' -and -not $IncludeCompleted) {
+            Write-Console "Hint: 'Exclude Completed' is ON. Completed-only scopes will return no rows." -Level Warn
+        }
         return $null
     }
 
@@ -2487,8 +2542,11 @@ function Get-MoveStats {
         [ValidateRange(1,1000)]
         [int]$BatchSize = 500,
         [bool]$IncludeDetailReport = $false,
+        # Preferred direct mode input: one entry per mailbox with ordered identity candidates.
+        # Each item should expose .Candidates (string[]), plus optional DisplayName/Alias/Status.
+        [object[]]$DirectIdentityPlans = @(),
         # When set, skip two-pass and call Get-MoveRequestStatistics per identity directly.
-        # Used when -Mailbox is specified — EXO resolves by email/alias natively.
+        # Back-compat: each value is treated as a single-candidate direct plan.
         [string[]]$DirectIdentities = @()
     )
 
@@ -2534,34 +2592,105 @@ function Get-MoveStats {
     # ════════════════════════════════════════════════════════════════════
     $fastStatMap = @{}   # guid → fast stat object
 
-    if ($DirectIdentities.Count -gt 0) {
+    if ($DirectIdentityPlans.Count -gt 0 -or $DirectIdentities.Count -gt 0) {
         $includeReport = $IncludeDetailReport
-        Write-Console "  Direct fetch ($($DirectIdentities.Count) identity/identities, IncludeReport=$includeReport)..." -Level INFO
-        foreach ($identity in $DirectIdentities) {
-            try {
-                $fs = if ($includeReport) {
-                    Get-MoveRequestStatistics -Identity $identity -IncludeReport -ErrorAction Stop
-                } else {
-                    Get-MoveRequestStatistics -Identity $identity -ErrorAction Stop
+        $plans = if ($DirectIdentityPlans.Count -gt 0) {
+            @($DirectIdentityPlans)
+        } else {
+            @($DirectIdentities | ForEach-Object {
+                [PSCustomObject]@{
+                    DisplayName = "$_"
+                    Alias       = "$_"
+                    Status      = ''
+                    Candidates  = @("$_")
                 }
-                if ($fs) {
-                    $key = "$($fs.ExchangeGuid)"
-                    $fastStatMap[$key] = $fs
-                    Write-Console "    OK [$($fs.DisplayName)] via '$identity'" -Level INFO
+            })
+        }
+
+        Write-Console "  Direct fetch ($($plans.Count) mailbox candidate set(s), IncludeReport=$includeReport)..." -Level INFO
+        foreach ($plan in $plans) {
+            $planDisplay = if ($plan.DisplayName) { "$($plan.DisplayName)" } elseif ($plan.Alias) { "$($plan.Alias)" } else { "" }
+            $planAlias   = if ($plan.Alias) { "$($plan.Alias)" } elseif ($planDisplay) { $planDisplay } else { "" }
+            $planStatus  = if ($plan.Status) { "$($plan.Status)" } else { "" }
+
+            $candidatePool = @()
+            if ($plan -is [string]) {
+                $candidatePool = @("$plan")
+            } else {
+                if ($plan.PSObject.Properties.Name -contains 'Candidates') { $candidatePool += @($plan.Candidates) }
+                if ($plan.PSObject.Properties.Name -contains 'Identities') { $candidatePool += @($plan.Identities) }
+                if ($candidatePool.Count -eq 0 -and ($plan.PSObject.Properties.Name -contains 'Identity')) {
+                    $candidatePool += @("$($plan.Identity)")
                 }
-            } catch {
-                $itemErr = $_.Exception.Message -replace "`r`n"," "
-                Write-Console "    FAILED [$identity]: $itemErr" -Level WARN
+            }
+
+            $candidates = [System.Collections.Generic.List[string]]::new()
+            foreach ($candidateRaw in @($candidatePool)) {
+                $candidate = "$candidateRaw".Trim()
+                if (-not [string]::IsNullOrWhiteSpace($candidate) -and -not $candidates.Contains($candidate)) {
+                    $null = $candidates.Add($candidate)
+                }
+            }
+            if ($candidates.Count -eq 0) {
+                $itemErr = "No direct identity candidates were provided."
+                Write-Console "    FAILED [$planAlias]: $itemErr" -Level WARN
                 $failed.Add([PSCustomObject]@{
-                    DisplayName = $identity
-                    Alias       = $identity
-                    GuidUsed    = $identity
-                    Status      = ""
+                    DisplayName = $planDisplay
+                    Alias       = $planAlias
+                    GuidUsed    = ''
+                    Status      = $planStatus
+                    Error       = $itemErr
+                })
+                continue
+            }
+
+            $success = $false
+            $lastError = ''
+            foreach ($candidate in $candidates) {
+                try {
+                    $fs = if ($includeReport) {
+                        Get-MoveRequestStatistics -Identity $candidate -IncludeReport -ErrorAction Stop
+                    } else {
+                        Get-MoveRequestStatistics -Identity $candidate -ErrorAction Stop
+                    }
+                    if ($fs) {
+                        $key = if ($fs.ExchangeGuid -and "$($fs.ExchangeGuid)" -ne [Guid]::Empty.ToString()) {
+                            "$($fs.ExchangeGuid)"
+                        } elseif ($fs.MailboxGuid -and "$($fs.MailboxGuid)" -ne [Guid]::Empty.ToString()) {
+                            "$($fs.MailboxGuid)"
+                        } elseif ($fs.Identity) {
+                            "$($fs.Identity)"
+                        } else {
+                            $candidate
+                        }
+
+                        $fastStatMap[$key] = $fs
+                        $disp = if ($fs.DisplayName) { "$($fs.DisplayName)" } elseif ($planDisplay) { $planDisplay } else { $candidate }
+                        Write-Console "    OK [$disp] via '$candidate'" -Level INFO
+                        $success = $true
+                        break
+                    }
+                } catch {
+                    $lastError = $_.Exception.Message -replace "`r`n"," "
+                    Write-Console "    FAILED [$candidate]: $lastError" -Level WARN
+                }
+            }
+
+            if (-not $success) {
+                $failedIdentity = if ($candidates.Count -gt 0) { $candidates[0] } else { '' }
+                $itemErr = if ($lastError) { $lastError } else { 'No statistics returned for any candidate identity.' }
+                $itemErr = "$itemErr (candidates: $(@($candidates) -join ', '))"
+                Write-Console "    FAILED [$planAlias]: $itemErr" -Level WARN
+                $failed.Add([PSCustomObject]@{
+                    DisplayName = $planDisplay
+                    Alias       = $planAlias
+                    GuidUsed    = $failedIdentity
+                    Status      = $planStatus
                     Error       = $itemErr
                 })
             }
         }
-        Write-Console "  Direct fetch complete — $($fastStatMap.Count) stats retrieved." -Level INFO
+        Write-Console "  Direct fetch complete - $($fastStatMap.Count) stats retrieved." -Level INFO
 
         # Skip both Pass 1 and Pass 2 — jump straight to results
         $results.AddRange([object[]]($fastStatMap.Values))
@@ -6582,17 +6711,18 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     fetch(apiBase + '/api/mailbox-trend?name=' + encodeURIComponent(mailboxName))
       .then(function(r) { return r.json(); })
       .then(function(res) {
+        var trendData = Array.isArray(res.data) ? res.data : (res.data ? [res.data] : []);
         if (res.needsDetailReport) {
           trendContainer.innerHTML = "<div style='background:#fef3c7;border:1px solid #fcd34d;border-radius:8px;padding:12px 16px;color:#92400e;font-size:.85rem;'>" +
             "<strong>&#x26A0; Include Detail Report Required</strong><br>" +
             "Enable 'Include Detail Report' in the control panel to track per-mailbox trends over time.</div>";
           return;
         }
-        if (!res.ok || !res.data || res.data.length === 0) {
+        if (!res.ok || !trendData || trendData.length === 0) {
           trendContainer.innerHTML = "<div style='color:#64748b;font-size:.85rem;text-align:center;padding:20px;'>No trend data available yet. Data will appear after multiple refresh cycles.</div>";
           return;
         }
-        renderMailboxTrend(res.data);
+        renderMailboxTrend(trendData);
       })
       .catch(function(e) {
         trendContainer.innerHTML = "<div style='color:#ef4444;font-size:.85rem;text-align:center;padding:20px;'>Failed to load trend data</div>";
@@ -7454,9 +7584,10 @@ function fetchTrendData() {
   fetch(apiBase + '/api/trends')
     .then(function(r) { return r.json(); })
     .then(function(data) {
+      var trendData = Array.isArray(data) ? data : (data ? [data] : []);
       var emptyEl = document.getElementById('trend-charts-empty');
-      if (!data || !Array.isArray(data) || data.length === 0) {
-        // Show empty state message — hide charts, show placeholder
+      if (!trendData || trendData.length === 0) {
+        // Show empty state message - hide charts, show placeholder
         ['chart-rate','chart-progress','chart-transferred','chart-status'].forEach(function(id) {
           var c = document.getElementById(id);
           if (c) c.style.visibility = 'hidden';
@@ -7470,7 +7601,7 @@ function fetchTrendData() {
         if (c) c.style.visibility = '';
       });
       if (emptyEl) emptyEl.style.display = 'none';
-      updateTrendCharts(data);
+      updateTrendCharts(trendData);
     })
     .catch(function(e) { console.log('Trend fetch error:', e); });
 }
@@ -8153,7 +8284,7 @@ function loadTrendMailboxes() {
         document.getElementById('trend-mailbox-list').innerHTML = errHtml;
         return;
       }
-      trendMailboxList = res.data || [];
+      trendMailboxList = Array.isArray(res.data) ? res.data : (res.data ? [res.data] : []);
       console.log('[TrendsPanel] trendMailboxList:', trendMailboxList);
       if (trendMailboxList.length === 0 && res.message) {
         document.getElementById('trend-mailbox-list').innerHTML =
@@ -8244,7 +8375,8 @@ function selectTrendMailbox(name) {
   fetch(apiBase + '/api/mailbox-trend?name=' + encodeURIComponent(name))
     .then(function(r) { return r.json(); })
     .then(function(res) {
-      if (!res.ok || !res.data || res.data.length === 0) {
+      var trendData = Array.isArray(res.data) ? res.data : (res.data ? [res.data] : []);
+      if (!res.ok || !trendData || trendData.length === 0) {
         document.getElementById('trend-selected-sub').textContent = 'No trend data available';
         contentEl.innerHTML = '<div style="text-align:center;padding:60px 40px;color:#94a3b8;"><div style="font-size:3rem;margin-bottom:16px;">📭</div><div>No trend data available for this mailbox yet.</div></div>';
         return;
@@ -8253,9 +8385,9 @@ function selectTrendMailbox(name) {
       var mbxInfo = trendMailboxList.find(function(m) { return m.Name === name; });
       document.getElementById('trend-selected-sub').textContent =
         (mbxInfo ? mbxInfo.Status + ' • ' + mbxInfo.PercentComplete + '% complete • ' : '') +
-        res.data.length + ' data points';
+        trendData.length + ' data points';
 
-      renderTrendPanelContent(res.data);
+      renderTrendPanelContent(trendData);
     })
     .catch(function(e) {
       document.getElementById('trend-selected-sub').textContent = 'Failed to load';
@@ -8266,17 +8398,51 @@ function selectTrendMailbox(name) {
 function renderTrendPanelContent(data) {
   var contentEl = document.getElementById('trend-content');
   if (!contentEl) return;
+  data = Array.isArray(data) ? data : (data ? [data] : []);
+
+  // Normalize both rich points (Type=Progress/Transfer/Anchor) and
+  // lightweight per-refresh points (no Type) into a common shape.
+  var normalized = data.map(function(d) {
+    var p = d || {};
+    var out = {};
+    Object.keys(p).forEach(function(k) { out[k] = p[k]; });
+    if (!out.Type) { out.Type = 'Point'; }
+    if (!out.Stage && out.Status) { out.Stage = out.Status; }
+    if (!out.TimeLabel && out.Timestamp) {
+      try {
+        var dt = new Date(out.Timestamp);
+        if (!isNaN(dt.getTime())) {
+          out.TimeLabel = String(dt.getMonth() + 1).padStart(2, '0') + '/' + String(dt.getDate()).padStart(2, '0') +
+            ' ' + String(dt.getHours()).padStart(2, '0') + ':' + String(dt.getMinutes()).padStart(2, '0');
+        }
+      } catch (_) {}
+    }
+    if (out.TransferredGB == null && out.BytesTransferred != null) {
+      out.TransferredGB = out.BytesTransferred / 1073741824;
+    }
+    if (out.BytesTransferred == null && out.TransferredGB != null) {
+      out.BytesTransferred = out.TransferredGB * 1073741824;
+    }
+    return out;
+  });
 
   // Sort data by timestamp (oldest first for chronological order)
-  var sortedByTime = data.slice().sort(function(a, b) {
+  var sortedByTime = normalized.slice().sort(function(a, b) {
     if (!a.Timestamp) return -1;
     if (!b.Timestamp) return 1;
     return new Date(a.Timestamp) - new Date(b.Timestamp);
   });
 
-  // Separate data by type (using sorted data)
-  var progressPoints = sortedByTime.filter(function(d) { return d.Type === 'Progress' || d.Type === 'Anchor'; });
-  var transferPoints = sortedByTime.filter(function(d) { return d.Type === 'Transfer' || d.Type === 'Anchor'; });
+  var hasRichTypes = sortedByTime.some(function(d) {
+    return d.Type === 'Progress' || d.Type === 'Transfer' || d.Type === 'Anchor';
+  });
+  // Separate data by type (or use all points for lightweight mode)
+  var progressPoints = hasRichTypes
+    ? sortedByTime.filter(function(d) { return d.Type === 'Progress' || d.Type === 'Anchor'; })
+    : sortedByTime.slice();
+  var transferPoints = hasRichTypes
+    ? sortedByTime.filter(function(d) { return d.Type === 'Transfer' || d.Type === 'Anchor'; })
+    : sortedByTime.slice();
 
   // Build timeline table (show newest first for readability)
   var html = '<div style="margin-bottom:24px;">';
@@ -8296,8 +8462,8 @@ function renderTrendPanelContent(data) {
   // Show newest first in table for readability
   var tableData = sortedByTime.slice().reverse();
   tableData.forEach(function(d) {
-    var typeColor = d.Type === 'Anchor' ? '#22c55e' : d.Type === 'Progress' ? '#3b82f6' : '#f59e0b';
-    var typeBadge = '<span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:.7rem;font-weight:600;background:' + typeColor + '20;color:' + typeColor + ';">' + d.Type + '</span>';
+    var typeColor = d.Type === 'Anchor' ? '#22c55e' : d.Type === 'Progress' ? '#3b82f6' : d.Type === 'Transfer' ? '#f59e0b' : '#64748b';
+    var typeBadge = '<span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:.7rem;font-weight:600;background:' + typeColor + '20;color:' + typeColor + ';">' + (d.Type || 'Point') + '</span>';
     var transferred = d.TransferredGB != null ? d.TransferredGB.toFixed(3) + ' GB' : (d.BytesTransferred ? (d.BytesTransferred / 1048576).toFixed(1) + ' MB' : '—');
     var pctColor = d.PercentComplete >= 95 ? '#22c55e' : d.PercentComplete >= 50 ? '#3b82f6' : '#64748b';
     var items = d.ItemsTransferred != null ? (d.ItemsTotal != null ? d.ItemsTransferred + '/' + d.ItemsTotal : d.ItemsTransferred) : '—';
@@ -8330,7 +8496,8 @@ function renderTrendPanelContent(data) {
   var stageChanges = [];
   var lastStage = null;
   sortedByTime.forEach(function(d, idx) {
-    if (d.Type === 'Progress' && d.Stage && d.Stage !== lastStage) {
+    var stageEligible = hasRichTypes ? (d.Type === 'Progress') : true;
+    if (stageEligible && d.Stage && d.Stage !== lastStage) {
       stageChanges.push({ index: idx, stage: d.Stage, label: d.TimeLabel });
       lastStage = d.Stage;
     }
@@ -8777,7 +8944,7 @@ $(if($ListenerPort -gt 0){
     <div style='display:flex;flex-direction:column;gap:8px;margin-top:8px;'>
 
       <label style='display:flex;align-items:center;gap:6px;color:#94a3b8;font-size:.78rem;cursor:pointer;'>
-        <input type='checkbox' id='wIncludeCompleted' style='width:14px;height:14px'> Include Completed
+        <input type='checkbox' id='wIncludeCompleted' style='width:14px;height:14px'> Exclude Completed
       </label>
 
       <label style='display:flex;align-items:center;gap:6px;color:#94a3b8;font-size:.78rem;cursor:pointer;'>
@@ -8969,7 +9136,8 @@ $(if($ListenerPort -gt 0){
     // Get selected batches from checkbox dropdown
     var batch = getSelectedBatches();
     var mailbox = (document.getElementById('wMailboxInput')||{}).value || '';
-    var incComp = (document.getElementById('wIncludeCompleted')||{}).checked || false;
+    var excludeComp = (document.getElementById('wIncludeCompleted')||{}).checked || false;
+    var incComp = !excludeComp;
     var sinceDate = (document.getElementById('wSinceDate')||{}).value || '';
     setDot('stale');
     apiCall('/api/switch','POST',{
@@ -8980,7 +9148,8 @@ $(if($ListenerPort -gt 0){
   };
 
   window.apiSwitchAll = function() {
-    var incComp = (document.getElementById('wIncludeCompleted')||{}).checked || false;
+    var excludeComp = (document.getElementById('wIncludeCompleted')||{}).checked || false;
+    var incComp = !excludeComp;
     setDot('stale');
     apiCall('/api/switch','POST',{batch:'', mailbox:'', includeCompleted: incComp})
       .then(function(){ nextRefreshAt = Date.now() + 2000; })
@@ -9234,6 +9403,12 @@ $(if($ListenerPort -gt 0){
         retryCheck.checked = data.autoRetryEnabled;
       }
 
+      // Sync Exclude Completed checkbox (inverse of includeCompleted backend flag)
+      var includeCompletedCheck = document.getElementById('wIncludeCompleted');
+      if (includeCompletedCheck && typeof data.includeCompleted !== 'undefined') {
+        includeCompletedCheck.checked = !data.includeCompleted;
+      }
+
       // Sync include detail report checkbox (for -IncludeDetailReport parameter)
       var detailReportCheck = document.getElementById('wIncludeDetailReport');
       if (detailReportCheck && typeof data.includeDetailReport !== 'undefined') {
@@ -9418,6 +9593,11 @@ function apiCall(endpoint, method, body) {
     headers: {'Content-Type':'application/json'},
     body: body ? JSON.stringify(body) : undefined
   }).then(function(r){ return r.json(); });
+}
+
+function mrsApiUrl(endpoint) {
+  var base = window.WATCH_API_BASE || '';
+  return base ? (base + endpoint) : endpoint;
 }
 
 (function () {
@@ -10022,6 +10202,9 @@ function apiCall(endpoint, method, body) {
   function mrsStatusColor(s) {
     if (!s) return '#94a3b8';
     var m = s.toLowerCase();
+    if (m === 'importing')                 return '#f59e0b';
+    if (m === 'imported')                  return '#22c55e';
+    if (m === 'importfailed')              return '#ef4444';
     if (m === 'inprogress')                return '#3b82f6';
     if (m === 'completed')                 return '#22c55e';
     if (m === 'completedwithwarning')      return '#22c55e';
@@ -11011,7 +11194,7 @@ function apiCall(endpoint, method, body) {
     btn.textContent = '⏳ Exporting…';
     btn.disabled = true;
     var a = document.createElement('a');
-    a.href = '/api/mrs/export-xml?alias=' + encodeURIComponent(alias);
+    a.href = mrsApiUrl('/api/mrs/export-xml?alias=' + encodeURIComponent(alias));
     a.download = '';
     a.click();
     setTimeout(function() {
@@ -11032,7 +11215,7 @@ function apiCall(endpoint, method, body) {
     badge.textContent = 'Importing…';
     var fd = new FormData();
     fd.append('file', file, file.name);
-    fetch('/api/mrs/import-xml', { method: 'POST', body: fd })
+    fetch(mrsApiUrl('/api/mrs/import-xml'), { method: 'POST', body: fd })
       .then(function(r) { return r.json(); })
       .then(function(resp) {
         console.log('[MRS] import-xml response:', resp);
@@ -11047,8 +11230,13 @@ function apiCall(endpoint, method, body) {
         var key = resp.key;
         console.log('[MRS] import queued with key:', key);
         mrsPollImport(key, Date.now(), file.name);
-        // Add a virtual row in the list
-        mrsState.listItems.unshift({ Name: file.name, Alias: key, BatchName: 'Imported', Status: 'Imported' });
+        // Add a virtual row in the list (dedup by alias); backend will persist it.
+        var hasRow = (mrsState.listItems || []).some(function(it) {
+          return String((it && it.Alias) || '') === key;
+        });
+        if (!hasRow) {
+          mrsState.listItems.unshift({ Name: file.name, DisplayName: file.name, Alias: key, BatchName: 'Imported XML', Status: 'Importing' });
+        }
         mrsRenderList(mrsState.listItems);
       })
       .catch(function(err) {
@@ -11062,7 +11250,7 @@ function apiCall(endpoint, method, body) {
   window.mrsImportXml = mrsImportXml;
 
   function mrsPollImport(key, startTime, filename) {
-    if (Date.now() - startTime > 60000) {
+    if (Date.now() - startTime > 300000) {
       console.warn('[MRS] mrsPollImport timed out for key:', key);
       var badge = document.getElementById('mrs-session-status');
       badge.style.background = '#fee2e2'; badge.style.color = '#991b1b';
@@ -11072,6 +11260,20 @@ function apiCall(endpoint, method, body) {
     apiCall('/api/mrs/statistics?alias=' + encodeURIComponent(key), 'GET', null).then(function(resp) {
       console.log('[MRS] mrsPollImport:', key, 'ok=', resp && resp.ok);
       if (!resp || !resp.ok) {
+        if (resp && resp.error === 'importing') {
+          var waitBadge = document.getElementById('mrs-session-status');
+          waitBadge.style.background = '#fef9c3'; waitBadge.style.color = '#854d0e';
+          waitBadge.textContent = 'Importing (processing XML)...';
+          setTimeout(function() { mrsPollImport(key, startTime, filename); }, 1500);
+          return;
+        }
+        if (resp && resp.error && resp.error !== 'not found') {
+          console.error('[MRS] mrsPollImport failed:', resp.error);
+          var failBadge = document.getElementById('mrs-session-status');
+          failBadge.style.background = '#fee2e2'; failBadge.style.color = '#991b1b';
+          failBadge.textContent = 'Import failed';
+          return;
+        }
         setTimeout(function() { mrsPollImport(key, startTime, filename); }, 1500);
         return;
       }
@@ -11319,6 +11521,7 @@ function Start-WatchListener {
                             nextIn       = [int]$State['NextIn']
                             retryQueue   = [int]$State['RetryQueue']
                             autoRetryEnabled = [bool]$State['AutoRetryEnabled']
+                            includeCompleted = [bool]$State['IncludeCompleted']
                             throughput   = if ($State['Throughput']) { [double]$State['Throughput'] } else { 0 }
                             nextScheduledReport = if ($State['NextScheduledReport']) { $State['NextScheduledReport'] } else { $null }
                             lastAlert    = if ($State['LastAlert']) { $State['LastAlert'] } else { $null }
@@ -11404,12 +11607,16 @@ function Start-WatchListener {
                                 $reader.Close()
                             }
                             $d = $reqBody | ConvertFrom-Json
+                            $includeCompletedPresent = $false
+                            if ($d -and $d.PSObject -and $d.PSObject.Properties) {
+                                $includeCompletedPresent = $d.PSObject.Properties.Name -contains 'includeCompleted'
+                            }
                             [void]$State['PendingCommands'].Add(@{
                                 Action           = 'switch'
                                 Batch            = "$($d.batch)"
                                 Mailbox          = "$($d.mailbox)"
                                 SinceDate        = "$($d.sincedate)"
-                                IncludeCompleted = [bool]$d.includeCompleted
+                                IncludeCompleted = if ($includeCompletedPresent) { [bool]$d.includeCompleted } else { $null }
                             })
                             $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true,"message":"Switch queued"}')
                         } catch {
@@ -11419,10 +11626,35 @@ function Start-WatchListener {
                     elseif ($path -eq '/api/trends') {
                         $contentType = 'application/json; charset=utf-8'
                         $trends = $State['TrendHistory']
-                        $json = if ($trends -and $trends.Count -gt 0) {
-                            $trends | ConvertTo-Json -Compress
+                        $json = '[]'
+                        if ($trends -and $trends.Count -gt 0) {
+                            $json = $trends | ConvertTo-Json -Compress
                         } else {
-                            '[]'
+                            # Fallback: if trend history has not been populated yet but we already
+                            # have cached mailbox data, expose a synthesized single point so the UI
+                            # can render immediately instead of staying on "Waiting for trend data".
+                            $cached = @($State['CachedMailboxes'])
+                            if ($cached.Count -gt 0) {
+                                $avgPct = 0
+                                try { $avgPct = [math]::Round((($cached | Measure-Object -Property PercentComplete -Average).Average), 1) } catch { $avgPct = 0 }
+                                $totalGb = 0.0
+                                foreach ($mbx in $cached) {
+                                    $tv = 0.0
+                                    if ([double]::TryParse("$($mbx.TransferredGB)", [ref]$tv)) { $totalGb += $tv }
+                                }
+                                $pt = @{
+                                    Timestamp       = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss')
+                                    TimeLabel       = (Get-Date).ToString('HH:mm')
+                                    PercentComplete = $avgPct
+                                    TransferRateGBh = if ($State['Throughput']) { [double]$State['Throughput'] } else { 0 }
+                                    TransferredGB   = [math]::Round($totalGb, 3)
+                                    CompletedCount  = (@($cached | Where-Object { "$($_.Status)" -eq 'Completed' })).Count
+                                    InProgressCount = (@($cached | Where-Object { "$($_.Status)" -eq 'InProgress' })).Count
+                                    FailedCount     = (@($cached | Where-Object { "$($_.Status)" -eq 'Failed' })).Count
+                                    TotalCount      = $cached.Count
+                                }
+                                $json = @($pt) | ConvertTo-Json -Compress
+                            }
                         }
                         $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
                     }
@@ -11437,28 +11669,24 @@ function Start-WatchListener {
                             if (-not $mailboxName) {
                                 $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"Missing name parameter"}')
                             } else {
-                                $includeDetail = $State['IncludeDetailReport']
-                                if (-not $includeDetail) {
-                                    $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"IncludeDetailReport not enabled","needsDetailReport":true}')
+                                # Prefer rich trend cache (from Get-MigrationTrend); fall back to
+                                # lightweight per-refresh history so mailbox trends work even when
+                                # IncludeDetailReport is off.
+                                $trendCache   = $State['MailboxTrendCache']
+                                $trendHistory = $State['MailboxTrendHistory']
+                                $data = $null
+
+                                if ($trendCache -and $trendCache.ContainsKey($mailboxName)) {
+                                    $data = $trendCache[$mailboxName]
+                                } elseif ($trendHistory -and $trendHistory.ContainsKey($mailboxName)) {
+                                    $data = $trendHistory[$mailboxName]
+                                }
+
+                                if ($data -and @($data).Count -gt 0) {
+                                    $json = @{ ok = $true; data = @($data) } | ConvertTo-Json -Depth 5 -Compress
+                                    $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
                                 } else {
-                                    # Prefer rich trend cache (from Get-MigrationTrend); fall back to
-                                    # lightweight per-refresh history collected without -IncludeReport
-                                    $trendCache   = $State['MailboxTrendCache']
-                                    $trendHistory = $State['MailboxTrendHistory']
-                                    $data = $null
-
-                                    if ($trendCache -and $trendCache.ContainsKey($mailboxName)) {
-                                        $data = $trendCache[$mailboxName]
-                                    } elseif ($trendHistory -and $trendHistory.ContainsKey($mailboxName)) {
-                                        $data = $trendHistory[$mailboxName]
-                                    }
-
-                                    if ($data -and $data.Count -gt 0) {
-                                        $json = @{ ok = $true; data = $data } | ConvertTo-Json -Depth 5 -Compress
-                                        $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
-                                    } else {
-                                        $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true,"data":[],"message":"No trend data for this mailbox yet"}')
-                                    }
+                                    $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true,"data":[],"message":"No trend data for this mailbox yet"}')
                                 }
                             }
                         } catch {
@@ -11478,9 +11706,7 @@ function Start-WatchListener {
                             $hasCacheData   = $trendCache   -and @($trendCache.Keys).Count   -gt 0
                             $hasHistoryData = $trendHistory -and @($trendHistory.Keys).Count -gt 0
 
-                            if (-not $includeDetail -and -not $hasHistoryData) {
-                                $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"IncludeDetailReport not enabled. Run with -IncludeDetailReport to enable trend tracking.","needsDetailReport":true}')
-                            } elseif (-not $hasCacheData -and -not $hasHistoryData) {
+                            if (-not $hasCacheData -and -not $hasHistoryData) {
                                 $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true,"data":[],"message":"No trend data cached yet. Wait for multiple refresh cycles."}')
                             } else {
                                 # Prefer rich cache; fall back to lightweight per-refresh history
@@ -11731,6 +11957,19 @@ function Start-WatchListener {
                             $cache     = $State['MRSMoveRequestCache']
                             $cacheTime = $State['MRSMoveRequestCacheTime']
                             $itemsRaw  = @(if ($cache) { $cache } else { @() })
+                            $importItemsRaw = @()
+                            $importStore = $State['MRSImportedItems']
+                            if ($importStore -is [System.Collections.IDictionary]) {
+                                foreach ($ik in @($importStore.Keys | Sort-Object)) {
+                                    $iv = $importStore[$ik]
+                                    if ($null -ne $iv) { $importItemsRaw += $iv }
+                                }
+                            }
+                            # Keep imported sessions visible after refresh/page reload by merging them
+                            # with live move-request cache (imported aliases are prefixed with "imported:").
+                            if ($importItemsRaw.Count -gt 0) {
+                                $itemsRaw = @($importItemsRaw + $itemsRaw)
+                            }
                             $rawQuery  = $null
                             if ($req.RawUrl -match '\?(.*)$') {
                                 $rawQuery = $Matches[1]
@@ -11917,12 +12156,30 @@ function Start-WatchListener {
                             } elseif ($alias) {
                                 # Keep pending polls as normal JSON responses (avoid noisy browser 404 errors).
                                 $mrsKeys = @($State.Keys | Where-Object { $_ -like "MRSStatsJson_${alias}*" } | Sort-Object)
-                                $payload = @{
-                                    ok = $false
-                                    error = 'not found'
-                                    alias = $alias
-                                    availableKeys = $mrsKeys
-                                } | ConvertTo-Json -Depth 6 -Compress
+                                $importPending = "$($State["MRSImportPending_$alias"])"
+                                $importErr = "$($State["MRSImportError_$alias"])"
+                                if (-not [string]::IsNullOrWhiteSpace($importPending)) {
+                                    $payload = @{
+                                        ok = $false
+                                        error = 'importing'
+                                        alias = $alias
+                                        availableKeys = $mrsKeys
+                                    } | ConvertTo-Json -Depth 6 -Compress
+                                } elseif (-not [string]::IsNullOrWhiteSpace($importErr)) {
+                                    $payload = @{
+                                        ok = $false
+                                        error = $importErr
+                                        alias = $alias
+                                        availableKeys = $mrsKeys
+                                    } | ConvertTo-Json -Depth 6 -Compress
+                                } else {
+                                    $payload = @{
+                                        ok = $false
+                                        error = 'not found'
+                                        alias = $alias
+                                        availableKeys = $mrsKeys
+                                    } | ConvertTo-Json -Depth 6 -Compress
+                                }
                                 $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
                             } else {
                                 $payload = @{ ok = $false; error = 'Missing alias parameter' } | ConvertTo-Json -Compress
@@ -11975,31 +12232,112 @@ function Start-WatchListener {
                     elseif ($path -eq '/api/mrs/import-xml' -and $req.HttpMethod -eq 'POST') {
                         $contentType = 'application/json; charset=utf-8'
                         try {
-                            $bodyBytes3 = [System.Byte[]]::new($req.ContentLength64)
-                            [void]$req.InputStream.Read($bodyBytes3, 0, $bodyBytes3.Length)
-                            $bodyStr3 = [System.Text.Encoding]::UTF8.GetString($bodyBytes3)
-                            $origName = 'import.xml'
-                            if ($bodyStr3 -match 'filename="([^"]+)"') { $origName = $Matches[1] }
-                            $tempPath3  = Join-Path $env:TEMP "MRS_Import_$([guid]::NewGuid().ToString('N')).xml"
-                            $boundary3  = ''
-                            if ($req.ContentType -match 'boundary=(.+)') { $boundary3 = $Matches[1].Trim() }
-                            $headerEnd3 = $bodyStr3.IndexOf("`r`n`r`n")
-                            if ($headerEnd3 -lt 0) { $headerEnd3 = $bodyStr3.IndexOf("`n`n") + 1 }
-                            $dataStart3  = $headerEnd3 + 4
-                            $closeBound3 = "--$boundary3--"
-                            $dataEnd3    = $bodyStr3.LastIndexOf($closeBound3)
-                            if ($dataEnd3 -gt $dataStart3) {
-                                $xmlStr3 = $bodyStr3.Substring($dataStart3, $dataEnd3 - $dataStart3).TrimEnd("`r","`n")
-                                [System.IO.File]::WriteAllText($tempPath3, $xmlStr3, [System.Text.Encoding]::UTF8)
-                            } else {
-                                [System.IO.File]::WriteAllBytes($tempPath3, $bodyBytes3)
+                            function Find-BytePattern {
+                                param(
+                                    [byte[]]$Source,
+                                    [byte[]]$Pattern,
+                                    [int]$Start = 0
+                                )
+                                if ($null -eq $Source -or $null -eq $Pattern -or $Pattern.Length -eq 0) { return -1 }
+                                for ($i = $Start; $i -le ($Source.Length - $Pattern.Length); $i++) {
+                                    $match = $true
+                                    for ($j = 0; $j -lt $Pattern.Length; $j++) {
+                                        if ($Source[$i + $j] -ne $Pattern[$j]) { $match = $false; break }
+                                    }
+                                    if ($match) { return $i }
+                                }
+                                return -1
                             }
-                            [void]$State.PendingCommands.Add([hashtable]@{ Action = 'importMRSXml'; TempPath = $tempPath3; OriginalName = $origName })
-                            $safeKey3 = "imported:$origName" -replace '"','\"'
-                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"status`":`"queued`",`"key`":`"$safeKey3`"}")
+
+                            $ms3 = New-Object System.IO.MemoryStream
+                            try {
+                                $buf3 = New-Object byte[] 8192
+                                while (($read3 = $req.InputStream.Read($buf3, 0, $buf3.Length)) -gt 0) {
+                                    $ms3.Write($buf3, 0, $read3)
+                                }
+                                $bodyBytes3 = $ms3.ToArray()
+                            } finally {
+                                $ms3.Dispose()
+                            }
+                            if ($null -eq $bodyBytes3 -or $bodyBytes3.Length -eq 0) {
+                                throw "Import payload is empty."
+                            }
+
+                            $boundary3 = ''
+                            if ($req.ContentType -match 'boundary=(.+)$') { $boundary3 = $Matches[1].Trim().Trim('"') }
+                            if ([string]::IsNullOrWhiteSpace($boundary3)) {
+                                throw "Invalid multipart payload: missing boundary."
+                            }
+
+                            $boundaryMarker3 = [System.Text.Encoding]::ASCII.GetBytes("--$boundary3")
+                            $partBoundary3   = [System.Text.Encoding]::ASCII.GetBytes("`r`n--$boundary3")
+                            $partBoundaryLf3 = [System.Text.Encoding]::ASCII.GetBytes("`n--$boundary3")
+                            $headerSep3      = [System.Text.Encoding]::ASCII.GetBytes("`r`n`r`n")
+                            $headerSepLf3    = [System.Text.Encoding]::ASCII.GetBytes("`n`n")
+
+                            $firstBoundary3 = Find-BytePattern -Source $bodyBytes3 -Pattern $boundaryMarker3 -Start 0
+                            if ($firstBoundary3 -lt 0) { throw "Invalid multipart payload: boundary start not found." }
+
+                            $headerEnd3 = Find-BytePattern -Source $bodyBytes3 -Pattern $headerSep3 -Start $firstBoundary3
+                            $sepLen3 = 4
+                            if ($headerEnd3 -lt 0) {
+                                $headerEnd3 = Find-BytePattern -Source $bodyBytes3 -Pattern $headerSepLf3 -Start $firstBoundary3
+                                $sepLen3 = 2
+                            }
+                            if ($headerEnd3 -lt 0) { throw "Invalid multipart payload: part headers not found." }
+
+                            $headersStart3 = $firstBoundary3 + $boundaryMarker3.Length + 2
+                            if ($headersStart3 -gt $headerEnd3) { $headersStart3 = $firstBoundary3 + $boundaryMarker3.Length }
+                            $headersLen3 = $headerEnd3 - $headersStart3
+                            $headersText3 = if ($headersLen3 -gt 0) {
+                                [System.Text.Encoding]::UTF8.GetString($bodyBytes3, $headersStart3, $headersLen3)
+                            } else {
+                                ''
+                            }
+
+                            $origName = 'import.xml'
+                            if ($headersText3 -match 'filename="([^"]+)"') { $origName = $Matches[1] }
+                            try { $origName = [System.IO.Path]::GetFileName($origName) } catch {}
+                            if ([string]::IsNullOrWhiteSpace($origName)) { $origName = 'import.xml' }
+
+                            $dataStart3 = $headerEnd3 + $sepLen3
+                            $dataEnd3 = Find-BytePattern -Source $bodyBytes3 -Pattern $partBoundary3 -Start $dataStart3
+                            if ($dataEnd3 -lt 0) {
+                                $dataEnd3 = Find-BytePattern -Source $bodyBytes3 -Pattern $partBoundaryLf3 -Start $dataStart3
+                            }
+                            if ($dataEnd3 -lt $dataStart3) { throw "Invalid multipart payload: file body not found." }
+
+                            $fileLen3 = $dataEnd3 - $dataStart3
+                            if ($fileLen3 -le 0) { throw "Import payload did not include file content." }
+
+                            $fileBytes3 = [System.Byte[]]::new($fileLen3)
+                            [System.Array]::Copy($bodyBytes3, $dataStart3, $fileBytes3, 0, $fileLen3)
+
+                            $tempPath3  = Join-Path $env:TEMP "MRS_Import_$([guid]::NewGuid().ToString('N')).xml"
+                            [System.IO.File]::WriteAllBytes($tempPath3, $fileBytes3)
+                            $importKey3 = "imported:$origName"
+                            if ($null -eq $State['MRSImportedItems'] -or -not ($State['MRSImportedItems'] -is [System.Collections.IDictionary])) {
+                                $State['MRSImportedItems'] = [System.Collections.Hashtable]::Synchronized(@{})
+                            }
+                            $State['MRSImportedItems'][$importKey3] = [ordered]@{
+                                Name        = $origName
+                                DisplayName = $origName
+                                Alias       = $importKey3
+                                BatchName   = 'Imported XML'
+                                Status      = 'Importing'
+                                Source      = 'XML'
+                                ImportedAt  = (Get-Date).ToUniversalTime().ToString('o')
+                            }
+                            $State["MRSImportPending_$importKey3"] = (Get-Date).ToUniversalTime().ToString('o')
+                            [void]$State.PendingCommands.Insert(0, [hashtable]@{ Action = 'importMRSXml'; TempPath = $tempPath3; OriginalName = $origName })
+                            $payload = @{
+                                status = 'queued'
+                                key = $importKey3
+                            } | ConvertTo-Json -Depth 5 -Compress
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
                         } catch {
-                            $errMsg = $_.Exception.Message -replace '"', "'"
-                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes("{`"error`":`"$errMsg`"}")
+                            $payload = @{ error = "$($_.Exception.Message)" } | ConvertTo-Json -Compress
+                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
                         }
                     }
                     elseif ($path -eq '/api/retry-status') {
@@ -12268,27 +12606,45 @@ function Invoke-MigrationReport {
             return
         }
 
-        # Step 2 – Retrieve statistics
-        # When -Mailbox is specified use direct per-identity calls.
-        # Use ExchangeGuid from the resolved move request — avoids "matches multiple entries"
-        # errors when an email address resolves to both active and soft-deleted objects.
-        $directIds = if ($Mailbox) {
+        # Step 2 - Retrieve statistics
+        # When -Mailbox is specified use direct per-mailbox candidate sets.
+        # EXO can reject GUID-first identities for some requests, so use mailbox/alias/identity first,
+        # then fall back to GUID values.
+        $directIdentityPlans = if ($Mailbox) {
             @($moves | ForEach-Object {
-                $g = if ($_.ExchangeGuid -and "$($_.ExchangeGuid)" -ne [Guid]::Empty.ToString()) {
-                    "$($_.ExchangeGuid)"
-                } elseif ($_.MailboxGuid -and "$($_.MailboxGuid)" -ne [Guid]::Empty.ToString()) {
-                    "$($_.MailboxGuid)"
-                } elseif ($_.Alias) {
-                    "$($_.Alias)"
-                } else {
-                    "$($_.Identity)"
+                $candidates = [System.Collections.Generic.List[string]]::new()
+                foreach ($raw in @(
+                    "$Mailbox",
+                    "$($_.Alias)",
+                    "$($_.Identity)",
+                    "$($_.MailboxIdentity)"
+                )) {
+                    $candidate = "$raw".Trim()
+                    if (-not [string]::IsNullOrWhiteSpace($candidate) -and -not $candidates.Contains($candidate)) {
+                        $null = $candidates.Add($candidate)
+                    }
                 }
-                $g
-            } | Where-Object { $_ })
+
+                foreach ($raw in @("$($_.ExchangeGuid)","$($_.MailboxGuid)")) {
+                    $candidate = "$raw".Trim()
+                    if (-not [string]::IsNullOrWhiteSpace($candidate) -and
+                        $candidate -ne [Guid]::Empty.ToString() -and
+                        -not $candidates.Contains($candidate)) {
+                        $null = $candidates.Add($candidate)
+                    }
+                }
+
+                [PSCustomObject]@{
+                    DisplayName = "$($_.DisplayName)"
+                    Alias       = "$($_.Alias)"
+                    Status      = "$($_.Status)"
+                    Candidates  = $candidates.ToArray()
+                }
+            } | Where-Object { @($_.Candidates).Count -gt 0 })
         } else { @() }
         $statsResult = Get-MoveStats -Moves $moves -BatchSize $BatchSize `
                                      -IncludeDetailReport $IncludeDetailReport.IsPresent `
-                                     -DirectIdentities $directIds
+                                     -DirectIdentityPlans $directIdentityPlans
         $goodStats   = $statsResult.Stats
         $failedMbx   = $statsResult.Failed
 
@@ -12397,6 +12753,7 @@ if ($MyInvocation.InvocationName -ne '.') {
             BatchSize     = $BatchSize
             Percentile    = $Percentile
             MinSizeGBForScoring = $MinSizeGBForScoring
+            IncludeCompleted = $true
 
 
         }
@@ -12502,6 +12859,7 @@ if ($MyInvocation.InvocationName -ne '.') {
             # New fields for enhanced dashboard
             RetryQueue    = 0
             AutoRetryEnabled = $AutoRetryFailed.IsPresent
+            IncludeCompleted = $true
             Throughput    = 0
             NextScheduledReport = $null
             LastAlert     = $null
@@ -12524,6 +12882,7 @@ if ($MyInvocation.InvocationName -ne '.') {
             # MRS Explorer cache
             MRSMoveRequestCache     = $null
             MRSMoveRequestCacheTime = $null
+            MRSImportedItems        = [System.Collections.Hashtable]::Synchronized(@{})
             MRSExportReady          = [System.Collections.Hashtable]::Synchronized(@{})
         })
 
@@ -12665,7 +13024,12 @@ if ($MyInvocation.InvocationName -ne '.') {
                     }
                     if ($invokeParams.ContainsKey('Mailbox'))            { $cacheInvokeParams['Mailbox']            = $invokeParams.Mailbox }
                     if ($invokeParams.ContainsKey('MigrationBatchName')) { $cacheInvokeParams['MigrationBatchName'] = $invokeParams.MigrationBatchName }
-                    if ($invokeParams.ContainsKey('SinceDate'))          { $cacheInvokeParams['SinceDate']          = $invokeParams.SinceDate }
+                    if ($invokeParams.ContainsKey('SinceDate')) {
+                        $sinceVal = $invokeParams['SinceDate']
+                        if ($null -ne $sinceVal -and "$sinceVal".Trim() -ne '') {
+                            try { $cacheInvokeParams['SinceDate'] = [datetime]$sinceVal } catch {}
+                        }
+                    }
 
                     $result = Invoke-MigrationReportFromCache @cacheInvokeParams
                     $usedCacheRender = $true
@@ -12807,7 +13171,7 @@ if ($MyInvocation.InvocationName -ne '.') {
                     $watchState['TrendHistory'] = $script:TrendHistory
 
                     # ── Collect per-mailbox trend data (only when IncludeDetailReport is enabled) ──
-                    if ($watchState['IncludeDetailReport'] -and $result.PerMailboxDetail) {
+                    if ($result.PerMailboxDetail) {
                         $timestamp = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss')
                         $timeLabel = (Get-Date).ToString('HH:mm')
                         foreach ($mbx in $result.PerMailboxDetail) {
@@ -13007,6 +13371,7 @@ if ($MyInvocation.InvocationName -ne '.') {
                             }
                             if ($null -ne $cmd.IncludeCompleted) {
                                 $invokeParams.IncludeCompleted = [bool]$cmd.IncludeCompleted
+                                $watchState['IncludeCompleted'] = [bool]$cmd.IncludeCompleted
                                 Write-Console "Include Completed set to $($cmd.IncludeCompleted)" -Level API -NoTimestamp
                             }
                             if ($cmd.SinceDate -and $cmd.SinceDate -ne '') {
