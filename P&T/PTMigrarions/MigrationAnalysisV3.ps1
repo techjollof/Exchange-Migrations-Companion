@@ -12232,26 +12232,9 @@ function Start-WatchListener {
                     elseif ($path -eq '/api/mrs/import-xml' -and $req.HttpMethod -eq 'POST') {
                         $contentType = 'application/json; charset=utf-8'
                         try {
-                            function Find-BytePattern {
-                                param(
-                                    [byte[]]$Source,
-                                    [byte[]]$Pattern,
-                                    [int]$Start = 0
-                                )
-                                if ($null -eq $Source -or $null -eq $Pattern -or $Pattern.Length -eq 0) { return -1 }
-                                for ($i = $Start; $i -le ($Source.Length - $Pattern.Length); $i++) {
-                                    $match = $true
-                                    for ($j = 0; $j -lt $Pattern.Length; $j++) {
-                                        if ($Source[$i + $j] -ne $Pattern[$j]) { $match = $false; break }
-                                    }
-                                    if ($match) { return $i }
-                                }
-                                return -1
-                            }
-
                             $ms3 = New-Object System.IO.MemoryStream
                             try {
-                                $buf3 = New-Object byte[] 8192
+                                $buf3 = New-Object byte[] 65536
                                 while (($read3 = $req.InputStream.Read($buf3, 0, $buf3.Length)) -gt 0) {
                                     $ms3.Write($buf3, 0, $read3)
                                 }
@@ -12269,25 +12252,30 @@ function Start-WatchListener {
                                 throw "Invalid multipart payload: missing boundary."
                             }
 
-                            $boundaryMarker3 = [System.Text.Encoding]::ASCII.GetBytes("--$boundary3")
-                            $partBoundary3   = [System.Text.Encoding]::ASCII.GetBytes("`r`n--$boundary3")
-                            $partBoundaryLf3 = [System.Text.Encoding]::ASCII.GetBytes("`n--$boundary3")
-                            $headerSep3      = [System.Text.Encoding]::ASCII.GetBytes("`r`n`r`n")
-                            $headerSepLf3    = [System.Text.Encoding]::ASCII.GetBytes("`n`n")
+                            # Use Latin-1 string search — byte-safe (0-255 maps 1:1), orders of magnitude
+                            # faster than a PowerShell byte loop for large XML files.
+                            $latin1  = [System.Text.Encoding]::GetEncoding(28591)
+                            $bodyStr = $latin1.GetString($bodyBytes3)
 
-                            $firstBoundary3 = Find-BytePattern -Source $bodyBytes3 -Pattern $boundaryMarker3 -Start 0
+                            $boundaryMarker3Str = "--$boundary3"
+                            $partBoundary3Str   = "`r`n--$boundary3"
+                            $partBoundaryLf3Str = "`n--$boundary3"
+                            $headerSep3Str      = "`r`n`r`n"
+                            $headerSepLf3Str    = "`n`n"
+
+                            $firstBoundary3 = $bodyStr.IndexOf($boundaryMarker3Str, 0, [System.StringComparison]::Ordinal)
                             if ($firstBoundary3 -lt 0) { throw "Invalid multipart payload: boundary start not found." }
 
-                            $headerEnd3 = Find-BytePattern -Source $bodyBytes3 -Pattern $headerSep3 -Start $firstBoundary3
+                            $headerEnd3 = $bodyStr.IndexOf($headerSep3Str, $firstBoundary3, [System.StringComparison]::Ordinal)
                             $sepLen3 = 4
                             if ($headerEnd3 -lt 0) {
-                                $headerEnd3 = Find-BytePattern -Source $bodyBytes3 -Pattern $headerSepLf3 -Start $firstBoundary3
+                                $headerEnd3 = $bodyStr.IndexOf($headerSepLf3Str, $firstBoundary3, [System.StringComparison]::Ordinal)
                                 $sepLen3 = 2
                             }
                             if ($headerEnd3 -lt 0) { throw "Invalid multipart payload: part headers not found." }
 
-                            $headersStart3 = $firstBoundary3 + $boundaryMarker3.Length + 2
-                            if ($headersStart3 -gt $headerEnd3) { $headersStart3 = $firstBoundary3 + $boundaryMarker3.Length }
+                            $headersStart3 = $firstBoundary3 + $boundaryMarker3Str.Length + 2
+                            if ($headersStart3 -gt $headerEnd3) { $headersStart3 = $firstBoundary3 + $boundaryMarker3Str.Length }
                             $headersLen3 = $headerEnd3 - $headersStart3
                             $headersText3 = if ($headersLen3 -gt 0) {
                                 [System.Text.Encoding]::UTF8.GetString($bodyBytes3, $headersStart3, $headersLen3)
@@ -12301,9 +12289,9 @@ function Start-WatchListener {
                             if ([string]::IsNullOrWhiteSpace($origName)) { $origName = 'import.xml' }
 
                             $dataStart3 = $headerEnd3 + $sepLen3
-                            $dataEnd3 = Find-BytePattern -Source $bodyBytes3 -Pattern $partBoundary3 -Start $dataStart3
+                            $dataEnd3 = $bodyStr.IndexOf($partBoundary3Str, $dataStart3, [System.StringComparison]::Ordinal)
                             if ($dataEnd3 -lt 0) {
-                                $dataEnd3 = Find-BytePattern -Source $bodyBytes3 -Pattern $partBoundaryLf3 -Start $dataStart3
+                                $dataEnd3 = $bodyStr.IndexOf($partBoundaryLf3Str, $dataStart3, [System.StringComparison]::Ordinal)
                             }
                             if ($dataEnd3 -lt $dataStart3) { throw "Invalid multipart payload: file body not found." }
 
