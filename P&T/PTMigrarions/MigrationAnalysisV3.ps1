@@ -5011,7 +5011,11 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     border-bottom:2px solid #e2e8f0;
     padding-bottom:0;
     overflow-x:auto;
+    overflow-y:hidden;
+    scrollbar-width:none;      /* Firefox */
+    -ms-overflow-style:none;   /* IE/Edge legacy */
   }
+  .compare-view-tabs::-webkit-scrollbar { display:none; } /* Chrome/Safari/Edge */
   .compare-view-tab {
     border:none;
     background:none;
@@ -5585,6 +5589,10 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
   body.dark-mode .compare-view-tab { background:none; color:#cbd5e1; }
   body.dark-mode .compare-view-tab:hover { background:#334155; color:#dbeafe; }
   body.dark-mode .compare-view-tab.active { background:#1e293b; border-bottom-color:#60a5fa; color:#93c5fd; }
+  body.dark-mode .mrs-right-tabs { border-bottom-color:#475569; }
+  body.dark-mode .mrs-right-tab { background:none; color:#cbd5e1; }
+  body.dark-mode .mrs-right-tab:hover { background:#334155; color:#dbeafe; }
+  body.dark-mode .mrs-right-tab.active { background:#1e293b; border-bottom-color:#60a5fa; color:#93c5fd; }
   body.dark-mode .compare-title,
   body.dark-mode .cohort-title { color:#f1f5f9; }
   body.dark-mode .compare-subtitle,
@@ -5782,28 +5790,39 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     overflow-y:auto;
     white-space:nowrap;
   }
-  .mrs-center-tabs {
+  .mrs-right-tabs {
     display:flex;
-    gap:6px;
-    padding:8px 10px;
-    border-bottom:1px solid #e2e8f0;
-    background:#f8fafc;
+    gap:4px;
+    align-items:flex-end;
+    margin:2px 0 12px;
+    border-bottom:2px solid #e2e8f0;
+    padding:0 10px;
+    overflow-x:auto;
     flex:0 0 auto;
   }
-  .mrs-center-tab {
-    border:1px solid #cbd5e1;
-    background:#fff;
-    color:#334155;
-    border-radius:8px;
-    padding:4px 10px;
-    font-size:.74rem;
+  .mrs-right-tab {
+    border:none;
+    background:none;
+    color:#475569;
+    border-radius:8px 8px 0 0;
+    border-bottom:3px solid transparent;
+    margin-bottom:-2px;
+    padding:10px 16px;
+    font-size:.84rem;
     font-weight:600;
+    letter-spacing:.01em;
     cursor:pointer;
+    white-space:nowrap;
+    transition:all .15s;
   }
-  .mrs-center-tab.active {
-    background:#dbeafe;
-    border-color:#93c5fd;
-    color:#1d4ed8;
+  .mrs-right-tab:hover {
+    color:#1e40af;
+    background:#f1f5f9;
+  }
+  .mrs-right-tab.active {
+    color:#1e40af;
+    border-bottom-color:#1e40af;
+    background:#fff;
   }
   #mrs-report-viewer { padding:8px 12px 12px; }
   #mrs-failure-viewer { padding:10px 12px 12px; }
@@ -5876,6 +5895,37 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     color:#0f172a;
     background:#f8fafc;
   }
+  .mrs-chart-grid {
+    display:grid;
+    grid-template-columns:repeat(2,minmax(220px,1fr));
+    gap:10px;
+    margin:4px 0 10px;
+  }
+  .mrs-chart-card {
+    border:1px solid #e2e8f0;
+    border-radius:10px;
+    background:#fff;
+    padding:8px;
+  }
+  .mrs-chart-card-wide { grid-column:1 / -1; }
+  .mrs-chart-title {
+    font-size:.73rem;
+    font-weight:700;
+    color:#475569;
+    margin-bottom:6px;
+  }
+  .mrs-chart-wrap {
+    height:190px;
+    position:relative;
+  }
+  .mrs-chart-wrap-lg { height:230px; }
+  .mrs-chart-empty {
+    display:none;
+    color:#94a3b8;
+    font-size:.76rem;
+    text-align:center;
+    padding:8px 6px 2px;
+  }
   .mrs-collection-item { white-space:nowrap; }
   #mrs-entry-detail {
     flex:1;
@@ -5925,6 +5975,9 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     outline:none;
     border-color:#93c5fd !important;
     box-shadow:0 0 0 2px rgba(59,130,246,.15);
+  }
+  @media (max-width: 1000px) {
+    .mrs-chart-grid { grid-template-columns:1fr; }
   }
   .mrs-cmd-toolbar{
     margin:8px 10px 6px;
@@ -7062,6 +7115,11 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
               <button id="mrs-btn-export-xml" class="ent-btn" onclick="mrsExportXml()" style="font-size:.75rem;padding:4px 10px">Export XML</button>
             </div>
           </div>
+          <div class="mrs-right-tabs">
+            <button id="mrs-right-tab-explorer" class="mrs-right-tab active" onclick="mrsSetCenterMode('explorer')">📊 Explorer (Panel B-C-D)</button>
+            <button id="mrs-right-tab-entries" class="mrs-right-tab" onclick="mrsOpenReportEntries()">📈 Report Entries</button>
+            <button id="mrs-right-tab-failure" class="mrs-right-tab" onclick="mrsOpenFailureIntelligence()">⚠️ Failure Intelligence</button>
+          </div>
 
           <!-- Property tree + center pane -->
           <div id="mrs-body-row" class="mrs-body-row">
@@ -7081,14 +7139,9 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
 
             <!-- Center pane (value / entries viewer) -->
             <div id="mrs-center-pane" class="mrs-center-pane">
-              <div class="mrs-pane-head" style="margin:0;border-left:none;border-right:none;">
+              <div id="mrs-center-pane-head" class="mrs-pane-head" style="margin:0;border-left:none;border-right:none;">
                 <span class="mrs-pane-tag">Panel C</span>
-                <span class="mrs-pane-name">Value / Report Viewer</span>
-              </div>
-              <div class="mrs-center-tabs">
-                <button id="mrs-center-tab-value" class="mrs-center-tab active" onclick="mrsSetCenterMode('value')">Value</button>
-                <button id="mrs-center-tab-entries" class="mrs-center-tab" onclick="mrsOpenReportEntries()">Report Entries</button>
-                <button id="mrs-center-tab-failure" class="mrs-center-tab" onclick="mrsOpenFailureIntelligence()">Failure Intelligence</button>
+                <span id="mrs-center-pane-title" class="mrs-pane-name">Value / Report Viewer</span>
               </div>
               <div id="mrs-panel-c-scroll">
               <div id="mrs-center-label" style="display:none;font-size:.78rem;font-weight:600;color:#475569"></div>
@@ -7111,7 +7164,22 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
                          oninput="mrsFilterEntries()">
                   <button class="ent-btn" onclick="mrsExportEntriesCsv()" style="font-size:.75rem;padding:4px 8px">⬇ CSV</button>
                 </div>
-                <div style="overflow-x:auto">
+                <div id="mrs-entries-charts" class="mrs-chart-grid">
+                  <div class="compare-section mrs-chart-card-wide" style="padding:10px;">
+                    <div class="compare-section-title" style="margin-bottom:6px;">Entries Timeline (per hour)</div>
+                    <div class="mrs-chart-wrap mrs-chart-wrap-lg"><canvas id="mrs-chart-entries-timeline"></canvas></div>
+                  </div>
+                  <div class="compare-section" style="padding:10px;">
+                    <div class="compare-section-title" style="margin-bottom:6px;">Level Distribution</div>
+                    <div class="mrs-chart-wrap"><canvas id="mrs-chart-entries-level"></canvas></div>
+                  </div>
+                  <div class="compare-section" style="padding:10px;">
+                    <div class="compare-section-title" style="margin-bottom:6px;">Top Entry Types</div>
+                    <div class="mrs-chart-wrap"><canvas id="mrs-chart-entries-type"></canvas></div>
+                  </div>
+                </div>
+                <div id="mrs-entries-chart-empty" class="mrs-chart-empty">No chartable entries in current filter.</div>
+                <div class="compare-table-wrap">
                   <table style="width:100%;border-collapse:collapse;font-size:.75rem">
                     <thead>
                       <tr style="background:#f1f5f9">
@@ -11292,7 +11360,7 @@ function mrsApiUrl(endpoint) {
     currentAlias    : null,   // alias or 'imported:filename' key of selected item
     currentStats    : null,   // parsed JSON stats object
     currentProp     : null,   // selected property path in Panel B tree
-    centerMode      : 'value',// Panel C mode: value | entries | failure
+    centerMode      : 'explorer',// Right view mode: explorer | entries | failure
     allEntries      : [],     // full Report.Entries array for current selection
     filteredEntries : [],     // entries after filter
     filteredEntryIndexes : [],// source indexes for filtered report entries
@@ -11300,6 +11368,8 @@ function mrsApiUrl(endpoint) {
     collectionProp  : '',     // currently selected property path for Panel C
     failureEvents   : [],     // normalized failure events for current mailbox
     failureTopTypes : [],     // top failure type distribution for current mailbox
+    entryCharts     : null,   // Chart.js refs for Report Entries view
+    failureCharts   : null,   // Chart.js refs for Failure Intelligence view
     treeExpanded    : {},     // expanded object nodes in Panel B tree
     listItems       : [],     // cached move request list
     lastFetchTime   : 0,      // ms timestamp of last successful list load (0 = never)
@@ -11351,21 +11421,48 @@ function mrsApiUrl(endpoint) {
   }
 
   function mrsSetCenterMode(mode, skipSave) {
-    var next = (mode === 'entries' || mode === 'failure') ? mode : 'value';
+    var next = (mode === 'entries' || mode === 'failure') ? mode : 'explorer';
+    if (mode === 'value') next = 'explorer'; // backward compatibility for older calls/state
     mrsState.centerMode = next;
+    var treePane = document.getElementById('mrs-tree-pane');
+    var splitTree = document.getElementById('mrs-splitter-tree');
+    var centerHead = document.getElementById('mrs-center-pane-head');
+    var centerTitle = document.getElementById('mrs-center-pane-title');
     var center = document.getElementById('mrs-center-content');
     var report = document.getElementById('mrs-report-viewer');
     var failure = document.getElementById('mrs-failure-viewer');
-    if (center) center.style.display = (next === 'value') ? '' : 'none';
+    var detailPanel = document.getElementById('mrs-entry-detail-panel');
+    var detailText = document.getElementById('mrs-entry-detail');
+    if (treePane) treePane.style.display = (next === 'explorer') ? '' : 'none';
+    if (splitTree) splitTree.style.display = (next === 'explorer') ? '' : 'none';
+    if (centerHead) centerHead.style.display = (next === 'explorer') ? '' : 'none';
+    if (centerTitle) {
+      centerTitle.textContent = (next === 'entries')
+        ? 'Report Entries'
+        : (next === 'failure' ? 'Failure Intelligence' : 'Value / Report Viewer');
+    }
+    if (center) center.style.display = (next === 'explorer') ? '' : 'none';
     if (report) report.style.display = (next === 'entries') ? '' : 'none';
     if (failure) failure.style.display = (next === 'failure') ? '' : 'none';
-    var tabValue = document.getElementById('mrs-center-tab-value');
-    var tabEntries = document.getElementById('mrs-center-tab-entries');
-    var tabFailure = document.getElementById('mrs-center-tab-failure');
-    if (tabValue) tabValue.classList.toggle('active', next === 'value');
+    var tabValue = document.getElementById('mrs-right-tab-explorer');
+    var tabEntries = document.getElementById('mrs-right-tab-entries');
+    var tabFailure = document.getElementById('mrs-right-tab-failure');
+    if (tabValue) tabValue.classList.toggle('active', next === 'explorer');
     if (tabEntries) tabEntries.classList.toggle('active', next === 'entries');
     if (tabFailure) tabFailure.classList.toggle('active', next === 'failure');
-    if (next === 'value' && center) {
+    if (next !== 'entries') mrsDestroyEntriesCharts();
+    if (next !== 'failure') mrsDestroyFailureCharts();
+    if (detailPanel) {
+      if (next === 'explorer') {
+        detailPanel.style.display = '';
+      } else {
+        detailPanel.style.display = 'none';
+      }
+    }
+    if (next !== 'explorer' && detailText) {
+      detailText.textContent = 'Panel D - Entry Detail\nSwitch to Explorer (Panel B-C-D) to use detail view.';
+    }
+    if (next === 'explorer' && center) {
       var hasContent = String(center.innerHTML || '').trim().length > 0;
       if (!hasContent) {
         center.innerHTML = mrsState.currentStats
@@ -11824,7 +11921,7 @@ function mrsApiUrl(endpoint) {
       status: 'All',
       currentAlias: null,
       currentProp: null,
-      centerMode: 'value',
+      centerMode: 'explorer',
       treeExpanded: {},
       commandState: mrsCreateDefaultCommandState()
     };
@@ -11838,7 +11935,9 @@ function mrsApiUrl(endpoint) {
         status: parsed.status || 'All',
         currentAlias: parsed.currentAlias || null,
         currentProp: parsed.currentProp || null,
-        centerMode: (parsed.centerMode === 'entries' || parsed.centerMode === 'failure') ? parsed.centerMode : 'value',
+        centerMode: (parsed.centerMode === 'entries' || parsed.centerMode === 'failure' || parsed.centerMode === 'explorer' || parsed.centerMode === 'value')
+          ? (parsed.centerMode === 'value' ? 'explorer' : parsed.centerMode)
+          : 'explorer',
         treeExpanded: parsed.treeExpanded && typeof parsed.treeExpanded === 'object' ? parsed.treeExpanded : {},
         commandState: parsed.commandState && typeof parsed.commandState === 'object' ? parsed.commandState : defaults.commandState
       };
@@ -11854,7 +11953,7 @@ function mrsApiUrl(endpoint) {
         status: (document.getElementById('mrs-status-filter') || {}).value || 'All',
         currentAlias: mrsState.currentAlias || null,
         currentProp: mrsState.currentProp || null,
-        centerMode: mrsState.centerMode || 'value',
+        centerMode: mrsState.centerMode || 'explorer',
         treeExpanded: mrsState.treeExpanded || {},
         commandState: mrsCmdState
       }));
@@ -11875,7 +11974,9 @@ function mrsApiUrl(endpoint) {
     mrsInitCommandToolbar();
     mrsState.currentAlias = st.currentAlias || null;
     mrsState.currentProp = st.currentProp || null;
-    mrsState.centerMode = (st.centerMode === 'entries' || st.centerMode === 'failure') ? st.centerMode : 'value';
+    mrsState.centerMode = (st.centerMode === 'entries' || st.centerMode === 'failure' || st.centerMode === 'explorer' || st.centerMode === 'value')
+      ? (st.centerMode === 'value' ? 'explorer' : st.centerMode)
+      : 'explorer';
     mrsState.treeExpanded = st.treeExpanded && typeof st.treeExpanded === 'object' ? st.treeExpanded : {};
     mrsSyncIdentityFromPanelSelection();
     mrsUpdateCommandPreviewBar();
@@ -12286,14 +12387,14 @@ function mrsApiUrl(endpoint) {
         mrsState.currentProp = null;
       }
     }
-    if (!mrsState.currentProp && mrsState.centerMode === 'value') {
+    if (!mrsState.currentProp && mrsState.centerMode === 'explorer') {
       document.getElementById('mrs-center-content').innerHTML =
         '<span style="color:#94a3b8;font-style:italic">Select a property in Panel B to view value details.</span>';
       mrsShowEntryDetail('');
     }
     if (mrsState.centerMode === 'entries') mrsOpenReportEntries();
     else if (mrsState.centerMode === 'failure') mrsRenderFailureIntelligence();
-    else mrsSetCenterMode('value', true);
+    else mrsSetCenterMode('explorer', true);
     mrsSaveUiState();
   }
 
@@ -12453,15 +12554,15 @@ function mrsApiUrl(endpoint) {
     var center = document.getElementById('mrs-center-content');
     if (empty) empty.style.display = 'none';
     if (area) area.style.display = 'flex';
-    mrsSetCenterMode(mrsState.centerMode || 'value', true);
+    mrsSetCenterMode(mrsState.centerMode || 'explorer', true);
 
     if (show) {
       detailPanel.style.flex = '0 0 auto';
       if (!detailPanel.style.height || detailPanel.style.height === 'auto') {
         detailPanel.style.height = (mrsClamp(mrsLoadLayout().detailHeight, 120, 360)) + 'px';
       }
-      detailPanel.style.display = '';
-      if (mrsState.centerMode === 'value' && !mrsState.currentProp) {
+      detailPanel.style.display = (mrsState.centerMode === 'explorer') ? '' : 'none';
+      if (mrsState.centerMode === 'explorer' && !mrsState.currentProp) {
         center.innerHTML = '<span style="color:#94a3b8;font-style:italic">Select a property in Panel B to view value details.</span>';
       }
     } else {
@@ -12475,9 +12576,9 @@ function mrsApiUrl(endpoint) {
       if (!detailPanel.style.height || detailPanel.style.height === 'auto') {
         detailPanel.style.height = (mrsClamp(mrsLoadLayout().detailHeight, 120, 360)) + 'px';
       }
-      detailPanel.style.display = '';
+      detailPanel.style.display = (mrsState.centerMode === 'explorer') ? '' : 'none';
       detailText.textContent = 'Panel D - Entry Detail\nSelect a property or report row to populate this panel.';
-      mrsSetCenterMode('value', true);
+      mrsSetCenterMode('explorer', true);
     }
   }
 
@@ -12730,7 +12831,7 @@ function mrsApiUrl(endpoint) {
 
   function renderMRSScalar(propName, val) {
     var content = document.getElementById('mrs-center-content');
-    mrsSetCenterMode('value', true);
+    mrsSetCenterMode('explorer', true);
     mrsState.collectionItems = [];
     mrsState.collectionProp = '';
     if (val === null || val === undefined || val === '') {
@@ -12759,7 +12860,7 @@ function mrsApiUrl(endpoint) {
 
   function renderMRSCollection(propName, items) {
     var content = document.getElementById('mrs-center-content');
-    mrsSetCenterMode('value', true);
+    mrsSetCenterMode('explorer', true);
     mrsState.collectionItems = Array.isArray(items) ? items : [];
     mrsState.collectionProp = propName || '';
     if (!items || items.length === 0) {
@@ -12781,7 +12882,7 @@ function mrsApiUrl(endpoint) {
 
   function mrsSelectProperty(prop) {
     if (!mrsState.currentStats) return;
-    mrsSetCenterMode('value', true);
+    mrsSetCenterMode('explorer', true);
     mrsState.currentProp = prop;
     mrsSaveUiState();
     document.querySelectorAll('.mrs-tree-item').forEach(function(li){ li.style.background = ''; });
@@ -12821,7 +12922,7 @@ function mrsApiUrl(endpoint) {
     var pre   = document.getElementById('mrs-entry-detail');
     var val = (text === null || text === undefined) ? '' : String(text);
     pre.textContent = val.length ? val : 'Panel D - Entry Detail\nSelect a property or report row to populate this panel.';
-    panel.style.display = '';
+    panel.style.display = (mrsState.centerMode === 'explorer') ? '' : 'none';
   }
 
   function mrsCopyDetail() {
@@ -12858,6 +12959,217 @@ function mrsApiUrl(endpoint) {
   function mrsEntryMessage(entry) { return mrsEntryField(entry, ['Message', 'Error', 'Failure', '__Text']); }
   function mrsEntryTime(entry) { return mrsEntryField(entry, ['CreationTime', 'Timestamp', 'TimeStamp']); }
   function mrsEntryDuration(entry) { return mrsEntryField(entry, ['Duration']); }
+
+  function mrsDestroyChart(chart) {
+    if (!chart) return null;
+    try { chart.destroy(); } catch (_) {}
+    return null;
+  }
+
+  function mrsDestroyEntriesCharts() {
+    if (!mrsState.entryCharts) return;
+    mrsState.entryCharts.timeline = mrsDestroyChart(mrsState.entryCharts.timeline);
+    mrsState.entryCharts.level = mrsDestroyChart(mrsState.entryCharts.level);
+    mrsState.entryCharts.type = mrsDestroyChart(mrsState.entryCharts.type);
+  }
+
+  function mrsDestroyFailureCharts() {
+    if (!mrsState.failureCharts) return;
+    mrsState.failureCharts.timeline = mrsDestroyChart(mrsState.failureCharts.timeline);
+    mrsState.failureCharts.types = mrsDestroyChart(mrsState.failureCharts.types);
+  }
+
+  function mrsHourKeyMs(raw) {
+    if (!raw) return 0;
+    var d = new Date(raw);
+    if (isNaN(d.getTime())) return 0;
+    d.setMinutes(0, 0, 0);
+    return d.getTime();
+  }
+
+  function mrsChartTheme() {
+    var isDark = document.body.classList.contains('dark-mode');
+    return {
+      grid: isDark ? 'rgba(148,163,184,0.2)' : 'rgba(0,0,0,0.08)',
+      text: isDark ? '#94a3b8' : '#64748b'
+    };
+  }
+
+  function mrsRenderEntriesCharts(rows) {
+    var empty = document.getElementById('mrs-entries-chart-empty');
+    if (!Array.isArray(rows) || rows.length === 0) {
+      mrsDestroyEntriesCharts();
+      if (empty) empty.style.display = '';
+      return;
+    }
+    if (empty) empty.style.display = 'none';
+    mrsState.entryCharts = mrsState.entryCharts || {};
+
+    var timelineMap = {};
+    var levelCounts = { Info: 0, Warning: 0, Error: 0, Failure: 0, Other: 0 };
+    var typeCounts = {};
+    rows.forEach(function(e) {
+      var keyMs = mrsHourKeyMs(mrsEntryTime(e));
+      if (keyMs > 0) {
+        if (!timelineMap[keyMs]) timelineMap[keyMs] = { total: 0, errFail: 0 };
+        timelineMap[keyMs].total += 1;
+        var lv = String(mrsEntryLevel(e) || '').toLowerCase();
+        if (lv === 'error' || lv === 'failure') timelineMap[keyMs].errFail += 1;
+      }
+
+      var level = String(mrsEntryLevel(e) || '').toLowerCase();
+      if (level === 'info') levelCounts.Info += 1;
+      else if (level === 'warning') levelCounts.Warning += 1;
+      else if (level === 'error') levelCounts.Error += 1;
+      else if (level === 'failure') levelCounts.Failure += 1;
+      else levelCounts.Other += 1;
+
+      var type = String(mrsEntryType(e) || 'Unknown').trim();
+      if (!type) type = 'Unknown';
+      typeCounts[type] = (typeCounts[type] || 0) + 1;
+    });
+
+    var timelineKeys = Object.keys(timelineMap).map(function(k) { return parseInt(k, 10); }).sort(function(a, b) { return a - b; });
+    if (timelineKeys.length > 140) {
+      var step = Math.ceil(timelineKeys.length / 140);
+      timelineKeys = timelineKeys.filter(function(_, idx) { return idx % step === 0; });
+    }
+    var labels = timelineKeys.map(function(ms) { return new Date(ms).toLocaleString(); });
+    var totalVals = timelineKeys.map(function(ms) { return timelineMap[ms].total; });
+    var errFailVals = timelineKeys.map(function(ms) { return timelineMap[ms].errFail; });
+
+    var topTypes = Object.keys(typeCounts)
+      .map(function(k) { return { name: k, count: typeCounts[k] }; })
+      .sort(function(a, b) { return b.count - a.count; })
+      .slice(0, 10);
+
+    var canTimeline = document.getElementById('mrs-chart-entries-timeline');
+    var canLevel = document.getElementById('mrs-chart-entries-level');
+    var canType = document.getElementById('mrs-chart-entries-type');
+    if (!canTimeline || !canLevel || !canType) return;
+
+    loadChartJs(function() {
+      mrsDestroyEntriesCharts();
+      var t = mrsChartTheme();
+      mrsState.entryCharts.timeline = new Chart(canTimeline, {
+        type: 'line',
+        data: {
+          labels: labels,
+          datasets: [
+            { label: 'Entries', data: totalVals, borderColor: '#2563eb', backgroundColor: 'rgba(37,99,235,0.08)', borderWidth: 2, tension: 0.2, pointRadius: 1, fill: false },
+            { label: 'Error+Failure', data: errFailVals, borderColor: '#dc2626', backgroundColor: 'rgba(220,38,38,0.08)', borderWidth: 2, tension: 0.2, pointRadius: 1, fill: false }
+          ]
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          plugins: { legend: { position: 'bottom', labels: { color: t.text, boxWidth: 10, font: { size: 10 } } } },
+          scales: {
+            x: { grid: { color: t.grid }, ticks: { color: t.text, maxTicksLimit: 8 } },
+            y: { beginAtZero: true, grid: { color: t.grid }, ticks: { color: t.text, precision: 0 } }
+          }
+        }
+      });
+
+      mrsState.entryCharts.level = new Chart(canLevel, {
+        type: 'doughnut',
+        data: {
+          labels: ['Info', 'Warning', 'Error', 'Failure', 'Other'],
+          datasets: [{
+            data: [levelCounts.Info, levelCounts.Warning, levelCounts.Error, levelCounts.Failure, levelCounts.Other],
+            backgroundColor: ['#0ea5e9', '#f59e0b', '#ef4444', '#b91c1c', '#94a3b8'],
+            borderWidth: 1
+          }]
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          plugins: { legend: { position: 'bottom', labels: { color: t.text, boxWidth: 10, font: { size: 10 } } } }
+        }
+      });
+
+      mrsState.entryCharts.type = new Chart(canType, {
+        type: 'bar',
+        data: {
+          labels: topTypes.map(function(x) { return x.name; }),
+          datasets: [{ label: 'Count', data: topTypes.map(function(x) { return x.count; }), backgroundColor: 'rgba(59,130,246,0.75)', borderColor: '#2563eb', borderWidth: 1 }]
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false, indexAxis: 'y',
+          plugins: { legend: { display: false } },
+          scales: {
+            x: { beginAtZero: true, grid: { color: t.grid }, ticks: { color: t.text, precision: 0 } },
+            y: { grid: { color: t.grid }, ticks: { color: t.text, autoSkip: false, font: { size: 10 } } }
+          }
+        }
+      });
+    });
+  }
+
+  function mrsRenderFailureCharts(fi) {
+    var timelineCanvas = document.getElementById('mrs-chart-failure-timeline');
+    var typesCanvas = document.getElementById('mrs-chart-failure-types');
+    if (!timelineCanvas || !typesCanvas || !fi) return;
+    mrsState.failureCharts = mrsState.failureCharts || {};
+
+    var map = {};
+    (fi.events || []).forEach(function(e) {
+      var keyMs = mrsHourKeyMs(e.Timestamp);
+      if (keyMs <= 0) return;
+      if (!map[keyMs]) map[keyMs] = { total: 0, permanent: 0, retryable: 0 };
+      map[keyMs].total += 1;
+      if (e.IsPermanent) map[keyMs].permanent += 1;
+      else map[keyMs].retryable += 1;
+    });
+    var keys = Object.keys(map).map(function(k) { return parseInt(k, 10); }).sort(function(a, b) { return a - b; });
+    if (keys.length > 140) {
+      var step = Math.ceil(keys.length / 140);
+      keys = keys.filter(function(_, idx) { return idx % step === 0; });
+    }
+    var labels = keys.map(function(ms) { return new Date(ms).toLocaleString(); });
+    var totalVals = keys.map(function(ms) { return map[ms].total; });
+    var permVals = keys.map(function(ms) { return map[ms].permanent; });
+    var retVals = keys.map(function(ms) { return map[ms].retryable; });
+    var topTypes = (fi.topTypes || []).slice(0, 10);
+
+    loadChartJs(function() {
+      mrsDestroyFailureCharts();
+      var t = mrsChartTheme();
+      mrsState.failureCharts.timeline = new Chart(timelineCanvas, {
+        type: 'line',
+        data: {
+          labels: labels,
+          datasets: [
+            { label: 'Total', data: totalVals, borderColor: '#2563eb', backgroundColor: 'rgba(37,99,235,0.08)', borderWidth: 2, tension: 0.2, pointRadius: 1, fill: false },
+            { label: 'Permanent', data: permVals, borderColor: '#dc2626', backgroundColor: 'rgba(220,38,38,0.08)', borderWidth: 2, tension: 0.2, pointRadius: 1, fill: false },
+            { label: 'Retryable', data: retVals, borderColor: '#16a34a', backgroundColor: 'rgba(22,163,74,0.08)', borderWidth: 2, tension: 0.2, pointRadius: 1, fill: false }
+          ]
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          plugins: { legend: { position: 'bottom', labels: { color: t.text, boxWidth: 10, font: { size: 10 } } } },
+          scales: {
+            x: { grid: { color: t.grid }, ticks: { color: t.text, maxTicksLimit: 8 } },
+            y: { beginAtZero: true, grid: { color: t.grid }, ticks: { color: t.text, precision: 0 } }
+          }
+        }
+      });
+
+      mrsState.failureCharts.types = new Chart(typesCanvas, {
+        type: 'bar',
+        data: {
+          labels: topTypes.map(function(x) { return x.FailureType || 'Unknown'; }),
+          datasets: [{ label: 'Count', data: topTypes.map(function(x) { return x.Count || 0; }), backgroundColor: 'rgba(124,58,237,0.75)', borderColor: '#7c3aed', borderWidth: 1 }]
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false, indexAxis: 'y',
+          plugins: { legend: { display: false } },
+          scales: {
+            x: { beginAtZero: true, grid: { color: t.grid }, ticks: { color: t.text, precision: 0 } },
+            y: { grid: { color: t.grid }, ticks: { color: t.text, autoSkip: false, font: { size: 10 } } }
+          }
+        }
+      });
+    });
+  }
 
   function mrsEscHtml(value) {
     return String(value === null || value === undefined ? '' : value)
@@ -13111,17 +13423,29 @@ function mrsApiUrl(endpoint) {
       ['Last Event', fi.events.length ? mrsFiFmtTs(fi.events[0].Timestamp) : '-']
     ];
 
-    var html = '<div class="mrs-fi-grid">' + rows.map(function(r) {
-      return '<div class="mrs-fi-kpi"><div class="mrs-fi-kpi-label">' + mrsEscHtml(r[0]) + '</div><div class="mrs-fi-kpi-value">' + mrsEscHtml(r[1]) + '</div></div>';
+    var html = '<div class="compare-kv-grid">' + rows.map(function(r) {
+      return '<div class="compare-kv-box"><div class="compare-kv-key">' + mrsEscHtml(r[0]) + '</div><div class="compare-kv-value">' + mrsEscHtml(r[1]) + '</div></div>';
     }).join('') + '</div>';
 
     if (!fi.events.length && !fi.diagRaw) {
       html += '<div class="mrs-fi-empty">No failure records found in this mailbox statistics payload. This can be normal for healthy requests.</div>';
       host.innerHTML = html;
+      mrsDestroyFailureCharts();
       return;
     }
 
-    html += '<div class="mrs-fi-section"><div class="mrs-fi-section-head">Top Failure Types</div><div class="mrs-fi-table-wrap"><table class="mrs-fi-table"><thead><tr><th>Type</th><th>Count</th></tr></thead><tbody>';
+    html += '<div class="mrs-chart-grid">' +
+      '<div class="mrs-chart-card mrs-chart-card-wide">' +
+      '<div class="mrs-chart-title">Failure Timeline (per hour)</div>' +
+      '<div class="mrs-chart-wrap mrs-chart-wrap-lg"><canvas id="mrs-chart-failure-timeline"></canvas></div>' +
+      '</div>' +
+      '<div class="mrs-chart-card mrs-chart-card-wide">' +
+      '<div class="mrs-chart-title">Top Failure Types</div>' +
+      '<div class="mrs-chart-wrap"><canvas id="mrs-chart-failure-types"></canvas></div>' +
+      '</div>' +
+      '</div>';
+
+    html += '<div class="compare-section"><div class="compare-section-title">Top Failure Types</div><div class="compare-table-wrap"><table class="mrs-fi-table"><thead><tr><th>Type</th><th>Count</th></tr></thead><tbody>';
     if (!fi.topTypes.length) {
       html += '<tr><td colspan="2" style="color:#94a3b8">No grouped failure types available.</td></tr>';
     } else {
@@ -13131,7 +13455,7 @@ function mrsApiUrl(endpoint) {
     }
     html += '</tbody></table></div></div>';
 
-    html += '<div class="mrs-fi-section"><div class="mrs-fi-section-head">Recent Failure Events</div><div class="mrs-fi-table-wrap"><table class="mrs-fi-table"><thead><tr><th>Timestamp</th><th>Type</th><th>Code</th><th>Mailbox</th><th>Message</th></tr></thead><tbody>';
+    html += '<div class="compare-section"><div class="compare-section-title">Recent Failure Events</div><div class="compare-table-wrap"><table class="mrs-fi-table"><thead><tr><th>Timestamp</th><th>Type</th><th>Code</th><th>Mailbox</th><th>Message</th></tr></thead><tbody>';
     if (!fi.events.length) {
       html += '<tr><td colspan="5" style="color:#94a3b8">No individual failure events available.</td></tr>';
     } else {
@@ -13149,8 +13473,8 @@ function mrsApiUrl(endpoint) {
     }
     html += '</tbody></table></div></div>';
 
-    html += '<div class="mrs-fi-section"><div class="mrs-fi-section-head">DiagnosticInfo Summary</div>';
-    html += '<div class="mrs-fi-grid" style="padding:8px 10px 0">';
+    html += '<div class="compare-section"><div class="compare-section-title">DiagnosticInfo Summary</div>';
+    html += '<div class="compare-kv-grid" style="padding:4px 0 0">';
     [
       ['Status', fi.diagSummary.Status || '-'],
       ['Legacy Status', fi.diagSummary.LegacyStatus || '-'],
@@ -13159,19 +13483,20 @@ function mrsApiUrl(endpoint) {
       ['SameStatusCount', fi.diagSummary.SameStatusCount || '-'],
       ['TransientErrors', fi.diagSummary.TransientErrors || '-']
     ].forEach(function(r) {
-      html += '<div class="mrs-fi-kpi"><div class="mrs-fi-kpi-label">' + mrsEscHtml(r[0]) + '</div><div class="mrs-fi-kpi-value">' + mrsEscHtml(r[1]) + '</div></div>';
+      html += '<div class="compare-kv-box"><div class="compare-kv-key">' + mrsEscHtml(r[0]) + '</div><div class="compare-kv-value">' + mrsEscHtml(r[1]) + '</div></div>';
     });
     html += '</div>';
     if (fi.diagStatuses.length) {
-      html += '<div class="mrs-fi-table-wrap" style="padding:8px 10px 0"><table class="mrs-fi-table"><thead><tr><th>Status Code</th><th>Count</th></tr></thead><tbody>';
+      html += '<div class="compare-table-wrap" style="margin-top:8px;"><table class="mrs-fi-table"><thead><tr><th>Status Code</th><th>Count</th></tr></thead><tbody>';
       html += fi.diagStatuses.map(function(s) {
         return '<tr><td>' + mrsEscHtml(s.Status) + '</td><td>' + mrsEscHtml(s.Count) + '</td></tr>';
       }).join('');
       html += '</tbody></table></div>';
     }
-    html += '<pre class="mrs-fi-diag">' + mrsEscHtml(fi.diagRaw ? String(fi.diagRaw).slice(0, 12000) : '-') + '</pre></div>';
+    html += '<pre class="mrs-fi-diag" style="margin-top:8px;">' + mrsEscHtml(fi.diagRaw ? String(fi.diagRaw).slice(0, 12000) : '-') + '</pre></div>';
 
     host.innerHTML = html;
+    mrsRenderFailureCharts(fi);
   }
 
   function mrsOpenFailureIntelligence() {
@@ -13186,6 +13511,9 @@ function mrsApiUrl(endpoint) {
     mrsSetCenterMode('entries');
     if (!mrsState.currentStats || !mrsState.currentStats.Report) {
       mrsState.allEntries = [];
+      mrsDestroyEntriesCharts();
+      var chartEmpty = document.getElementById('mrs-entries-chart-empty');
+      if (chartEmpty) chartEmpty.style.display = '';
       document.getElementById('mrs-entries-tbody').innerHTML = '<tr><td colspan="5" style="padding:16px;text-align:center;color:#94a3b8">No Report object in current mailbox stats</td></tr>';
       document.getElementById('mrs-entries-count').textContent = 'Showing 0 of 0 entries';
       mrsShowEntryDetail('Panel D - Entry Detail\nNo Report.Entries found for this mailbox.');
@@ -13258,6 +13586,7 @@ function mrsApiUrl(endpoint) {
     }).join('');
     tbody.innerHTML = html || '<tr><td colspan="5" style="padding:16px;text-align:center;color:#94a3b8">No entries match filters</td></tr>';
     document.getElementById('mrs-entries-count').textContent = 'Showing ' + filtered.length + ' of ' + mrsState.allEntries.length + ' entries';
+    mrsRenderEntriesCharts(filtered);
   }
   window.mrsFilterEntries = mrsFilterEntries;
 
