@@ -41,6 +41,7 @@
     Requires -IncludeDetailReport. Exports the raw statistics array to CLIXML
     alongside the HTML/CSV reports for later offline replay.
     Output file: <ReportName>_RawStats.xml
+    Cannot be used with -WatchMode.
 
 .PARAMETER WatchMode
     Continuously regenerates the report every -RefreshIntervalSeconds seconds.
@@ -72,6 +73,7 @@
 
 .PARAMETER SkipCsv
     Suppress CSV report output.
+    Cannot be used with -WatchMode (watch mode suppresses CSV automatically).
 
 .PARAMETER BatchSize
     Number of mailboxes per Get-MoveRequestStatistics EXO call. Default: 500
@@ -205,7 +207,7 @@ param (
 
     [Parameter(ParameterSetName = "Live")]
     [ValidateRange(10,86400)]
-    [int]$RefreshIntervalSeconds = 300,
+    [int]$RefreshIntervalSeconds = 3600,
 
     [Parameter(ParameterSetName = "Live")]
     [ValidateRange(1024,65535)]
@@ -289,7 +291,7 @@ param (
 
     # Only retry failures matching these error patterns (regex)
     [Parameter(ParameterSetName = "Live")]
-    [string[]]$RetryOnErrorPatterns = @('Transient', 'Timeout', 'ConnectionFailed', 'NetworkError', 'Throttl'),
+    [string[]]$RetryOnErrorPatterns = @('Transient', 'Timeout', 'ConnectionFailed', 'NetworkError', 'Throttle'),
 
     # ── Scheduled Reports Parameters ─────────────────────────────────────────
     # Enable scheduled report generation
@@ -1821,7 +1823,7 @@ function Ensure-MRSImportedItemsStore {
 function Invoke-MRSMoveRequestRefresh {
     param([Parameter(Mandatory)][hashtable]$WatchState)
     try {
-        $moves = @(Get-MoveRequest -ResultSize Unlimited | Select-Object Name, DisplayName, Alias, BatchName, RemoteHostName, Flags, TargetDatabase, Status, ExchangeGuid)
+        $moves = @(Get-MoveRequest -ResultSize Unlimited | Select-Object Name, DisplayName, Alias, BatchName, RemoteHostName, Flags, TargetDatabase, Status, ExchangeGuid, MailboxGuid, Identity)
         $serialized = @($moves | ForEach-Object {
             [ordered]@{
                 Name           = "$($_.Name)"
@@ -1833,6 +1835,8 @@ function Invoke-MRSMoveRequestRefresh {
                 TargetDatabase = "$($_.TargetDatabase)"
                 Status         = "$($_.Status)"
                 ExchangeGuid   = "$($_.ExchangeGuid)"
+                MailboxGuid    = "$($_.MailboxGuid)"
+                Identity       = "$($_.Identity)"
             }
         })
         $WatchState['MRSMoveRequestCache']     = $serialized
@@ -1843,15 +1847,95 @@ function Invoke-MRSMoveRequestRefresh {
     }
 }
 
+function Test-MRSGuid {
+    param([string]$Value)
+    $g = [guid]::Empty
+    return [guid]::TryParse("$Value", [ref]$g)
+}
+
 function Resolve-MRSIdentity {
     param([hashtable]$WatchState, [string]$Alias)
-    # Prefer ExchangeGuid from cache to avoid "matches multiple entries" when a mailbox
-    # has more than one move request (e.g. a completed/soft-deleted one alongside an active one).
-    $cached = $WatchState['MRSMoveRequestCache']
-    if ($cached) {
-        $match = @($cached | Where-Object { $_.Alias -eq $Alias -and $_.ExchangeGuid -and $_.ExchangeGuid -ne '' })[0]
-        if ($match) { return $match.ExchangeGuid }
+    $key = "$Alias".Trim()
+    if ([string]::IsNullOrWhiteSpace($key)) { return $Alias }
+    if ($key -like 'imported:*') { return $Alias }
+    if (Test-MRSGuid -Value $key) { return $key }
+
+    $zeroGuid = [guid]::Empty.ToString()
+    $statusRank = @{
+        InProgress = 1; AutoSuspended = 2; Suspended = 3; Queued = 4;
+        Synced = 5; Failed = 6; CompletionFailed = 7; IncrementalFailed = 8;
+        CompletedWithWarning = 9; CompletedWithWarnings = 10; CompletedWithSkippedItems = 11; Completed = 12
     }
+    $keyLower = $key.ToLowerInvariant()
+
+    $pickIdentity = {
+        param([object[]]$Rows)
+        $rowsArr = @($Rows)
+        if ($rowsArr.Count -eq 0) { return $null }
+        $matches = @($rowsArr | Where-Object {
+            $ex = "$($_.ExchangeGuid)".Trim()
+            $mb = "$($_.MailboxGuid)".Trim()
+            $al = "$($_.Alias)".Trim()
+            $dn = "$($_.DisplayName)".Trim()
+            $nm = "$($_.Name)".Trim()
+            $id = "$($_.Identity)".Trim()
+            $hasUniqueIdentity = ($ex -and $ex -ne $zeroGuid) -or ($mb -and $mb -ne $zeroGuid) -or ($id -and $id -ne '')
+            $nameMatch =
+                ($al -and $al -ieq $key) -or
+                ($dn -and $dn -ieq $key) -or
+                ($nm -and $nm -ieq $key) -or
+                ($id -and (
+                    ($id -ieq $key) -or
+                    ($id.ToLowerInvariant() -like "$keyLower+*") -or
+                    ($id.ToLowerInvariant() -like "$keyLower\*")
+                )) -or
+                ($ex -and $ex -ieq $key) -or
+                ($mb -and $mb -ieq $key)
+            $hasUniqueIdentity -and $nameMatch
+        })
+        if ($matches.Count -eq 0) { return $null }
+        $best = @($matches | Sort-Object `
+            @{ Expression = { $st = "$($_.Status)"; if ($statusRank.ContainsKey($st)) { $statusRank[$st] } else { 99 } } }, `
+            @{ Expression = { "$($_.Identity)$($_.Name)$($_.DisplayName)$($_.Alias)".ToLowerInvariant() } } | Select-Object -First 1)[0]
+        if (-not $best) { return $null }
+        $guid = "$($best.ExchangeGuid)".Trim()
+        if (-not $guid -or $guid -eq $zeroGuid) { $guid = "$($best.MailboxGuid)".Trim() }
+        if ($guid -and $guid -ne $zeroGuid) { return $guid }
+        $id = "$($best.Identity)".Trim()
+        if ($id) { return $id }
+        return $null
+    }
+
+    # Prefer GUID from cached list first.
+    $cached = @($WatchState['MRSMoveRequestCache'])
+    if ($cached.Count -gt 0) {
+        $idFromCache = & $pickIdentity $cached
+        if ($idFromCache) { return $idFromCache }
+    }
+
+    # Fallback: resolve once directly and still return a GUID if available.
+    $directErr = $null
+    try {
+        $direct = @(Get-MoveRequest -Identity $key -ErrorAction Stop)
+        $idFromDirect = & $pickIdentity $direct
+        if ($idFromDirect) { return $idFromDirect }
+    } catch {
+        $directErr = "$($_.Exception.Message)"
+    }
+
+    # Last fallback for ambiguous aliases or stale caches:
+    # scan move requests and resolve to a concrete GUID.
+    try {
+        $allMoves = @(Get-MoveRequest -ResultSize Unlimited -ErrorAction Stop)
+        $idFromAll = & $pickIdentity $allMoves
+        if ($idFromAll) { return $idFromAll }
+    } catch {}
+
+    # If EXO error already contained a concrete GUID token, use it.
+    if ($directErr -and $directErr -match '(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b') {
+        return $Matches[0]
+    }
+
     return $Alias
 }
 
@@ -1999,7 +2083,7 @@ function Invoke-MRSStatisticsRefresh {
             }
         }
 
-        Write-Console "MRSStatisticsRefresh: $command for '$Alias' (env=$envKey sig=$(Get-MRSProfileSignatureHash -ProfileSignature $ProfileSignature))." -Level Info -NoTimestamp
+        Write-Console "MRSStatisticsRefresh: $command for '$Alias' (identity='$identity' env=$envKey sig=$(Get-MRSProfileSignatureHash -ProfileSignature $ProfileSignature))." -Level Info -NoTimestamp
         $stats = & $command @invokeParams
         if ($stats -is [System.Collections.IEnumerable] -and $stats -isnot [string]) {
             $arr = @($stats)
@@ -4113,6 +4197,84 @@ function Export-CsvReport {
 
     Write-Console "CSV reports saved: $csvSummary, $csvMailbox" -Level SUCCESS
     return @($csvSummary, $csvMailbox)
+}
+
+function New-WatchBootstrapReportData {
+    param(
+        [Parameter(Mandatory)][string]$BatchName,
+        [int]$Percentile = 90,
+        [double]$MinSizeGBForScoring = 0.1
+    )
+
+    $now = Get-Date
+    $summary = [PSCustomObject]@{
+        BatchName                       = $BatchName
+        GeneratedAt                     = $now
+        StartTime                       = $now
+        EndTime                         = $now
+        MigrationDuration               = "00:00:00"
+        MailboxCount                    = 0
+        PercentileUsed                  = $Percentile
+        MinSizeGBForScoring             = $MinSizeGBForScoring
+        TotalSourceSizeGB               = 0
+        TotalGBTransferred              = 0
+        PercentComplete                 = 0
+        MaxPerMoveTransferRateGBPerHour = 0
+        MinPerMoveTransferRateGBPerHour = 0
+        AvgPerMoveTransferRateGBPerHour = 0
+        TotalThroughputGBPerHour        = 0
+        MoveEfficiencyPercent           = 0
+        AverageSourceLatencyMs          = 0
+        AverageDestinationLatencyMs     = 0
+        IdleDurationPct                 = 0
+        SourceSideDurationPct           = 0
+        DestinationSideDurationPct      = 0
+        WordBreakingDurationPct         = 0
+        TransientFailureDurationsPct    = 0
+        OverallStallDurationsPct        = 0
+        ContentIndexingStallsPct        = 0
+        HighAvailabilityStallsPct       = 0
+        TargetCPUStallsPct              = 0
+        SourceCPUStallsPct              = 0
+        MailboxLockedStallPct           = 0
+        ProxyUnknownStallPct            = 0
+        ThrottleStallsPct               = 0
+        StatusBreakdown                 = @()
+        Bottleneck                      = [PSCustomObject]@{
+            Severity        = 'None'
+            Explanation     = 'No migration statistics loaded yet. Use Refresh Now or select a scope.'
+            Recommendations = @(
+                'Use Refresh Now in the UI to fetch latest Exchange data.',
+                'Or narrow scope (batch/mailbox/status/date) to load only what you need.'
+            )
+        }
+        PerMailboxDetail                = @()
+        SlowestMailboxes                = @()
+        EstimatedTimeRemaining          = 'Waiting for refresh'
+        EstimatedCompletionTime         = $null
+        RemainingGB                     = 0
+        IsThrottled                     = $false
+        ThrottleReasons                 = ''
+        HasDetailReport                 = $false
+        CohortAnalysis                  = @()
+        FailedMailboxes                 = @()
+        RawStats                        = @()
+    }
+
+    $health = [PSCustomObject]@{
+        Score       = 0
+        Grade       = 'N/A'
+        Checks      = @()
+        NaChecks    = @()
+        IsPartial   = $true
+        PartialNote = 'No migration statistics loaded yet. Click Refresh Now or select scope in the UI.'
+        MetricCount = 0
+    }
+
+    return [PSCustomObject]@{
+        Summary = $summary
+        Health  = $health
+    }
 }
 
 function Export-HtmlReport {
@@ -10825,7 +10987,11 @@ $(if($ListenerPort -gt 0){
 // WATCH MODE API CLIENT
 // ═══════════════════════════════════════════════════════════════════
 (function(){
-  var API_BASE = '$($apiBaseUrl)';  // injected by PS at report generation time
+  var EMBEDDED_API_BASE = '$($apiBaseUrl)';  // injected by PS at report generation time
+  var ORIGIN_API_BASE = (window.location && /^https?:$/i.test(window.location.protocol) && window.location.origin && window.location.origin !== 'null')
+    ? window.location.origin
+    : '';
+  var API_BASE = ORIGIN_API_BASE || EMBEDDED_API_BASE;
 
   if (!API_BASE) return;
 
@@ -10849,6 +11015,11 @@ $(if($ListenerPort -gt 0){
   var nextRefreshAt = null;
   var collapsed = false;
   var isPaused = false;
+  var panelHydrated = false;
+  var pendingBatchSelection = null;
+  var pendingMailboxFilter = null;
+  var hasStatusBaseline = false;
+  var lastSeenRefreshToken = '';
 
   function apiCall(endpoint, method, body) {
     return fetch(API_BASE + endpoint, {
@@ -10892,6 +11063,8 @@ $(if($ListenerPort -gt 0){
     var excludeComp = (document.getElementById('wIncludeCompleted')||{}).checked || false;
     var incComp = !excludeComp;
     var sinceDate = (document.getElementById('wSinceDate')||{}).value || '';
+    pendingBatchSelection = batch || '';
+    pendingMailboxFilter = mailbox || '';
     setDot('stale');
     apiCall('/api/switch','POST',{
       batch: batch, mailbox: mailbox, includeCompleted: incComp, sincedate: sinceDate
@@ -10903,6 +11076,11 @@ $(if($ListenerPort -gt 0){
   window.apiSwitchAll = function() {
     var excludeComp = (document.getElementById('wIncludeCompleted')||{}).checked || false;
     var incComp = !excludeComp;
+    pendingBatchSelection = '';
+    pendingMailboxFilter = '';
+    var mailboxInput = document.getElementById('wMailboxInput');
+    if (mailboxInput) mailboxInput.value = '';
+    applyBatchSelectionFromCsv('');
     setDot('stale');
     apiCall('/api/switch','POST',{batch:'', mailbox:'', includeCompleted: incComp})
       .then(function(){ nextRefreshAt = Date.now() + 2000; })
@@ -10941,6 +11119,17 @@ $(if($ListenerPort -gt 0){
       setText('wIter',  data.iteration || '--');
       setText('wCount', data.mailboxCount || '--');
       setText('wScope', data.currentScope || 'All');
+      var refreshToken = String(data.lastRefresh || '') + '|' + String(data.iteration || '');
+      if (!hasStatusBaseline) {
+        hasStatusBaseline = true;
+        lastSeenRefreshToken = refreshToken;
+      } else if (!data.isRefreshing && refreshToken && refreshToken !== lastSeenRefreshToken) {
+        lastSeenRefreshToken = refreshToken;
+        setTimeout(function() {
+          try { window.location.reload(); } catch (_) {}
+        }, 400);
+        return;
+      }
       var pausedRow = document.getElementById('wPausedRow');
       if (pausedRow) pausedRow.style.display = data.isPaused ? '' : 'none';
 
@@ -10979,6 +11168,9 @@ $(if($ListenerPort -gt 0){
         container.appendChild(label);
       });
       updateBatchLabel();
+      if (pendingBatchSelection !== null) {
+        applyBatchSelectionFromCsv(pendingBatchSelection);
+      }
     }).catch(function(){});
   }
 
@@ -11028,6 +11220,24 @@ $(if($ListenerPort -gt 0){
     } else {
       label.textContent = checkboxes.length + ' batches selected';
     }
+  }
+
+  function applyBatchSelectionFromCsv(csv) {
+    var checkboxes = document.querySelectorAll('.batch-cb');
+    if (!checkboxes || !checkboxes.length) return;
+    var selected = {};
+    (String(csv || '').split(',')).forEach(function(raw) {
+      var name = String(raw || '').trim();
+      if (name) selected[name] = true;
+    });
+    checkboxes.forEach(function(cb) {
+      cb.checked = !!selected[cb.value];
+    });
+    var allCheck = document.getElementById('wBatchAll');
+    if (allCheck) {
+      allCheck.checked = Object.keys(selected).length === 0;
+    }
+    updateBatchLabel();
   }
 
   // Get selected batches as comma-separated string
@@ -11176,20 +11386,32 @@ $(if($ListenerPort -gt 0){
 
       // Sync since date
       var sinceDateInput = document.getElementById('wSinceDate');
-      if (sinceDateInput && data.currentSinceDate) {
-        sinceDateInput.value = data.currentSinceDate;
+      if (sinceDateInput) {
+        sinceDateInput.value = data.currentSinceDate || '';
       }
 
       // Sync status filter and reapply filters
       var statusFilterSelect = document.getElementById('wStatusFilter');
       if (statusFilterSelect) {
-        if (data.currentStatusFilter) {
-          statusFilterSelect.value = data.currentStatusFilter;
-        }
+        statusFilterSelect.value = data.currentStatusFilter || '';
         // Reapply filters after sync to ensure status filter is applied
         if (typeof applyFilters === 'function') {
           applyFilters();
         }
+      }
+
+      // Hydrate mailbox + batch selections once per page load from server state.
+      if (!panelHydrated) {
+        if (typeof data.currentMailboxFilter !== 'undefined') {
+          pendingMailboxFilter = data.currentMailboxFilter || '';
+          var mailboxInput = document.getElementById('wMailboxInput');
+          if (mailboxInput) mailboxInput.value = pendingMailboxFilter;
+        }
+        if (typeof data.currentBatchSelection !== 'undefined') {
+          pendingBatchSelection = data.currentBatchSelection || '';
+          applyBatchSelectionFromCsv(pendingBatchSelection);
+        }
+        panelHydrated = true;
       }
 
       // Sync paused state
@@ -12304,6 +12526,50 @@ function mrsApiUrl(endpoint) {
   }
   window.mrsResetList = mrsResetList;
 
+  function mrsIsGuid(value) {
+    var s = String(value || '').trim();
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
+  }
+
+  function mrsMailboxKey(item) {
+    var zero = '00000000-0000-0000-0000-000000000000';
+    var alias = String((item && item.Alias) || '').trim();
+    if (alias.indexOf('imported:') === 0) return alias;
+    var ex = String((item && item.ExchangeGuid) || '').trim();
+    if (ex && ex.toLowerCase() !== zero) return ex;
+    var mb = String((item && item.MailboxGuid) || '').trim();
+    if (mb && mb.toLowerCase() !== zero) return mb;
+    var id = String((item && item.Identity) || '').trim();
+    if (id) return id;
+    if (alias) return alias;
+    return String((item && (item.Name || item.DisplayName)) || '').trim();
+  }
+
+  function mrsResolveMailboxKeyFromList(rawKey) {
+    var key = String(rawKey || '').trim();
+    if (!key) return '';
+    if (key.indexOf('imported:') === 0 || mrsIsGuid(key)) return key;
+    var needle = key.toLowerCase();
+    var items = Array.isArray(mrsState.listItems) ? mrsState.listItems : [];
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i] || {};
+      var candidates = [
+        String(it.Alias || '').trim(),
+        String(it.DisplayName || '').trim(),
+        String(it.Name || '').trim(),
+        String(it.Identity || '').trim(),
+        String(it.ExchangeGuid || '').trim(),
+        String(it.MailboxGuid || '').trim()
+      ];
+      for (var j = 0; j < candidates.length; j++) {
+        if (candidates[j] && candidates[j].toLowerCase() === needle) {
+          return mrsMailboxKey(it) || key;
+        }
+      }
+    }
+    return key;
+  }
+
   function mrsRenderList(items) {
     var tbody = document.getElementById('mrs-move-request-tbody');
     var count = document.getElementById('mrs-list-count');
@@ -12317,13 +12583,13 @@ function mrsApiUrl(endpoint) {
     }
     var rows = items.map(function(item) {
       var col = mrsStatusColor(item.Status);
-      var badge = '<span style="background:' + col + ';color:#fff;padding:1px 6px;border-radius:8px;font-size:.68rem;white-space:nowrap">' + (item.Status || '—') + '</span>';
+      var badge = '<span style="background:' + col + ';color:#fff;padding:1px 6px;border-radius:8px;font-size:.68rem;white-space:nowrap">' + (item.Status || '-') + '</span>';
       var name  = (item.DisplayName || item.Name || item.Alias || '').replace(/</g,'&lt;');
       var batch = (item.BatchName || '').replace(/^MigrationService:/i,'').replace(/</g,'&lt;');
-      var aliasRaw = String(item.Alias || '');
-      var aliasEnc = encodeURIComponent(aliasRaw);
-      var rowId    = mrsAliasRowId(aliasRaw);
-      return '<tr style="cursor:pointer;border-bottom:1px solid #f1f5f9" onclick="mrsSelectMailbox(decodeURIComponent(\'' + aliasEnc + '\'))" id="' + rowId + '">' +
+      var keyRaw = mrsMailboxKey(item);
+      var keyEnc = encodeURIComponent(keyRaw);
+      var rowId    = mrsAliasRowId(keyRaw);
+      return '<tr style="cursor:pointer;border-bottom:1px solid #f1f5f9" onclick="mrsSelectMailbox(decodeURIComponent(\'' + keyEnc + '\'))" id="' + rowId + '">' +
              '<td style="padding:5px 8px;font-size:.74rem;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + name + '">' + name + '</td>' +
              '<td style="padding:5px 8px">' + badge + '</td>' +
              '<td style="padding:5px 8px;font-size:.72rem;color:#64748b;max-width:90px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + batch + '">' + batch + '</td>' +
@@ -12433,6 +12699,7 @@ function mrsApiUrl(endpoint) {
     var forceRefresh = !!options.forceRefresh;
     var preserveSelection = !!options.preserveSelection;
     var cacheOnly = !!options.cacheOnly;
+    alias = mrsResolveMailboxKeyFromList(alias);
     var selectToken = ++mrsState.selectToken;
     console.log('[MRS] mrsSelectMailbox:', alias, 'forceRefresh=', forceRefresh, 'preferCache=', preferCache, 'cacheOnly=', cacheOnly);
     // Highlight selected row
@@ -13237,7 +13504,7 @@ function mrsApiUrl(endpoint) {
       String(codeValue || ''),
       String(msgValue || '')
     ].join(' ').toLowerCase();
-    if (/transient|timeout|throttl|temporar|retry|backoff/.test(hay)) return false;
+    if (/transient|timeout|Throttle|temporar|retry|backoff/.test(hay)) return false;
     if (/permanent|notfound|corrupt|invalid|cannot|unsupported|forbidden|denied/.test(hay)) return true;
     return false;
   }
@@ -13955,6 +14222,8 @@ function Start-WatchListener {
                             iteration    = [int]$State['Iteration']
                             mailboxCount = [int]$State['MailboxCount']
                             currentScope = "$($State['CurrentScope'])"
+                            currentBatchSelection = "$($State['CurrentBatchSelection'])"
+                            currentMailboxFilter = "$($State['CurrentMailboxFilter'])"
                             currentSinceDate = "$($State['CurrentSinceDate'])"
                             currentStatusFilter = "$($State['CurrentStatusFilter'])"
                             isRefreshing = [bool]$State['IsRefreshing']
@@ -14428,7 +14697,10 @@ function Start-WatchListener {
                                 $searchItems = @($searchItems | Where-Object {
                                     ("$($_.Name)".ToLower()      -like "*$sv*") -or
                                     ("$($_.Alias)".ToLower()     -like "*$sv*") -or
-                                    ("$($_.BatchName)".ToLower() -like "*$sv*")
+                                    ("$($_.Identity)".ToLower()  -like "*$sv*") -or
+                                    ("$($_.BatchName)".ToLower() -like "*$sv*") -or
+                                    ("$($_.ExchangeGuid)".ToLower() -like "*$sv*") -or
+                                    ("$($_.MailboxGuid)".ToLower()  -like "*$sv*")
                                 })
                             }
                             $availableStatuses = @(
@@ -14852,6 +15124,9 @@ function Start-WatchListener {
                     # Send response
                     $resp.ContentType = $contentType
                     $resp.Headers.Add('Access-Control-Allow-Origin', '*')
+                    $resp.Headers.Add('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
+                    $resp.Headers.Add('Pragma', 'no-cache')
+                    $resp.Headers.Add('Expires', '0')
                     $resp.ContentLength64 = $responseBytes.Length
                     $resp.OutputStream.Write($responseBytes, 0, $responseBytes.Length)
                 } catch {
@@ -15008,6 +15283,8 @@ function Invoke-MigrationReport {
     else {
         # ── LIVE MODE — retrieve from EXO ────────────────────────────────────
 
+
+
         # Validate ExportDetailXml dependency
         if ($ExportDetailXml -and -not $IncludeDetailReport) {
             Write-Console "-ExportDetailXml requires -IncludeDetailReport. ExportDetailXml will be skipped." -Level WARN
@@ -15132,9 +15409,11 @@ function Invoke-MigrationReport {
             Write-Host ("     * {0,-35} GUID: {1}" -f $_.DisplayName, $_.GuidUsed) -ForegroundColor Yellow
             Write-Host ("       Error: {0}" -f $_.Error) -ForegroundColor DarkYellow
         }
-        $skippedCsv = Join-Path $ReportPath "$($ReportName)_SkippedMailboxes.csv"
-        $failedMbx | Export-Csv -Path $skippedCsv -NoTypeInformation -Force
-        Write-Console "Skipped mailboxes exported: $skippedCsv" -Level WARN
+        if (-not $SkipCsv) {
+            $skippedCsv = Join-Path $ReportPath "$($ReportName)_SkippedMailboxes.csv"
+            $failedMbx | Export-Csv -Path $skippedCsv -NoTypeInformation -Force
+            Write-Console "Skipped mailboxes exported: $skippedCsv" -Level WARN
+        }
     }
 
     # Step 6 – Export reports
@@ -15157,8 +15436,16 @@ function Invoke-MigrationReport {
 
 #── Auto-run when executed directly (not dot-sourced) ────────────────────────
 if ($MyInvocation.InvocationName -ne '.') {
+    if ($WatchMode -and $PSBoundParameters.ContainsKey('ExportDetailXml')) {
+        Write-Console "-ExportDetailXml cannot be used with -WatchMode. Use UI export when needed." -Level Error
+        return
+    }
+    if ($WatchMode -and $PSBoundParameters.ContainsKey('SkipCsv')) {
+        Write-Console "-SkipCsv cannot be used with -WatchMode. Watch mode suppresses CSV generation automatically." -Level Error
+        return
+    }
 
-    # Build invoke params once — reused in watch loop
+    # Build invoke params once - reused in watch loop
     if ($PSCmdlet.ParameterSetName -eq 'FromXml') {
         # Offline replay mode
         $invokeParams = @{
@@ -15182,14 +15469,15 @@ if ($MyInvocation.InvocationName -ne '.') {
             BatchSize     = $BatchSize
             Percentile    = $Percentile
             MinSizeGBForScoring = $MinSizeGBForScoring
-            IncludeCompleted = $true
+            IncludeCompleted = if ($PSBoundParameters.ContainsKey('IncludeCompleted')) { [bool]$IncludeCompleted } else { $true }
 
 
         }
         if ($Mailbox)             { $invokeParams.Mailbox             = $Mailbox }
         if ($MigrationBatchName)  { $invokeParams.MigrationBatchName  = $MigrationBatchName }
         if ($SinceDate)           { $invokeParams.SinceDate           = $SinceDate }
-        if ($IncludeCompleted)    { $invokeParams.IncludeCompleted    = $true }
+
+
         if ($IncludeDetailReport) { $invokeParams.IncludeDetailReport = $true }
         if ($ExportDetailXml)     { $invokeParams.ExportDetailXml     = $true }
         if ($SkipHtml)            { $invokeParams.SkipHtml            = $true }
@@ -15202,12 +15490,22 @@ if ($MyInvocation.InvocationName -ne '.') {
         # ── Watch mode — loop until Ctrl+C ───────────────────────────────────
         $invokeParams.WatchMode          = $false  # prevent recursion
         $invokeParams.AutoRefreshSeconds = $RefreshIntervalSeconds
+        # Keep watch mode lightweight: disable CSV/XML file exports (UI can export on-demand).
+        if ($invokeParams.ContainsKey('ExportDetailXml')) { [void]$invokeParams.Remove('ExportDetailXml') }
+        $invokeParams.SkipCsv = $true
+        Write-Console "Watch mode: CSV/XML file exports are disabled; use UI export when needed." -Level Info -NoTimestamp
 
-        # Fixed report name — always overwrite same file
+        # Fixed report name - always overwrite same file
         $baseName  = ($invokeParams.ReportName -replace '_\d{8}_\d{6}$','')
         $watchName = "${baseName}_Watch"
         $invokeParams.ReportName = $watchName
         $reportFile = Join-Path $ReportPath "${watchName}_Report.html"
+        $hasExplicitScope =
+            $PSBoundParameters.ContainsKey('Mailbox') -or
+            $PSBoundParameters.ContainsKey('MigrationBatchName') -or
+            $PSBoundParameters.ContainsKey('SinceDate') -or
+            ($PSBoundParameters.ContainsKey('StatusFilter') -and $StatusFilter -ne 'All')
+        $deferInitialTenantFetch = -not $hasExplicitScope
 
         # ── Alert configuration ─────────────────────────────────────────────────
         $alertConfig = @{
@@ -15279,8 +15577,10 @@ if ($MyInvocation.InvocationName -ne '.') {
             MailboxCount  = 0
             IsRefreshing  = $false
             CurrentScope  = if ($MigrationBatchName) { $MigrationBatchName } elseif ($Mailbox) { $Mailbox -join ',' } else { 'All' }
+            CurrentBatchSelection = if ($MigrationBatchName) { "$MigrationBatchName" } else { '' }
+            CurrentMailboxFilter = if ($Mailbox) { $Mailbox -join ',' } else { '' }
             CurrentSinceDate = if ($SinceDate) { $SinceDate.ToString('yyyy-MM-dd') } else { '' }
-            CurrentStatusFilter = ''
+            CurrentStatusFilter = if ($StatusFilter -and $StatusFilter -ne 'All') { "$StatusFilter" } else { '' }
             Interval      = $RefreshIntervalSeconds
             NextIn        = $RefreshIntervalSeconds
             Batches       = @()
@@ -15288,7 +15588,7 @@ if ($MyInvocation.InvocationName -ne '.') {
             # New fields for enhanced dashboard
             RetryQueue    = 0
             AutoRetryEnabled = $AutoRetryFailed.IsPresent
-            IncludeCompleted = $true
+            IncludeCompleted = [bool]$invokeParams.IncludeCompleted
             Throughput    = 0
             NextScheduledReport = $null
             LastAlert     = $null
@@ -15296,6 +15596,8 @@ if ($MyInvocation.InvocationName -ne '.') {
             IncludeDetailInScheduled = $IncludeDetailInScheduledReport.IsPresent
             IsPaused      = $false
             RenderFromCacheNext = $false
+            DeferredInitialFetch = $deferInitialTenantFetch
+            DeferNoticeShown = $false
             AlertConfig   = @{
                 smtpServer = $SmtpServer
                 smtpPort = $SmtpPort
@@ -15317,28 +15619,64 @@ if ($MyInvocation.InvocationName -ne '.') {
 
         # ── Start HTTP listener in background runspace ────────────────────────
         $listenerJob = $null
+        $listenerStarted = $false
+        $activeListenerPort = 0
         $apiUrl = "http://127.0.0.1:$ListenerPort"
-        try {
-            $listenerJob = Start-WatchListener -Port $ListenerPort -State $watchState
-            # Wait up to 3s for listener to be ready
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
-            while (-not $watchState['ListenerReady'] -and $sw.ElapsedMilliseconds -lt 3000) {
-                Start-Sleep -Milliseconds 100
+        $portsToTry = [System.Collections.ArrayList]::new()
+        [void]$portsToTry.Add([int]$ListenerPort)
+        $maxFallbackPort = [Math]::Min([int]$ListenerPort + 10, 65535)
+        for ($p = [int]$ListenerPort + 1; $p -le $maxFallbackPort; $p++) {
+            [void]$portsToTry.Add($p)
+        }
+
+        foreach ($portCandidate in @($portsToTry)) {
+            $candidateJob = $null
+            $watchState['ListenerReady'] = $false
+            $watchState['ListenerError'] = ''
+            $watchState['ListenerUrl'] = ''
+            try {
+                $candidateJob = Start-WatchListener -Port $portCandidate -State $watchState
+                # Wait up to 3s for listener to be ready
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                while (-not $watchState['ListenerReady'] -and $sw.ElapsedMilliseconds -lt 3000) {
+                    Start-Sleep -Milliseconds 100
+                }
+                if ($watchState['ListenerReady']) {
+                    $listenerJob = $candidateJob
+                    $activeListenerPort = [int]$portCandidate
+                    $listenerStarted = $true
+                    if ($watchState['ListenerUrl']) {
+                        $apiUrl = "$($watchState['ListenerUrl'])"
+                    } else {
+                        $apiUrl = "http://127.0.0.1:$activeListenerPort"
+                    }
+                    if ($activeListenerPort -ne [int]$ListenerPort) {
+                        Write-Console "API listener ready on fallback port $activeListenerPort (requested $ListenerPort): $apiUrl" -Level Warn -NoTimestamp
+                    } else {
+                        Write-Console "API listener ready: $apiUrl" -Level Success -NoTimestamp
+                    }
+                    break
+                }
+                $startErr = if ($watchState['ListenerError']) { "$($watchState['ListenerError'])" } else { 'unknown startup error' }
+                Write-Console "API listener did not start on port ${portCandidate}: $startErr" -Level Warn -NoTimestamp
+            } catch {
+                Write-Console "Could not start API listener on port ${portCandidate}: $($_.Exception.Message)" -Level Warn -NoTimestamp
+            } finally {
+                if (-not $listenerStarted -and $candidateJob) {
+                    try { $candidateJob.PS.Stop() } catch {}
+                    try { $candidateJob.Runspace.Close() } catch {}
+                }
             }
-            if ($watchState['ListenerReady']) {
-                if ($watchState['ListenerUrl']) { $apiUrl = "$($watchState['ListenerUrl'])" }
-                Write-Console "API listener ready: $apiUrl" -Level Success -NoTimestamp
-            } else {
-                Write-Console "API listener failed to start (port $ListenerPort may be in use). Watch mode will still work without browser API." -Level Warn -NoTimestamp
-                if ($watchState['ListenerError']) { Write-Console "Error: $($watchState['ListenerError'])" -Level Warn -NoTimestamp }
-            }
-        } catch {
-            Write-Console "Could not start API listener: $_" -Level Warn -NoTimestamp
+        }
+
+        if (-not $listenerStarted) {
+            Write-Console "API listener failed to start on ports $ListenerPort-$maxFallbackPort. Watch mode will still work without browser API." -Level Warn -NoTimestamp
+            $apiUrl = 'unavailable'
         }
 
         # Pass API endpoint into HTML for the control panel JS when listener is available.
         if ($watchState['ListenerReady']) {
-            $invokeParams.ListenerPort    = $ListenerPort
+            $invokeParams.ListenerPort    = if ($activeListenerPort -gt 0) { $activeListenerPort } else { $ListenerPort }
             $invokeParams.ListenerBaseUrl = $apiUrl
         } else {
             $invokeParams.Remove('ListenerPort')
@@ -15366,9 +15704,11 @@ if ($MyInvocation.InvocationName -ne '.') {
         } catch {
             Write-Console "Could not pre-load batch list: $_" -Level Warn -NoTimestamp
         }
-
-        # ── Initial batch stats cache (no CachedMailboxes yet — rate data on next cycle) ──
-        Invoke-BatchStatsRefresh -WatchState $watchState
+        # Startup light mode: skip heavy batch stats preload; fetch on demand from UI.
+        Write-Console "Startup in light mode: deferring batch stats (IncludeReport/DiagnosticInfo) until requested." -Level Info -NoTimestamp
+        if ($deferInitialTenantFetch) {
+            Write-Console "Startup in light mode: skipping automatic tenant-wide mailbox stats fetch (on-demand via UI Refresh/Scope)." -Level Info -NoTimestamp
+        }
 
         $iteration = 0
 
@@ -15398,6 +15738,7 @@ if ($MyInvocation.InvocationName -ne '.') {
                             elseif ($cmd.Action -eq 'refresh') {
                                 Write-Console "Manual refresh requested (overriding pause)" -Level API
                                 $watchState['IsPaused'] = $false
+                                $watchState['DeferredInitialFetch'] = $false
                                 break
                             }
                             elseif ($cmd.Action -eq 'UpdatePaused' -and $cmd.Paused) {
@@ -15435,41 +15776,112 @@ if ($MyInvocation.InvocationName -ne '.') {
                 $renderFromCache = [bool]$watchState['RenderFromCacheNext']
                 $watchState['RenderFromCacheNext'] = $false
                 $usedCacheRender = $false
+                $didDataRefresh = $false
+                $skipDataRefreshThisIteration = $false
 
-                if ($renderFromCache -and $watchState['CachedRawStats'] -and @($watchState['CachedRawStats']).Count -gt 0) {
-                    $cacheInvokeParams = @{
-                        CachedRawStats      = @($watchState['CachedRawStats'])
-                        StatusFilter        = if ($invokeParams.ContainsKey('StatusFilter')) { $invokeParams.StatusFilter } else { 'All' }
-                        IncludeCompleted    = [bool]($invokeParams.ContainsKey('IncludeCompleted') -and $invokeParams.IncludeCompleted)
-                        Percentile          = if ($invokeParams.ContainsKey('Percentile')) { [int]$invokeParams.Percentile } else { 90 }
-                        MinSizeGBForScoring = if ($invokeParams.ContainsKey('MinSizeGBForScoring')) { [double]$invokeParams.MinSizeGBForScoring } else { 0.1 }
-                        ReportPath          = $invokeParams.ReportPath
-                        ReportName          = $invokeParams.ReportName
-                        AutoRefreshSeconds  = if ($invokeParams.ContainsKey('AutoRefreshSeconds')) { [int]$invokeParams.AutoRefreshSeconds } else { 0 }
-                        ListenerPort        = if ($invokeParams.ContainsKey('ListenerPort')) { [int]$invokeParams.ListenerPort } else { 0 }
-                        ListenerBaseUrl     = if ($invokeParams.ContainsKey('ListenerBaseUrl')) { "$($invokeParams.ListenerBaseUrl)" } else { '' }
-                        SkipHtml            = [bool]($invokeParams.ContainsKey('SkipHtml') -and $invokeParams.SkipHtml)
-                        SkipCsv             = [bool]($invokeParams.ContainsKey('SkipCsv') -and $invokeParams.SkipCsv)
-                    }
-                    if ($invokeParams.ContainsKey('Mailbox'))            { $cacheInvokeParams['Mailbox']            = $invokeParams.Mailbox }
-                    if ($invokeParams.ContainsKey('MigrationBatchName')) { $cacheInvokeParams['MigrationBatchName'] = $invokeParams.MigrationBatchName }
-                    if ($invokeParams.ContainsKey('SinceDate')) {
-                        $sinceVal = $invokeParams['SinceDate']
-                        if ($null -ne $sinceVal -and "$sinceVal".Trim() -ne '') {
-                            try { $cacheInvokeParams['SinceDate'] = [datetime]$sinceVal } catch {}
+                $result = $null
+                $deferTenantFetchNow = [bool]$watchState['DeferredInitialFetch']
+                $bootstrapReportExists = Test-Path $reportFile
+                if ($deferTenantFetchNow -and $bootstrapReportExists) {
+                    $skipDataRefreshThisIteration = $true
+                    if (-not [bool]$watchState['DeferNoticeShown']) {
+                        try {
+                            if (-not ([bool]($invokeParams.ContainsKey('SkipHtml') -and $invokeParams.SkipHtml))) {
+                                $bootstrapPercentile = if ($invokeParams.ContainsKey('Percentile')) { [int]$invokeParams.Percentile } else { 90 }
+                                $bootstrapMinSize = if ($invokeParams.ContainsKey('MinSizeGBForScoring')) { [double]$invokeParams.MinSizeGBForScoring } else { 0.1 }
+                                $bootstrapAutoRefresh = if ($invokeParams.ContainsKey('AutoRefreshSeconds')) { [int]$invokeParams.AutoRefreshSeconds } else { 0 }
+                                $bootstrapListenerPort = if ($invokeParams.ContainsKey('ListenerPort')) { [int]$invokeParams.ListenerPort } else { 0 }
+                                $bootstrapListenerBase = if ($invokeParams.ContainsKey('ListenerBaseUrl')) { "$($invokeParams.ListenerBaseUrl)" } else { '' }
+                                $bootstrapData = New-WatchBootstrapReportData `
+                                    -BatchName $invokeParams.ReportName `
+                                    -Percentile $bootstrapPercentile `
+                                    -MinSizeGBForScoring $bootstrapMinSize
+                                Export-HtmlReport `
+                                    -Summary $bootstrapData.Summary `
+                                    -Health $bootstrapData.Health `
+                                    -Path $invokeParams.ReportPath `
+                                    -AutoRefreshSeconds $bootstrapAutoRefresh `
+                                    -ListenerPort $bootstrapListenerPort `
+                                    -ListenerBaseUrl $bootstrapListenerBase | Out-Null
+                            }
+                        } catch {
+                            Write-Console "Failed to refresh bootstrap shell: $($_.Exception.Message)" -Level Warn -NoTimestamp
                         }
+                        Write-Console "Light mode: tenant-wide mailbox stats fetch is deferred. Use Refresh Now or change scope in UI." -Level Info -NoTimestamp
+                        $watchState['DeferNoticeShown'] = $true
                     }
-
-                    $result = Invoke-MigrationReportFromCache @cacheInvokeParams
-                    $usedCacheRender = $true
                 } else {
-                    if ($renderFromCache) {
-                        Write-Console "Cached data is not available yet - falling back to live Exchange refresh." -Level Warn -NoTimestamp
+                    if ($deferTenantFetchNow -and -not $bootstrapReportExists) {
+                        Write-Console "Light mode: no existing watch report file found. Generating bootstrap report shell (no Exchange fetch)." -Level Warn -NoTimestamp
+                        try {
+                            if (-not ([bool]($invokeParams.ContainsKey('SkipHtml') -and $invokeParams.SkipHtml))) {
+                                $bootstrapPercentile = if ($invokeParams.ContainsKey('Percentile')) { [int]$invokeParams.Percentile } else { 90 }
+                                $bootstrapMinSize = if ($invokeParams.ContainsKey('MinSizeGBForScoring')) { [double]$invokeParams.MinSizeGBForScoring } else { 0.1 }
+                                $bootstrapAutoRefresh = if ($invokeParams.ContainsKey('AutoRefreshSeconds')) { [int]$invokeParams.AutoRefreshSeconds } else { 0 }
+                                $bootstrapListenerPort = if ($invokeParams.ContainsKey('ListenerPort')) { [int]$invokeParams.ListenerPort } else { 0 }
+                                $bootstrapListenerBase = if ($invokeParams.ContainsKey('ListenerBaseUrl')) { "$($invokeParams.ListenerBaseUrl)" } else { '' }
+                                $bootstrapData = New-WatchBootstrapReportData `
+                                    -BatchName $invokeParams.ReportName `
+                                    -Percentile $bootstrapPercentile `
+                                    -MinSizeGBForScoring $bootstrapMinSize
+
+                                Export-HtmlReport `
+                                    -Summary $bootstrapData.Summary `
+                                    -Health $bootstrapData.Health `
+                                    -Path $invokeParams.ReportPath `
+                                    -AutoRefreshSeconds $bootstrapAutoRefresh `
+                                    -ListenerPort $bootstrapListenerPort `
+                                    -ListenerBaseUrl $bootstrapListenerBase | Out-Null
+
+                                Write-Console "Light mode bootstrap report generated. Waiting for UI-triggered refresh." -Level Info -NoTimestamp
+                            } else {
+                                Write-Console "Light mode bootstrap HTML skipped because -SkipHtml is enabled." -Level Warn -NoTimestamp
+                            }
+                        } catch {
+                            Write-Console "Failed to generate bootstrap report shell: $($_.Exception.Message)" -Level Warn -NoTimestamp
+                        }
+                        $watchState['DeferNoticeShown'] = $true
+                        $skipDataRefreshThisIteration = $true
                     }
-                    $result = Invoke-MigrationReport @invokeParams
+                    if (-not $skipDataRefreshThisIteration -and $renderFromCache -and $watchState['CachedRawStats'] -and @($watchState['CachedRawStats']).Count -gt 0) {
+                        $cacheInvokeParams = @{
+                            CachedRawStats      = @($watchState['CachedRawStats'])
+                            StatusFilter        = if ($invokeParams.ContainsKey('StatusFilter')) { $invokeParams.StatusFilter } else { 'All' }
+                            IncludeCompleted    = [bool]($invokeParams.ContainsKey('IncludeCompleted') -and $invokeParams.IncludeCompleted)
+                            Percentile          = if ($invokeParams.ContainsKey('Percentile')) { [int]$invokeParams.Percentile } else { 90 }
+                            MinSizeGBForScoring = if ($invokeParams.ContainsKey('MinSizeGBForScoring')) { [double]$invokeParams.MinSizeGBForScoring } else { 0.1 }
+                            ReportPath          = $invokeParams.ReportPath
+                            ReportName          = $invokeParams.ReportName
+                            AutoRefreshSeconds  = if ($invokeParams.ContainsKey('AutoRefreshSeconds')) { [int]$invokeParams.AutoRefreshSeconds } else { 0 }
+                            ListenerPort        = if ($invokeParams.ContainsKey('ListenerPort')) { [int]$invokeParams.ListenerPort } else { 0 }
+                            ListenerBaseUrl     = if ($invokeParams.ContainsKey('ListenerBaseUrl')) { "$($invokeParams.ListenerBaseUrl)" } else { '' }
+                            SkipHtml            = [bool]($invokeParams.ContainsKey('SkipHtml') -and $invokeParams.SkipHtml)
+                            SkipCsv             = [bool]($invokeParams.ContainsKey('SkipCsv') -and $invokeParams.SkipCsv)
+                        }
+                        if ($invokeParams.ContainsKey('Mailbox'))            { $cacheInvokeParams['Mailbox']            = $invokeParams.Mailbox }
+                        if ($invokeParams.ContainsKey('MigrationBatchName')) { $cacheInvokeParams['MigrationBatchName'] = $invokeParams.MigrationBatchName }
+                        if ($invokeParams.ContainsKey('SinceDate')) {
+                            $sinceVal = $invokeParams['SinceDate']
+                            if ($null -ne $sinceVal -and "$sinceVal".Trim() -ne '') {
+                                try { $cacheInvokeParams['SinceDate'] = [datetime]$sinceVal } catch {}
+                            }
+                        }
+
+                        $result = Invoke-MigrationReportFromCache @cacheInvokeParams
+                        $usedCacheRender = $true
+                        $didDataRefresh = $true
+                    } elseif (-not $skipDataRefreshThisIteration) {
+                        if ($renderFromCache) {
+                            Write-Console "Cached data is not available yet - falling back to live Exchange refresh." -Level Warn -NoTimestamp
+                        }
+                        $result = Invoke-MigrationReport @invokeParams
+                        $didDataRefresh = $true
+                    }
                 }
 
-                $watchState['LastRefresh']  = Get-Date
+                if ($didDataRefresh) {
+                    $watchState['LastRefresh'] = Get-Date
+                }
                 $watchState['IsRefreshing'] = $false
                 if ($result) {
                     $watchState['MailboxCount'] = $result.MailboxCount
@@ -15772,6 +16184,7 @@ if ($MyInvocation.InvocationName -ne '.') {
                         Write-Console "Command received: $($cmd.Action)" -Level API
 
                         if ($cmd.Action -eq 'switch') {
+                            $watchState['DeferredInitialFetch'] = $false
                             # Update invoke params based on what was requested
                             if ($cmd.Batch -and $cmd.Batch -ne '') {
                                 $invokeParams.Remove('Mailbox')
@@ -15780,22 +16193,30 @@ if ($MyInvocation.InvocationName -ne '.') {
                                 if ($batchList.Count -eq 1) {
                                     $invokeParams.MigrationBatchName = $batchList[0]
                                     $watchState['CurrentScope'] = "Batch: $($batchList[0])"
+                                    $watchState['CurrentBatchSelection'] = "$($batchList[0])"
+                                    $watchState['CurrentMailboxFilter'] = ''
                                     Write-Console "Scope changed to Batch: $($batchList[0])" -Level API -NoTimestamp
                                 } else {
                                     $invokeParams.MigrationBatchName = $batchList -join ','
                                     $watchState['CurrentScope'] = "Batches: $($batchList.Count) selected"
+                                    $watchState['CurrentBatchSelection'] = ($batchList -join ',')
+                                    $watchState['CurrentMailboxFilter'] = ''
                                     Write-Console "Scope changed to $($batchList.Count) batches: $($batchList -join ', ')" -Level API -NoTimestamp
                                 }
                             } elseif ($cmd.Mailbox -and $cmd.Mailbox -ne '') {
                                 $invokeParams.Remove('MigrationBatchName')
                                 $invokeParams.Mailbox = @($cmd.Mailbox -split ',')
                                 $watchState['CurrentScope'] = "Mailbox: $($cmd.Mailbox)"
+                                $watchState['CurrentMailboxFilter'] = "$($cmd.Mailbox)"
+                                $watchState['CurrentBatchSelection'] = ''
                                 Write-Console "Scope changed to Mailbox: $($cmd.Mailbox)" -Level API -NoTimestamp
                             } else {
-                                # All — clear filters
+                                # All - clear filters
                                 $invokeParams.Remove('Mailbox')
                                 $invokeParams.Remove('MigrationBatchName')
                                 $watchState['CurrentScope'] = 'All'
+                                $watchState['CurrentMailboxFilter'] = ''
+                                $watchState['CurrentBatchSelection'] = ''
                                 Write-Console "Scope changed to All" -Level API -NoTimestamp
                             }
                             if ($null -ne $cmd.IncludeCompleted) {
@@ -15817,6 +16238,7 @@ if ($MyInvocation.InvocationName -ne '.') {
                             Write-Console "Applying scope/date filters from cache. Use 'Refresh Now' to fetch latest Exchange data." -Level API -NoTimestamp
                         }
                         elseif ($cmd.Action -eq 'refresh') {
+                            $watchState['DeferredInitialFetch'] = $false
                             $watchState['RenderFromCacheNext'] = $false
                             Write-Console "Manual refresh requested" -Level API -NoTimestamp
                         }
@@ -15898,13 +16320,14 @@ if ($MyInvocation.InvocationName -ne '.') {
                             }
                         }
                         elseif ($cmd.Action -eq 'UpdateStatusFilter') {
+                            $watchState['DeferredInitialFetch'] = $false
                             $newFilter = $cmd.StatusFilter
                             if ($newFilter -and $newFilter -ne '' -and $newFilter -ne 'All') {
                                 $invokeParams.StatusFilter = $newFilter
                             } else {
                                 $invokeParams.StatusFilter = 'All'
                             }
-                            $watchState['CurrentStatusFilter'] = $invokeParams.StatusFilter
+                            $watchState['CurrentStatusFilter'] = if ($invokeParams.StatusFilter -eq 'All') { '' } else { $invokeParams.StatusFilter }
                             $watchState['RenderFromCacheNext'] = $true
                             Write-Console "Status Filter changed to $($invokeParams.StatusFilter)" -Level API -NoTimestamp
                         }
