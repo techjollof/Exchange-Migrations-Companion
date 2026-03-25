@@ -1939,6 +1939,51 @@ function Resolve-MRSIdentity {
     return $Alias
 }
 
+function Resolve-MRSDisplayName {
+    param([hashtable]$WatchState, [string]$Alias)
+    $key = "$Alias".Trim()
+    if ([string]::IsNullOrWhiteSpace($key)) { return $Alias }
+    if ($key -like 'imported:*') {
+        $importStore = $WatchState['MRSImportedItems']
+        if ($importStore -is [System.Collections.IDictionary] -and $importStore.Contains($key)) {
+            $imp = $importStore[$key]
+            $label = "$($imp.DisplayName)".Trim()
+            if (-not $label) { $label = "$($imp.Name)".Trim() }
+            if (-not $label) { $label = "$($imp.Alias)".Trim() }
+            if ($label) { return $label }
+        }
+        return ($key -replace '^imported:','')
+    }
+
+    $cached = @($WatchState['MRSMoveRequestCache'])
+    if ($cached.Count -gt 0) {
+        $matches = @($cached | Where-Object {
+            $al = "$($_.Alias)".Trim()
+            $dn = "$($_.DisplayName)".Trim()
+            $nm = "$($_.Name)".Trim()
+            $id = "$($_.Identity)".Trim()
+            $ex = "$($_.ExchangeGuid)".Trim()
+            $mb = "$($_.MailboxGuid)".Trim()
+            ($al -and $al -ieq $key) -or
+            ($dn -and $dn -ieq $key) -or
+            ($nm -and $nm -ieq $key) -or
+            ($id -and $id -ieq $key) -or
+            ($ex -and $ex -ieq $key) -or
+            ($mb -and $mb -ieq $key)
+        })
+        if ($matches.Count -gt 0) {
+            $best = @($matches | Select-Object -First 1)[0]
+            if ($best) {
+                $label = "$($best.DisplayName)".Trim()
+                if (-not $label) { $label = "$($best.Name)".Trim() }
+                if (-not $label) { $label = "$($best.Alias)".Trim() }
+                if ($label) { return $label }
+            }
+        }
+    }
+    return $Alias
+}
+
 function Get-MRSProfileSignatureHash {
     param([string]$ProfileSignature)
     if ([string]::IsNullOrWhiteSpace($ProfileSignature)) { return 'default' }
@@ -2000,11 +2045,12 @@ function Invoke-MRSStatisticsRefresh {
         [string]$ProfileSignature
     )
     try {
+        $displayName = Resolve-MRSDisplayName -WatchState $WatchState -Alias $Alias
         # Imported XML entries are already in the cache - no EXO call needed.
         if ($Alias -like 'imported:*') {
             $pendingKey = "MRSImportPending_$Alias"
             if ($WatchState[$pendingKey]) {
-                Write-Console "MRSStatisticsRefresh: '$Alias' import still in progress." -Level Info -NoTimestamp
+                Write-Console "MRSStatisticsRefresh: '$displayName' import still in progress." -Level Info -NoTimestamp
                 return
             }
             $keys = Get-MRSStatsCacheKeys -Alias $Alias -ProfileSignature $ProfileSignature
@@ -2014,9 +2060,9 @@ function Invoke-MRSStatisticsRefresh {
                 $WatchState[$keys.JsonKey] = $legacyJson
                 $WatchState[$keys.TimeKey] = $nowUtc
                 if (-not $WatchState[$keys.LegacyTimeKey]) { $WatchState[$keys.LegacyTimeKey] = $nowUtc }
-                Write-Console "MRSStatisticsRefresh: '$Alias' is imported; refreshed cache timestamp only (profile=$($keys.SignatureHash))." -Level Info -NoTimestamp
+                Write-Console "MRSStatisticsRefresh: '$displayName' is imported; refreshed cache timestamp only (profile=$($keys.SignatureHash))." -Level Info -NoTimestamp
             } else {
-                Write-Console "MRSStatisticsRefresh: '$Alias' imported entry not found in cache." -Level Warn -NoTimestamp
+                Write-Console "MRSStatisticsRefresh: '$displayName' imported entry not found in cache." -Level Warn -NoTimestamp
             }
             return
         }
@@ -2083,16 +2129,16 @@ function Invoke-MRSStatisticsRefresh {
             }
         }
 
-        Write-Console "MRSStatisticsRefresh: $command for '$Alias' (identity='$identity' env=$envKey sig=$(Get-MRSProfileSignatureHash -ProfileSignature $ProfileSignature))." -Level Info -NoTimestamp
+        Write-Console "MRSStatisticsRefresh: $command for '$displayName' (identity='$identity' env=$envKey sig=$(Get-MRSProfileSignatureHash -ProfileSignature $ProfileSignature))." -Level Info -NoTimestamp
         $stats = & $command @invokeParams
         if ($stats -is [System.Collections.IEnumerable] -and $stats -isnot [string]) {
             $arr = @($stats)
             if ($arr.Count -gt 1) {
-                Write-Console "MRSStatisticsRefresh: '$Alias' returned $($arr.Count) records; caching first item." -Level Warn -NoTimestamp
+                Write-Console "MRSStatisticsRefresh: '$displayName' returned $($arr.Count) records; caching first item." -Level Warn -NoTimestamp
             }
             $stats = if ($arr.Count -gt 0) { $arr[0] } else { $null }
         }
-        if ($null -eq $stats) { throw "$command returned null for '$Alias'" }
+        if ($null -eq $stats) { throw "$command returned null for '$displayName'" }
         $json = ConvertTo-MRSStatisticsJson -Stats $stats
         $keys = Get-MRSStatsCacheKeys -Alias $Alias -ProfileSignature $ProfileSignature
         $nowUtc = (Get-Date).ToUniversalTime().ToString('o')
@@ -2103,9 +2149,10 @@ function Invoke-MRSStatisticsRefresh {
             $WatchState[$keys.LegacyJsonKey] = $json
             $WatchState[$keys.LegacyTimeKey] = $nowUtc
         }
-        Write-Console "MRSStatisticsRefresh: cached statistics for '$Alias' (profile=$($keys.SignatureHash))." -Level Info -NoTimestamp
+        Write-Console "MRSStatisticsRefresh: cached statistics for '$displayName' (profile=$($keys.SignatureHash))." -Level Info -NoTimestamp
     } catch {
-        Write-Console "MRSStatisticsRefresh failed for '$Alias': $($_.Exception.Message)" -Level Warn -NoTimestamp
+        $displayName = Resolve-MRSDisplayName -WatchState $WatchState -Alias $Alias
+        Write-Console "MRSStatisticsRefresh failed for '$displayName': $($_.Exception.Message)" -Level Warn -NoTimestamp
     }
 }
 
@@ -4708,8 +4755,43 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
 <title>Migration Report – $($Summary.BatchName)</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: 'Segoe UI', system-ui, sans-serif; background: #f8fafc; color: #1e293b; transition: background .3s, color .3s; }
-  .container { max-width: 1300px; margin: 0 auto; padding: 24px; }
+  :root {
+    --bg: #edf3f8;
+    --bg-grad: radial-gradient(1200px 560px at 10% -5%, #dbeafe 0%, rgba(219,234,254,0) 55%),
+               radial-gradient(1000px 540px at 95% 0%, #ccfbf1 0%, rgba(204,251,241,0) 50%),
+               #edf3f8;
+    --surface: #ffffff;
+    --surface-soft: #f7fafc;
+    --line: #d8e1eb;
+    --text: #1f2937;
+    --muted: #5f7288;
+    --brand: #0f766e;
+    --brand-2: #0369a1;
+    --brand-strong: #115e59;
+    --brand-soft: #ccfbf1;
+    --shadow-md: 0 8px 24px rgba(15, 23, 42, 0.09);
+    --shadow-sm: 0 2px 8px rgba(15, 23, 42, 0.06);
+  }
+  body {
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background: var(--bg-grad);
+    color: var(--text);
+    transition: background .3s, color .3s;
+  }
+  .container {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 20px 18px 26px;
+  }
+  body.has-watch-panel .container {
+    --dash-left: 334px;
+    --workspace-w: calc(100vw - var(--dash-left));
+    --target-w: clamp(1180px, calc(100vw - 390px), 1840px);
+    max-width: none;
+    width: min(var(--target-w), var(--workspace-w));
+    margin-left: calc(var(--dash-left) + max(0px, (var(--workspace-w) - min(var(--target-w), var(--workspace-w))) / 2));
+    margin-right: auto;
+  }
 
   /* Dark Mode */
   body.dark-mode { background: #0f172a; color: #e2e8f0; }
@@ -4734,6 +4816,14 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
   body.dark-mode .hc-card { background: #334155; }
   body.dark-mode .hc-metric { color: #e2e8f0; }
   body.dark-mode .dur-label { color: #cbd5e1; }
+  body.dark-mode .main-tab-bar { border-bottom-color:#334155; }
+  body.dark-mode .main-tab { background:#1e293b; border-color:#334155; color:#cbd5e1; }
+  body.dark-mode .main-tab:hover { background:#334155; border-color:#475569; color:#f1f5f9; }
+  body.dark-mode .main-tab.active {
+    background:linear-gradient(135deg,#0f766e 0%,#0369a1 100%);
+    border-color:#14b8a6;
+    color:#ffffff;
+  }
 
   /* Dark mode toggle button */
   .dark-toggle { position: fixed; top: 20px; right: 20px; z-index: 1000; background: #1e293b; color: #f8fafc;
@@ -4743,14 +4833,17 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
   body.dark-mode .dark-toggle { background: #f8fafc; color: #1e293b; }
 
   /* Header */
-  .header { background: linear-gradient(135deg, #1e3a5f 0%, #0f6cbd 100%);
-            color: white; padding: 32px 36px; border-radius: 12px; margin-bottom: 24px; }
+  .header {
+    background: linear-gradient(135deg, #1f3b56 0%, #0f766e 55%, #0c4a6e 100%);
+    color: white; padding: 30px 32px; border-radius: 14px; margin-bottom: 18px;
+    box-shadow: var(--shadow-md);
+  }
   .header h1 { font-size: 1.8rem; font-weight: 700; }
   .header .meta { font-size: 0.85rem; opacity: 0.8; margin-top: 6px; }
 
   /* Score card */
-  .score-card { background: white; border-radius: 12px; box-shadow: 0 1px 4px rgba(0,0,0,.08);
-                padding: 24px 32px; margin-bottom: 20px; display:flex; align-items:center; gap:24px; }
+  .score-card { background: var(--surface); border-radius: 14px; box-shadow: var(--shadow-sm);
+                border: 1px solid var(--line); padding: 22px 26px; margin-bottom: 18px; display:flex; align-items:center; gap:24px; }
   .score-circle { width:90px; height:90px; border-radius:50%; display:flex; flex-direction:column;
                   align-items:center; justify-content:center; font-weight:700;
                   background:$scoreColor; color:white; flex-shrink:0; }
@@ -4760,20 +4853,20 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
   .score-desc  { font-size:0.9rem; color:#64748b; margin-top:4px; }
 
   /* KPI grid */
-  .kpi-grid { display:grid; grid-template-columns:repeat(6,1fr); gap:16px; margin-bottom:20px; }
-  .kpi { background:white; border-radius:12px; padding:18px 20px;
-         box-shadow:0 1px 4px rgba(0,0,0,.06); border-top:4px solid #e2e8f0; }
+  .kpi-grid { display:grid; grid-template-columns:repeat(6, minmax(0, 1fr)); gap:12px; margin-bottom:16px; }
+  .kpi { background:var(--surface); border-radius:12px; padding:15px 16px;
+         box-shadow:var(--shadow-sm); border:1px solid var(--line); border-top:4px solid #dbe4ef; }
   .kpi.blue  { border-color:#3b82f6; }
   .kpi.green { border-color:#22c55e; }
   .kpi.amber { border-color:#f59e0b; }
   .kpi.red   { border-color:#ef4444; }
-  .kpi .label  { font-size:0.75rem; text-transform:uppercase; letter-spacing:.08em; color:#64748b; font-weight:600; }
+  .kpi .label  { font-size:0.72rem; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); font-weight:700; }
   .kpi .value  { font-size:1.6rem; font-weight:700; color:#0f172a; margin-top:4px; }
   .kpi .sub    { font-size:0.78rem; color:#94a3b8; margin-top:2px; }
 
   /* Cards */
-  .card { background:white; border-radius:12px; box-shadow:0 1px 4px rgba(0,0,0,.06); padding:24px; margin-bottom:20px; }
-  .card h2 { font-size:1rem; font-weight:700; color:#0f172a; border-bottom:1px solid #e2e8f0;
+  .card { background:var(--surface); border-radius:14px; box-shadow:var(--shadow-sm); border:1px solid var(--line); padding:20px; margin-bottom:16px; }
+  .card h2 { font-size:1rem; font-weight:700; color:#0f172a; border-bottom:1px solid var(--line);
              padding-bottom:10px; margin-bottom:16px; }
 
 
@@ -4861,17 +4954,21 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
 
   /* ── Main page tabs ── */
   .main-tab-bar {
-    display:flex; gap:4px; margin-bottom:24px;
-    border-bottom:2px solid #e2e8f0; padding-bottom:0;
+    display:flex; flex-wrap:wrap; gap:8px 6px; margin-bottom:16px;
+    border-bottom:1px solid var(--line); padding:0 0 10px;
   }
   .main-tab {
-    padding:10px 22px; font-size:.9rem; font-weight:600; color:#64748b;
-    border:none; background:none; cursor:pointer; border-radius:8px 8px 0 0;
-    border-bottom:3px solid transparent; margin-bottom:-2px;
+    padding:8px 14px; font-size:.84rem; font-weight:700; color:var(--muted);
+    border:1px solid #d9e2ec; background:#f2f6fb; cursor:pointer; border-radius:999px;
     transition:all .15s; white-space:nowrap;
   }
-  .main-tab:hover { color:#1e40af; background:#f1f5f9; }
-  .main-tab.active { color:#1e40af; border-bottom-color:#1e40af; background:#fff; }
+  .main-tab:hover { color:#0f172a; border-color:#b8c7d8; background:#e9f0f7; }
+  .main-tab.active {
+    color:#ffffff;
+    background:linear-gradient(135deg, var(--brand) 0%, var(--brand-2) 100%);
+    border-color:var(--brand-strong);
+    box-shadow:0 2px 10px rgba(15,118,110,.25);
+  }
   .main-panel { display:none; }
   .main-panel.active { display:block; }
 
@@ -4903,16 +5000,16 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
   /* ── Enterprise toolbar ── */
   .ent-toolbar { display:flex; align-items:center; flex-wrap:wrap; gap:8px;
-                 padding:10px 16px; background:#fff; border:1px solid #e2e8f0;
+                 padding:10px 12px; background:#fff; border:1px solid var(--line);
                  border-radius:10px; margin-bottom:16px; }
   .ent-toolbar .tb-group { display:flex; align-items:center; gap:6px; }
   .ent-toolbar .tb-sep { width:1px; height:24px; background:#e2e8f0; margin:0 4px; }
-  .ent-btn { display:inline-flex; align-items:center; gap:5px; padding:6px 13px;
-             border:1px solid #e2e8f0; border-radius:7px; background:#f8fafc;
+  .ent-btn { display:inline-flex; align-items:center; gap:5px; padding:6px 11px;
+             border:1px solid #d9e2ec; border-radius:8px; background:#f7fafc;
              color:#475569; font-size:.8rem; font-weight:600; cursor:pointer;
              white-space:nowrap; transition:all .15s; }
   .ent-btn:hover { background:#f1f5f9; border-color:#cbd5e1; color:#0f172a; }
-  .ent-btn.active { background:#dbeafe; border-color:#93c5fd; color:#1e40af; }
+  .ent-btn.active { background:#ccfbf1; border-color:#5eead4; color:#0f766e; }
   .ent-btn.green { background:#dcfce7; border-color:#86efac; color:#166534; }
   .tb-search { flex:1; min-width:180px; padding:6px 12px; border:1px solid #e2e8f0;
                border-radius:7px; font-size:.82rem; outline:none; }
@@ -4940,13 +5037,13 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
   .kpi-clickable.kpi-active { outline:3px solid #3b82f6; }
   /* Watch panel */
   .watch-panel {
-    position:fixed; bottom:20px; right:20px; width:300px;
-    background:#1e293b; color:#e2e8f0; border-radius:14px;
+    position:fixed; bottom:18px; left:18px; right:auto; width:312px;
+    background:#14273c; color:#e2e8f0; border-radius:14px;
     box-shadow:0 8px 32px rgba(0,0,0,.4); z-index:500; font-size:.82rem;
   }
   .watch-panel-hdr {
     display:flex; align-items:center; justify-content:space-between;
-    padding:11px 15px; background:#0f172a; border-radius:14px 14px 0 0; cursor:pointer;
+    padding:11px 15px; background:#0b1d31; border-radius:14px 14px 0 0; cursor:pointer;
   }
   .watch-panel-title { font-weight:700; font-size:.85rem; display:flex; align-items:center; gap:8px; }
   .watch-dot { width:8px; height:8px; border-radius:50%; background:#4ade80; animation:pulse 2s infinite; }
@@ -5063,13 +5160,13 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
   .compare-refresh-btn {
     width:100%;
     justify-content:center;
-    border:1px solid #bfdbfe !important;
-    background:#eff6ff !important;
-    color:#1d4ed8 !important;
+    border:1px solid #5eead4 !important;
+    background:#ccfbf1 !important;
+    color:#0f766e !important;
   }
   .compare-refresh-btn:hover {
-    background:#dbeafe !important;
-    border-color:#93c5fd !important;
+    background:#99f6e4 !important;
+    border-color:#2dd4bf !important;
   }
   .compare-selection-hint {
     font-size:.75rem;
@@ -5100,13 +5197,13 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     transition:all .15s ease;
   }
   .compare-batch-item:hover {
-    border-color:#bfdbfe;
-    background:#eff6ff;
+    border-color:#99f6e4;
+    background:#f0fdfa;
   }
   .compare-batch-selected {
-    border-color:#93c5fd;
-    background:#dbeafe;
-    color:#1e3a8a;
+    border-color:#5eead4;
+    background:#ccfbf1;
+    color:#0f766e;
   }
   .compare-batch-checkbox {
     width:14px;
@@ -5194,12 +5291,12 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     transition:all .15s;
   }
   .compare-view-tab:hover {
-    color:#1e40af;
-    background:#f1f5f9;
+    color:#0f766e;
+    background:#f0fdfa;
   }
   .compare-view-tab.active {
-    color:#1e40af;
-    border-bottom-color:#1e40af;
+    color:#0f766e;
+    border-bottom-color:#0f766e;
     background:#fff;
   }
   .compare-view-panel { display:none; }
@@ -5598,6 +5695,34 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     font-size:.72rem;
     word-break:break-word;
   }
+  @media (max-width: 1420px) {
+    .kpi-grid { grid-template-columns:repeat(4, minmax(0, 1fr)); }
+  }
+  @media (max-width: 980px) {
+    .container { padding:16px 12px 20px; }
+    body.has-watch-panel .container {
+      width: auto;
+      margin: 0;
+    }
+    .header { padding:22px 18px; border-radius:12px; }
+    .header h1 { font-size:1.42rem; }
+    .score-card { padding:16px 14px; gap:14px; }
+    .score-circle { width:72px; height:72px; }
+    .kpi-grid { grid-template-columns:repeat(2, minmax(0, 1fr)); gap:10px; }
+    .watch-panel { left:10px; right:10px; bottom:10px; width:auto; max-height:78vh; }
+    .watch-panel-body { max-height:calc(78vh - 56px); overflow:auto; }
+  }
+  @media (max-width: 760px) {
+    .kpi-grid { grid-template-columns:1fr; }
+    .main-tab-bar {
+      flex-wrap:nowrap;
+      overflow-x:auto;
+      overflow-y:hidden;
+      padding-bottom:8px;
+      scrollbar-width:thin;
+    }
+    .main-tab { flex:0 0 auto; }
+  }
   @media (max-width: 1140px) {
     .compare-dual-grid { grid-template-columns:1fr; }
     .compare-focus-select { min-width:180px; max-width:100%; }
@@ -5735,26 +5860,26 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
   body.dark-mode #cohort-table thead th { background:#334155; border-color:#475569; color:#cbd5e1; }
   body.dark-mode .compare-batch-item { background:#1e293b; border-color:#334155; color:#e2e8f0; }
   body.dark-mode .compare-batch-item:hover { background:#334155; border-color:#475569; }
-  body.dark-mode .compare-batch-selected { background:#1d4ed8; border-color:#60a5fa; color:#fff; }
+  body.dark-mode .compare-batch-selected { background:rgba(15,118,110,.35); border-color:#2dd4bf; color:#ecfeff; }
   body.dark-mode .compare-batch-count { background:#1e293b; border-color:#475569; color:#cbd5e1; }
   body.dark-mode .compare-refresh-btn {
-    background:#1e3a8a !important;
-    border-color:#3b82f6 !important;
-    color:#dbeafe !important;
+    background:rgba(15,118,110,.28) !important;
+    border-color:#2dd4bf !important;
+    color:#99f6e4 !important;
   }
   body.dark-mode .compare-refresh-btn:hover {
-    background:#1d4ed8 !important;
-    border-color:#60a5fa !important;
+    background:rgba(15,118,110,.45) !important;
+    border-color:#5eead4 !important;
     color:#fff !important;
   }
   body.dark-mode .compare-view-tabs { border-bottom-color:#475569; }
   body.dark-mode .compare-view-tab { background:none; color:#cbd5e1; }
   body.dark-mode .compare-view-tab:hover { background:#334155; color:#dbeafe; }
-  body.dark-mode .compare-view-tab.active { background:#1e293b; border-bottom-color:#60a5fa; color:#93c5fd; }
+  body.dark-mode .compare-view-tab.active { background:#1e293b; border-bottom-color:#2dd4bf; color:#5eead4; }
   body.dark-mode .mrs-right-tabs { border-bottom-color:#475569; }
   body.dark-mode .mrs-right-tab { background:none; color:#cbd5e1; }
   body.dark-mode .mrs-right-tab:hover { background:#334155; color:#dbeafe; }
-  body.dark-mode .mrs-right-tab.active { background:#1e293b; border-bottom-color:#60a5fa; color:#93c5fd; }
+  body.dark-mode .mrs-right-tab.active { background:#1e293b; border-bottom-color:#2dd4bf; color:#5eead4; }
   body.dark-mode .compare-title,
   body.dark-mode .cohort-title { color:#f1f5f9; }
   body.dark-mode .compare-subtitle,
@@ -5978,12 +6103,12 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     transition:all .15s;
   }
   .mrs-right-tab:hover {
-    color:#1e40af;
-    background:#f1f5f9;
+    color:#0f766e;
+    background:#f0fdfa;
   }
   .mrs-right-tab.active {
-    color:#1e40af;
-    border-bottom-color:#1e40af;
+    color:#0f766e;
+    border-bottom-color:#0f766e;
     background:#fff;
   }
   #mrs-report-viewer { padding:8px 12px 12px; }
@@ -6113,9 +6238,9 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     border-radius:999px;
     font-size:.68rem;
     font-weight:700;
-    color:#1e3a8a;
-    background:#dbeafe;
-    border:1px solid #bfdbfe;
+    color:#0f766e;
+    background:#ccfbf1;
+    border:1px solid #99f6e4;
   }
   .mrs-pane-name {
     font-size:.76rem;
@@ -6390,6 +6515,30 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     .mrs-right-pane { min-width:0; }
     .mrs-body-row { flex-direction:column; }
     .mrs-tree-pane { width:auto !important; min-width:0; max-width:none; max-height:220px; }
+    .compare-view-tabs,
+    .mrs-right-tabs {
+      flex-wrap:wrap;
+      overflow:visible;
+      gap:6px;
+      border-bottom:1px solid #e2e8f0;
+      padding-bottom:8px;
+    }
+    .compare-view-tab,
+    .mrs-right-tab {
+      margin-bottom:0;
+      border-radius:8px;
+      border:1px solid #dbe4ef;
+      padding:8px 10px;
+      background:#f8fafc;
+      flex:1 1 220px;
+      text-align:center;
+    }
+    .compare-view-tab.active,
+    .mrs-right-tab.active {
+      border-color:#5eead4;
+      background:#ccfbf1;
+      color:#0f766e;
+    }
   }
 
 </style>
@@ -6784,7 +6933,7 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     </table>
     </div>
     <div id="mbx-empty" style="display:none;text-align:center;padding:24px;color:#94a3b8;font-size:.88rem">
-      No mailboxes match the current filter.
+      No mailbox data loaded yet, or no mailboxes match the current filter.
     </div>
   </div>
 
@@ -7670,6 +7819,17 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     var panel = document.getElementById('panel-' + id);
     if (panel) { panel.style.display = ''; panel.classList.add('active'); }
     btn.classList.add('active');
+    if (id === 'mbx') {
+      if (typeof applyFilters === 'function') { applyFilters(); }
+      var mbxBody = document.getElementById('mbx-tbody');
+      var mbxEmpty = document.getElementById('mbx-empty');
+      var rowCount = mbxBody ? mbxBody.querySelectorAll('tr').length : 0;
+      if (mbxEmpty && rowCount === 0) {
+        mbxEmpty.style.display = '';
+        mbxEmpty.innerHTML = 'No mailbox data loaded yet. Click <strong>Refresh Now</strong> in Live Dashboard to fetch from Exchange.<br>' +
+          '<button class="ent-btn" style="margin-top:10px" onclick="if(window.apiRefresh){apiRefresh();}">Refresh Now</button>';
+      }
+    }
     if (id === 'cohort') { loadCohortData(); }
     if (id === 'compare') { compareOnTabActivate(); }
     if (id === 'mrs')    { mrsOnTabActivate(); }
@@ -10995,6 +11155,15 @@ $(if($ListenerPort -gt 0){
 
   if (!API_BASE) return;
 
+  // Enable wide-content layout mode when the live dashboard panel exists.
+  if (document.body) {
+    document.body.classList.add('has-watch-panel');
+  } else {
+    window.addEventListener('DOMContentLoaded', function() {
+      try { document.body.classList.add('has-watch-panel'); } catch (_) {}
+    });
+  }
+
   // Expose API base for trend charts
   window.WATCH_API_BASE = API_BASE;
 
@@ -11580,6 +11749,7 @@ function mrsApiUrl(endpoint) {
 
   var mrsState = {
     currentAlias    : null,   // alias or 'imported:filename' key of selected item
+    currentLabel    : null,   // display label shown to users (DisplayName/Name)
     currentStats    : null,   // parsed JSON stats object
     currentProp     : null,   // selected property path in Panel B tree
     centerMode      : 'explorer',// Right view mode: explorer | entries | failure
@@ -12142,6 +12312,7 @@ function mrsApiUrl(endpoint) {
       search: '',
       status: 'All',
       currentAlias: null,
+      currentLabel: null,
       currentProp: null,
       centerMode: 'explorer',
       treeExpanded: {},
@@ -12156,6 +12327,7 @@ function mrsApiUrl(endpoint) {
         search: parsed.search || '',
         status: parsed.status || 'All',
         currentAlias: parsed.currentAlias || null,
+        currentLabel: parsed.currentLabel || null,
         currentProp: parsed.currentProp || null,
         centerMode: (parsed.centerMode === 'entries' || parsed.centerMode === 'failure' || parsed.centerMode === 'explorer' || parsed.centerMode === 'value')
           ? (parsed.centerMode === 'value' ? 'explorer' : parsed.centerMode)
@@ -12174,6 +12346,7 @@ function mrsApiUrl(endpoint) {
         search: (document.getElementById('mrs-search') || {}).value || '',
         status: (document.getElementById('mrs-status-filter') || {}).value || 'All',
         currentAlias: mrsState.currentAlias || null,
+        currentLabel: mrsState.currentLabel || null,
         currentProp: mrsState.currentProp || null,
         centerMode: mrsState.centerMode || 'explorer',
         treeExpanded: mrsState.treeExpanded || {},
@@ -12195,6 +12368,7 @@ function mrsApiUrl(endpoint) {
     mrsApplyCommandState(st.commandState);
     mrsInitCommandToolbar();
     mrsState.currentAlias = st.currentAlias || null;
+    mrsState.currentLabel = st.currentLabel || null;
     mrsState.currentProp = st.currentProp || null;
     mrsState.centerMode = (st.centerMode === 'entries' || st.centerMode === 'failure' || st.centerMode === 'explorer' || st.centerMode === 'value')
       ? (st.centerMode === 'value' ? 'explorer' : st.centerMode)
@@ -12545,10 +12719,9 @@ function mrsApiUrl(endpoint) {
     return String((item && (item.Name || item.DisplayName)) || '').trim();
   }
 
-  function mrsResolveMailboxKeyFromList(rawKey) {
+  function mrsResolveMailboxItemFromList(rawKey) {
     var key = String(rawKey || '').trim();
-    if (!key) return '';
-    if (key.indexOf('imported:') === 0 || mrsIsGuid(key)) return key;
+    if (!key) return null;
     var needle = key.toLowerCase();
     var items = Array.isArray(mrsState.listItems) ? mrsState.listItems : [];
     for (var i = 0; i < items.length; i++) {
@@ -12563,11 +12736,44 @@ function mrsApiUrl(endpoint) {
       ];
       for (var j = 0; j < candidates.length; j++) {
         if (candidates[j] && candidates[j].toLowerCase() === needle) {
-          return mrsMailboxKey(it) || key;
+          return it;
         }
       }
     }
+    return null;
+  }
+
+  function mrsResolveMailboxKeyFromList(rawKey) {
+    var key = String(rawKey || '').trim();
+    if (!key) return '';
+    if (key.indexOf('imported:') === 0 || mrsIsGuid(key)) return key;
+    var item = mrsResolveMailboxItemFromList(key);
+    if (item) return mrsMailboxKey(item) || key;
     return key;
+  }
+
+  function mrsMailboxLabelFromItem(item, fallbackKey) {
+    var label = String((item && (item.DisplayName || item.Name || item.Alias)) || '').trim();
+    if (label) return label;
+    var fb = String(fallbackKey || '').trim();
+    if (fb.indexOf('imported:') === 0) return fb.replace(/^imported:/i, '');
+    return fb;
+  }
+
+  function mrsResolveMailboxLabelFromList(rawKey) {
+    var key = String(rawKey || '').trim();
+    if (!key) return '';
+    var item = mrsResolveMailboxItemFromList(key);
+    if (item) return mrsMailboxLabelFromItem(item, key);
+    if (key.indexOf('imported:') === 0) return key.replace(/^imported:/i, '');
+    return key;
+  }
+
+  function mrsCurrentMailboxLabel(fallbackKey) {
+    var label = String(mrsState.currentLabel || '').trim();
+    if (label) return label;
+    var key = String(fallbackKey || mrsState.currentAlias || '').trim();
+    return mrsResolveMailboxLabelFromList(key) || key;
   }
 
   function mrsRenderList(items) {
@@ -12641,10 +12847,11 @@ function mrsApiUrl(endpoint) {
     if (typeof data === 'string') {
       try { data = JSON.parse(data); } catch (_) {}
     }
+    var label = mrsCurrentMailboxLabel(alias);
     mrsState.currentStats = data || null;
     mrsShowDetailArea(true);
     mrsRenderPropertyTree(mrsState.currentStats || {});
-    mrsSetNodePath(alias || '');
+    mrsSetNodePath(label || '');
     if (preserveSelection && mrsState.currentProp) {
       var resolved = mrsResolvePropertyValue(mrsState.currentStats, mrsState.currentProp);
       if (resolved.found) {
@@ -12667,6 +12874,7 @@ function mrsApiUrl(endpoint) {
   function mrsQueueStatsRefresh(alias, selectToken, preserveSelection, profile, profileSignature) {
     profile = profile || mrsGetCommandProfilePayload();
     profileSignature = profileSignature || mrsGetCommandProfileSignature(profile);
+    var label = mrsCurrentMailboxLabel(alias);
     var pollSince = Date.now() - 2000; // 2 s tolerance for clock skew between client and server
     console.log('[MRS] posting fetch-statistics for', alias, 'pollSince=', pollSince, 'profile=', profileSignature);
     apiCall('/api/mrs/fetch-statistics', 'POST', {
@@ -12677,18 +12885,18 @@ function mrsApiUrl(endpoint) {
       if (selectToken !== mrsState.selectToken || alias !== mrsState.currentAlias) return;
       console.log('[MRS] fetch-statistics response:', resp);
       if (resp && resp.status === 'queued') {
-        mrsSetNodePath(alias + ' > queued, waiting for data.');
+        mrsSetNodePath(label + ' > queued, waiting for data.');
         mrsPollStats(alias, Date.now(), pollSince, selectToken, preserveSelection, profileSignature);
       } else {
         var errMsg = (resp && resp.error) ? resp.error : 'unexpected server response';
         console.warn('[MRS] fetch-statistics unexpected response:', resp);
-        mrsSetNodePath(alias + ' > Error: ' + errMsg);
+        mrsSetNodePath(label + ' > Error: ' + errMsg);
         mrsSetImportLabel('Error: ' + errMsg);
       }
     }).catch(function(err) {
       if (selectToken !== mrsState.selectToken || alias !== mrsState.currentAlias) return;
       console.error('[MRS] fetch-statistics network error:', err);
-      mrsSetNodePath(alias + ' > Error: could not contact server');
+      mrsSetNodePath(label + ' > Error: could not contact server');
       mrsSetImportLabel('Error: could not contact server');
     });
   }
@@ -12700,6 +12908,7 @@ function mrsApiUrl(endpoint) {
     var preserveSelection = !!options.preserveSelection;
     var cacheOnly = !!options.cacheOnly;
     alias = mrsResolveMailboxKeyFromList(alias);
+    var displayLabel = mrsResolveMailboxLabelFromList(alias);
     var selectToken = ++mrsState.selectToken;
     console.log('[MRS] mrsSelectMailbox:', alias, 'forceRefresh=', forceRefresh, 'preferCache=', preferCache, 'cacheOnly=', cacheOnly);
     // Highlight selected row
@@ -12710,6 +12919,7 @@ function mrsApiUrl(endpoint) {
     if (row) row.style.background = '#eff6ff';
 
     mrsState.currentAlias = alias;
+    mrsState.currentLabel = displayLabel || alias;
     mrsSyncIdentityFromPanelSelection();
     mrsUpdateCommandPreviewBar();
     if (!preserveSelection) {
@@ -12718,7 +12928,7 @@ function mrsApiUrl(endpoint) {
     }
     var profile = mrsGetCommandProfilePayload();
     var profileSignature = mrsGetCommandProfileSignature(profile);
-    mrsSetImportLabel(alias);
+    mrsSetImportLabel(displayLabel || alias);
     mrsSaveUiState();
 
     // Show detail area immediately with a loading state so the breadcrumb is visible.
@@ -12729,7 +12939,7 @@ function mrsApiUrl(endpoint) {
     }
     document.getElementById('mrs-property-tree').innerHTML =
       '<li style="padding:12px 10px;color:#94a3b8;font-size:.8rem">Fetching statistics.</li>';
-    mrsSetNodePath(alias + ' > contacting server.');
+    mrsSetNodePath((displayLabel || alias) + ' > contacting server.');
 
     if (!forceRefresh && preferCache) {
       apiCall(mrsStatsQueryUrl(alias, profileSignature), 'GET', null).then(function(resp) {
@@ -12740,7 +12950,7 @@ function mrsApiUrl(endpoint) {
           return;
         }
         if (cacheOnly) {
-          mrsSetNodePath(alias + ' > No cached statistics. Click "Refresh Selected" to fetch.');
+          mrsSetNodePath((mrsCurrentMailboxLabel(alias)) + ' > No cached statistics. Click "Refresh Selected" to fetch.');
           document.getElementById('mrs-property-tree').innerHTML =
             '<li style="padding:12px 10px;color:#94a3b8;font-size:.8rem">No cached statistics for this mailbox.</li>';
           mrsShowEntryDetail('Panel D - Entry Detail\nNo cached statistics were found. Click Refresh Selected to fetch fresh data.');
@@ -12750,7 +12960,7 @@ function mrsApiUrl(endpoint) {
       }).catch(function(err) {
         if (selectToken !== mrsState.selectToken || alias !== mrsState.currentAlias) return;
         if (cacheOnly) {
-          mrsSetNodePath(alias + ' > Cache check failed. Click "Refresh Selected" to fetch.');
+          mrsSetNodePath((mrsCurrentMailboxLabel(alias)) + ' > Cache check failed. Click "Refresh Selected" to fetch.');
           return;
         }
         console.warn('[MRS] cache read failed for', alias, '- falling back to refresh:', err);
@@ -12771,9 +12981,10 @@ function mrsApiUrl(endpoint) {
 
   function mrsPollStats(alias, startTime, pollSince, selectToken, preserveSelection, profileSignature) {
     if (selectToken !== mrsState.selectToken || alias !== mrsState.currentAlias) return;
+    var label = mrsCurrentMailboxLabel(alias);
     if (Date.now() - startTime > 180000) {
       console.warn('[MRS] mrsPollStats timed out for', alias);
-      mrsSetNodePath(alias + ' > Error: timed out waiting for statistics');
+      mrsSetNodePath(label + ' > Error: timed out waiting for statistics');
       mrsSetImportLabel('Timed out - try clicking again');
       return;
     }
@@ -12785,12 +12996,12 @@ function mrsApiUrl(endpoint) {
         '| data=', mrsDescribeDataShape(resp && resp.data),
         '| error=', resp && resp.error, '| availableKeys=', resp && resp.availableKeys);
       if (!resp || !resp.ok) {
-        mrsSetNodePath(alias + ' > waiting for server cache.');
+        mrsSetNodePath(label + ' > waiting for server cache.');
         setTimeout(function() { mrsPollStats(alias, startTime, pollSince, selectToken, preserveSelection, profileSignature); }, 1500);
         return;
       }
       if (cacheMs < pollSince) {
-        mrsSetNodePath(alias + ' > waiting for fresh data. (' + Math.round((pollSince - cacheMs) / 1000) + 's stale)');
+        mrsSetNodePath(label + ' > waiting for fresh data. (' + Math.round((pollSince - cacheMs) / 1000) + 's stale)');
         setTimeout(function() { mrsPollStats(alias, startTime, pollSince, selectToken, preserveSelection, profileSignature); }, 1500);
         return;
       }
@@ -12800,13 +13011,13 @@ function mrsApiUrl(endpoint) {
         console.log('[MRS] render complete for', alias);
       } catch (e) {
         console.error('[MRS] mrsRenderPropertyTree threw:', e);
-        mrsSetNodePath(alias + ' > Render error: ' + (e && e.message ? e.message : String(e)));
+        mrsSetNodePath(label + ' > Render error: ' + (e && e.message ? e.message : String(e)));
         mrsSetImportLabel('Render error - check breadcrumb');
       }
     }).catch(function(err) {
       if (selectToken !== mrsState.selectToken || alias !== mrsState.currentAlias) return;
       console.error('[MRS] mrsPollStats network error:', err);
-      mrsSetNodePath(alias + ' > network error, retrying.');
+      mrsSetNodePath(label + ' > network error, retrying.');
       setTimeout(function() { mrsPollStats(alias, startTime, pollSince, selectToken, preserveSelection, profileSignature); }, 2000);
     });
   }
@@ -13120,7 +13331,7 @@ function mrsApiUrl(endpoint) {
     var item = mrsState.collectionItems[idx];
     var path = mrsState.collectionProp || '';
     if (mrsState.collectionItems.length > 1) path += '[' + idx + ']';
-    mrsSetNodePath((mrsState.currentAlias || '') + ' > ' + path);
+    mrsSetNodePath((mrsCurrentMailboxLabel() || '') + ' > ' + path);
     mrsShowEntryDetail(mrsDetailTextForValue(item));
   }
   window.mrsSelectCollectionItem = mrsSelectCollectionItem;
@@ -13163,7 +13374,7 @@ function mrsApiUrl(endpoint) {
     var val = mrsState.currentStats;
     prop.split('.').forEach(function(k) { val = (val != null) ? val[k] : undefined; });
 
-    mrsSetNodePath(mrsState.currentAlias + ' > ' + prop);
+    mrsSetNodePath(mrsCurrentMailboxLabel() + ' > ' + prop);
 
     if (Array.isArray(val)) {
       renderMRSCollection(prop, val);
@@ -13657,7 +13868,7 @@ function mrsApiUrl(endpoint) {
     var e = mrsState.failureEvents && mrsState.failureEvents[idx];
     if (!e) return;
     mrsShowEntryDetail(mrsDetailTextForValue(e.Raw || e));
-    mrsSetNodePath((mrsState.currentAlias || '') + ' > Failure Intelligence > Event[' + idx + ']');
+    mrsSetNodePath((mrsCurrentMailboxLabel() || '') + ' > Failure Intelligence > Event[' + idx + ']');
   }
   window.mrsSelectFailureEvent = mrsSelectFailureEvent;
 
@@ -13665,7 +13876,7 @@ function mrsApiUrl(endpoint) {
     var s = mrsState.failureTopTypes && mrsState.failureTopTypes[idx];
     if (!s) return;
     mrsShowEntryDetail(mrsDetailTextForValue(s));
-    mrsSetNodePath((mrsState.currentAlias || '') + ' > Failure Intelligence > TopType[' + idx + ']');
+    mrsSetNodePath((mrsCurrentMailboxLabel() || '') + ' > Failure Intelligence > TopType[' + idx + ']');
   }
   window.mrsSelectFailureSignature = mrsSelectFailureSignature;
 
@@ -13682,7 +13893,7 @@ function mrsApiUrl(endpoint) {
     mrsState.failureTopTypes = fi.topTypes || [];
 
     var rows = [
-      ['Mailbox', mrsState.currentAlias || '-'],
+      ['Mailbox', mrsCurrentMailboxLabel() || '-'],
       ['Total Events', fi.events.length],
       ['Permanent', fi.permanent],
       ['Retryable', fi.retryable],
@@ -13769,7 +13980,7 @@ function mrsApiUrl(endpoint) {
   function mrsOpenFailureIntelligence() {
     mrsSetCenterMode('failure');
     mrsShowEntryDetail('Panel D - Entry Detail\nClick a failure row in Panel C to inspect full detail.');
-    mrsSetNodePath((mrsState.currentAlias || '') + ' > Failure Intelligence');
+    mrsSetNodePath((mrsCurrentMailboxLabel() || '') + ' > Failure Intelligence');
     mrsRenderFailureIntelligence();
   }
   window.mrsOpenFailureIntelligence = mrsOpenFailureIntelligence;
@@ -13784,7 +13995,7 @@ function mrsApiUrl(endpoint) {
       document.getElementById('mrs-entries-tbody').innerHTML = '<tr><td colspan="5" style="padding:16px;text-align:center;color:#94a3b8">No Report object in current mailbox stats</td></tr>';
       document.getElementById('mrs-entries-count').textContent = 'Showing 0 of 0 entries';
       mrsShowEntryDetail('Panel D - Entry Detail\nNo Report.Entries found for this mailbox.');
-      mrsSetNodePath((mrsState.currentAlias || '') + ' > Report > Entries');
+      mrsSetNodePath((mrsCurrentMailboxLabel() || '') + ' > Report > Entries');
       return;
     }
     mrsState.allEntries = mrsFiToArray(mrsState.currentStats.Report.Entries);
@@ -13804,7 +14015,7 @@ function mrsApiUrl(endpoint) {
     document.getElementById('mrs-entries-search').value = '';
     document.getElementById('mrs-center-content').innerHTML = '';
     mrsShowEntryDetail('Panel D - Entry Detail\nSelect a report row to view full entry detail.');
-    mrsSetNodePath(mrsState.currentAlias + ' > Report > Entries');
+    mrsSetNodePath(mrsCurrentMailboxLabel() + ' > Report > Entries');
     mrsFilterEntries();
   }
   window.mrsOpenReportEntries = mrsOpenReportEntries;
@@ -13864,7 +14075,7 @@ function mrsApiUrl(endpoint) {
       ? mrsState.filteredEntryIndexes[idx]
       : idx;
     mrsShowEntryDetail(mrsDetailTextForValue(entry));
-    mrsSetNodePath(mrsState.currentAlias + ' > Report > Entries[' + originalIndex + ']');
+    mrsSetNodePath(mrsCurrentMailboxLabel() + ' > Report > Entries[' + originalIndex + ']');
   }
   window.mrsSelectEntry = mrsSelectEntry;
   // ── Export entries as CSV ────────────────────────────────────────
@@ -13994,6 +14205,7 @@ function mrsApiUrl(endpoint) {
       delete mrsState.importPollTokens[key];
       // Auto-select the imported entry
       mrsState.currentAlias = key;
+      mrsState.currentLabel = filename || mrsResolveMailboxLabelFromList(key) || key;
       mrsState.currentProp = null;
       mrsState.treeExpanded = {};
       mrsSetImportLabel(filename);
