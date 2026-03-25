@@ -116,6 +116,10 @@
 .PARAMETER StallThresholdMinutes
     Minutes of no progress before triggering a stall alert. Default: 30. Range: 5-1440.
 
+.PARAMETER AcceptOpenSourceLicense
+    Skip the startup console acceptance prompt for open-source license terms.
+    UI acceptance popup is still required in the report page.
+
 .EXAMPLE
     # Full live analysis with detail report exported for later use
     .\MigrationAnalysis.ps1 -IncludeDetailReport -ExportDetailXml -ReportPath "C:\Reports"
@@ -320,6 +324,11 @@ param (
     # Include detailed mailbox list in scheduled reports
     [Parameter(ParameterSetName = "Live")]
     [switch]$IncludeDetailInScheduledReport
+    ,
+    # Bypass interactive open-source license acceptance prompt.
+    [Parameter(ParameterSetName = "Live")]
+    [Parameter(ParameterSetName = "FromXml")]
+    [switch]$AcceptOpenSourceLicense
 )
 
 #region ── Helpers ──────────────────────────────────────────────────────────────
@@ -397,6 +406,407 @@ function Write-Banner {
     }
     Write-Host $border -ForegroundColor $Color
     Write-Host ""
+}
+
+$script:OpenSourceLicenseVersion = '2026-03-25'
+$script:OpenSourceLicenseText = @'
+License Notice
+
+By continuing, you confirm:
+1) You will use this script according to your organization security and compliance policies.
+2) You understand this script is provided "as is", without warranty or liability.
+3) You are responsible for validating outputs before production actions.
+For contact and support, email: techjollof@gmail.com.
+
+
+Copyright (c) 2026 Migration Analysis Contributors
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+If you do not accept these terms, you must stop using the tool.
+'@
+
+# Embedded troubleshooting preview content (SolutionTab_Preview_Alt2.html), stored directly in script.
+$script:EmbeddedTroubleshootHtml = @'
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Solution Center</title>
+<style>
+:root{--bg:#f2f3ef;--card:#fffdf8;--ink:#102226;--muted:#5d6b70;--line:#d7dfd3;--blue:#0f766e;--blue-soft:#ccfbf1;--red:#9f1239;--red-soft:#ffe4e6;--amber:#92400e;--amber-soft:#ffedd5;--green:#166534;--green-soft:#dcfce7}
+*{box-sizing:border-box}
+body{margin:0;color:var(--ink);background:radial-gradient(1200px 500px at 30% -20%,#dff4ef 0%,transparent 60%),linear-gradient(180deg,#fbfcfa 0%,#edf1eb 100%);font:14px/1.35 "Segoe UI",Tahoma,Arial,sans-serif}
+body, .panel, .body, .tabpane, .detail-section, .cmd-card, .resource-card, .card, td, th, li, .small, .badge, .chip {overflow-wrap:anywhere;word-break:break-word}
+a{color:var(--blue);text-decoration:none}a:hover{text-decoration:underline}
+.grid{display:grid;grid-template-columns:310px minmax(520px,690px) minmax(560px,1fr);gap:10px;height:calc(100vh - 40px);min-height:calc(100vh - 40px)}
+.panel{border:1px solid var(--line);border-radius:12px;background:var(--card);display:flex;flex-direction:column;min-height:0;height:100%;overflow:hidden;box-shadow:0 6px 18px rgba(16,34,38,.06)}
+.head{border-bottom:1px solid var(--line);background:#f0fdf4;color:#36535b;font-size:.75rem;font-weight:800;letter-spacing:.06em;text-transform:uppercase;padding:10px 12px}.body{padding:10px 12px;overflow:auto;min-height:0}
+.kpis{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px}.kpi{border:1px solid var(--line);border-radius:10px;padding:8px 9px;background:#f8fafc}.kpi .k{color:var(--muted);font-size:.68rem;text-transform:uppercase;font-weight:700}.kpi .v{font-size:1.05rem;font-weight:800;margin-top:2px}
+.row{display:grid;gap:5px;margin-bottom:10px}.row label{font-size:.72rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.05em}
+input[type="text"],select{width:100%;border:1px solid #cbd5e1;border-radius:8px;background:#fff;padding:8px 10px}
+.chips{display:flex;flex-wrap:wrap;gap:6px}.chip{cursor:pointer;border:1px solid #cbd5e1;border-radius:999px;background:#fff;color:#334155;padding:4px 8px;font-size:.73rem;user-select:none}.chip.active{background:var(--blue-soft);border-color:#93c5fd;color:var(--blue)}
+.tabs{display:flex;gap:6px;align-items:center;border-bottom:1px solid var(--line);padding:8px 10px;background:#f8fffd;overflow:auto}
+.tab{border:1px solid transparent;background:#ecfdf5;color:#0f3a35;font-weight:700;border-radius:999px;padding:6px 11px;cursor:pointer;white-space:nowrap}.tab.active{border-color:#67e8f9;color:#0f766e;background:#ccfbf1}
+.tabpane{display:none;padding:10px;overflow:auto;min-height:0;flex:1}.tabpane.active{display:block}
+.panel:nth-child(2){min-width:0}
+.panel:nth-child(2) .tabs{flex:0 0 auto}
+.panel:nth-child(2) .tabpane{overflow-y:auto;overflow-x:hidden}
+.panel:nth-child(3) .body{overflow-y:auto;overflow-x:hidden}
+.table-wrap{border:1px solid var(--line);border-radius:10px;overflow:auto}table{width:100%;border-collapse:collapse;font-size:.78rem;table-layout:fixed;background:#fff}
+thead th{position:sticky;top:0;z-index:1;background:#ecfeff;border-bottom:1px solid var(--line);color:#155e75;text-transform:uppercase;letter-spacing:.05em;font-size:.68rem;text-align:left;padding:8px}
+tbody td{border-top:1px solid #e6efec;padding:8px;vertical-align:top}tbody tr{cursor:pointer}tbody tr:hover{background:#f0fdfa}
+.pill{display:inline-block;border-radius:999px;font-size:.67rem;font-weight:700;padding:2px 7px}.p-critical{background:var(--red-soft);color:var(--red)}.p-high{background:#ffe4e6;color:#be123c}.p-medium{background:var(--amber-soft);color:var(--amber)}.p-low{background:var(--green-soft);color:var(--green)}
+.small{font-size:.74rem;color:var(--muted)}.card{border:1px solid var(--line);border-radius:10px;background:#fff;padding:10px}.card h4{margin:0 0 6px;font-size:.84rem}
+.list{display:grid;gap:8px}.steps{margin:6px 0 0;padding-left:18px}.steps li{margin:3px 0}.code{border-radius:8px;background:#062a27;color:#d1fae5;padding:8px 10px;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;max-width:100%;overflow:auto;font-family:Consolas,"Courier New",monospace;font-size:.72rem;line-height:1.5}
+.meta{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}.resource-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.resource-card{border:1px solid var(--line);border-radius:10px;background:#fff;padding:10px}.resource-card h5{margin:0 0 6px;font-size:.8rem}.resource-list{margin:0;padding-left:16px;display:grid;gap:5px;font-size:.78rem}
+.detail-title{margin:0 0 6px;font-size:1rem}.detail-section{border:1px solid var(--line);border-radius:10px;padding:10px;background:#fff;margin-bottom:8px}.detail-section h4{margin:0 0 6px;font-size:.83rem;color:#0f766e}.matrix-id{font-size:.7rem;color:#94a3b8}
+.cmd-grid{display:grid;gap:8px;min-width:0}.cmd-card{border:1px solid var(--line);border-radius:8px;background:#f8fafc;padding:8px;min-width:0}.cmd-card h5{margin:0 0 6px;font-size:.78rem;color:#334155}.cmd-note{font-size:.72rem;color:#475569;margin-top:6px}
+@media (max-width:1500px){.grid{grid-template-columns:290px minmax(500px,640px) minmax(420px,1fr)}}@media (max-width:1200px){.grid{grid-template-columns:300px 1fr}}@media (max-width:1000px){.grid{grid-template-columns:1fr;height:auto;min-height:0}.panel{min-height:280px;height:auto}.resource-grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="grid">
+    <div class="panel">
+      <div class="head">Filters</div>
+      <div class="body">
+        <div class="kpis"><div class="kpi"><div class="k">Matched</div><div class="v" id="kpi-matched">0</div></div><div class="kpi"><div class="k">Critical/High</div><div class="v" id="kpi-high">0</div></div></div>
+        <div class="row"><label>Search</label><input id="q" type="text" placeholder="403, lock, ExchangeGUID, warning"></div>
+        <div class="row"><label>Phase</label><select id="phase"><option value="all">All Phases</option><option>Pre-Validation</option><option>Injection</option><option>Initial Sync</option><option>Incremental Sync</option><option>Completion</option><option>Post-Completion</option><option>All</option></select></div>
+        <div class="row"><label>Target Mailbox / Identity</label><input id="target-user" type="text" placeholder="user@contoso.com"></div>
+        <div class="row"><label>Target Batch (optional)</label><input id="target-batch" type="text" placeholder="batch001-50GB"></div>
+        <div class="row"><label>Severity</label><div class="chips" id="sev-chips"></div></div>
+        <div class="row"><label>Family</label><div class="chips" id="fam-chips"></div></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="tabs">
+        <button class="tab active" data-tab="matrix">Solution Matrix</button>
+        <button class="tab" data-tab="baseline">Baseline Checklist</button>
+        <button class="tab" data-tab="playbooks">Playbooks</button>
+        <button class="tab" data-tab="resources">Resource Library</button>
+      </div>
+      <div class="tabpane active" id="tab-matrix"><div class="table-wrap"><table><thead><tr><th style="min-width:250px">Issue Signature</th><th>Family</th><th>Phase</th><th>Severity</th><th style="min-width:280px">Primary Action</th></tr></thead><tbody id="matrix-body"></tbody></table></div></div>
+      <div class="tabpane" id="tab-baseline"><div class="list" id="baseline-list"></div></div>
+      <div class="tabpane" id="tab-playbooks"><div class="list" id="playbooks-list"></div></div>
+      <div class="tabpane" id="tab-resources"><div class="row"><label>Search Resource</label><input id="resource-q" type="text" placeholder="MRSProxy, timeout, GUID"></div><div class="resource-grid" id="resources-grid"></div></div>
+    </div>
+
+    <div class="panel"><div class="head">Issue Detail</div><div class="body" id="detail"><div class="small">Select an issue row to view full runbook detail.</div></div></div>
+</div>
+
+<script>
+const baselineChecklist=[
+'MRSProxy enabled and healthy on on-prem EWS virtual directory.','Migration auth path supports Negotiate/NTLM for MRS.','TLS 1.2 and certificate chain validated end-to-end.','ExchangeGUID synchronized for all scoped users.','Tenant routing proxy user@tenant.mail.onmicrosoft.com stamped.','All migration SMTP domains are accepted in EXO.','Classic hybrid ingress path allows required EXO IP ranges.','No unsupported SSL offload on MRSProxy route.','If Exchange 2010 exists, namespace points to supported newer endpoint.','Load balancer persistence configured where required.','Folder shape and item count prechecked against EXO limits.','Endpoint concurrency aligned to source performance capacity.','Evidence bundle process ready (IncludeReport + DiagnosticInfo + XML export).','Post-completion source conversion validation checklist prepared.'
+];
+
+const signatures=[
+{id:'SIG-001',signature:'MRSProxy not enabled / endpoint readiness fails',family:'Connectivity & Endpoint',phase:'Pre-Validation',severity:'Critical',primaryAction:'Enable and validate MRSProxy path before any migration run.',root:'Endpoint chain cannot establish supported hybrid MRS communication.',signals:['Endpoint test fails quickly.','Move request not created for users.','EAC or PowerShell shows endpoint readiness failure.'],diagnostics:['Get-WebServicesVirtualDirectory | fl Identity,MRSProxyEnabled,InternalUrl,ExternalUrl','Test-MigrationServerAvailability -ExchangeRemoteMove -RemoteServer <fqdn> -Credentials <cred>','Get-MigrationEndpoint | fl Identity,RemoteServer,Authentication'],runbook:['Confirm MRSProxyEnabled = True on correct EWS directory.','Validate TLS certificate chain and protocol (TLS 1.2).','Validate auth route supports Negotiate/NTLM for migration path.','Retest endpoint and run one pilot mailbox injection.','Resume broader scope only after pilot is stable.'],branchChecks:['If test fails behind proxy but passes direct -> network device path issue.','If test passes but user fails injection -> pivot to identity mapping checks.'],validation:['Endpoint test succeeds repeatedly.','RequestGuid is generated for pilot user.'],prevention:['Make endpoint test mandatory pre-flight gate.','Freeze path config changes during migration windows.'],escalationPack:['Endpoint test full output.','EWS directory settings export.','Timestamped change log for auth/network path.'],links:['https://learn.microsoft.com/en-us/exchange/architecture/mailbox-servers/mrs-proxy-endpoint','https://learn.microsoft.com/en-us/powershell/module/exchangepowershell/test-migrationserveravailability?view=exchange-ps']},
+{id:'SIG-002',signature:'403 Forbidden on /EWS/mrsproxy.svc',family:'Connectivity & Endpoint',phase:'Injection',severity:'High',primaryAction:'Correct auth/proxy chain and unsupported pre-auth/offload patterns.',root:'MRSProxy auth path blocked or mismatched.',signals:['Remote server returned (403) Forbidden.','Retries fail before data copy starts.','High transient communication noise.'],diagnostics:['Test-MigrationServerAvailability -ExchangeRemoteMove -RemoteServer <fqdn> -Credentials <cred>','Correlate UTC timestamp with HTTPERR + IIS + HttpProxy logs'],runbook:['Validate MRSProxy + IIS health first.','Verify auth route supports required negotiation method.','Remove unsupported pre-auth and SSL offload for MRS path.','Bypass inspection device for controlled test.','Pilot one mailbox then scale.'],branchChecks:['If only HTTPERR has failure -> problem likely before IIS processing.','If IIS + HttpProxy see failure -> inspect backend auth pipeline.'],validation:['403 removed in endpoint test and pilot migration.','No recurring 403 in logs during pilot window.'],prevention:['Keep migration-specific documented route with known-good auth behavior.','Revalidate path after cert/proxy changes.'],escalationPack:['Endpoint test failure output.','UTC-correlated log slices (HTTPERR/IIS/HttpProxy).','Auth and reverse proxy configuration snapshot.'],links:['https://learn.microsoft.com/en-us/troubleshoot/exchange/move-mailboxes/remote-server-returned-error-403-forbidden','https://techcommunity.microsoft.com/blog/exchange/troubleshooting-hybrid-migration-endpoints-in-classic-and-modern-hybrid/953006']},
+{id:'SIG-003',signature:'404 / timeout / communication transient pattern',family:'Connectivity & Timeout',phase:'Initial Sync',severity:'High',primaryAction:'Stabilize network session continuity before retrying at scale.',root:'Intermittent path interruption between EXO MRS and source MRSProxy.',signals:['HTTP timeout or 404 patterns.','CommunicationErrorTransientException bursts.','Copy progress repeatedly resets or pauses.'],diagnostics:['$stats = Get-MoveRequestStatistics <user> -IncludeReport -DiagnosticInfo "verbose,showtimeslots,showtimeline"','$stats.Report.Failures | group FailureType | ft -AutoSize','$stats.Report.InternalFailures | group FailureType | ft -AutoSize'],runbook:['Correlate report failure time with infrastructure logs.','Remove or bypass unstable middleboxes for migration path test.','Lower endpoint concurrency while path is unstable.','Apply keepalive strategy for faster lock recovery where needed.','Validate with one full copy interval pilot.'],branchChecks:['Failure at fixed intervals suggests device idle timeout.','Success on direct path indicates intermediary path root cause.'],validation:['Timeout transient bursts materially reduced.','Pilot mailbox achieves sustained copy progress.'],prevention:['Run long-session connectivity precheck before waves.','Maintain known-good route profile and monitor deviations.'],escalationPack:['Move report XML with diagnostics.','UTC-aligned infra logs.','Path diagram and timeout settings.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-failed-migrations/1746234','https://techcommunity.microsoft.com/blog/exchange/troubleshooting-slow-migrations/1795706']},
+{id:'SIG-004',signature:'Cannot find recipient with mailbox GUID',family:'Identity Mapping',phase:'Injection',severity:'Critical',primaryAction:'Repair ExchangeGUID mapping and allow sync to converge before retry.',root:'Recipient identity mismatch across on-prem and cloud objects.',signals:['MigrationPermanentException mailbox GUID not found.','RequestGuid empty; no move created.','Validation fails before queueing.'],diagnostics:['Get-MigrationUser <smtp> | fl Identity,Status,ErrorSummary,RequestGuid','Get-RemoteMailbox <smtp> | fl ExchangeGuid','Get-MailUser <smtp> | fl ExchangeGuid,RecipientTypeDetails,EmailAddresses'],runbook:['Identify authoritative GUID and expected target object.','Correct mismatched object GUID via supported process.','Wait/force sync and re-validate user status.','Confirm RequestGuid now exists.','Retry only corrected users first.'],branchChecks:['If GUID maps to ComponentShared mailbox -> collect mailbox location and escalate.','If GUID aligned but still fails -> validate accepted domain and routing proxy.'],validation:['Error summary clears after sync convergence.','Move request can be created successfully.'],prevention:['Preflight GUID audit for all wave users.','Block wave launch on unresolved GUID mismatches.'],escalationPack:['Before/after object dumps for GUID fields.','Migration user status outputs showing resolution.','Sync cycle evidence.'],links:['https://learn.microsoft.com/en-us/exchange/troubleshoot/move-mailboxes/migrationpermanentexception-when-moving-mailboxes']},
+{id:'SIG-005',signature:'User already being moved / mailbox lock loops',family:'Session Locking',phase:'Incremental Sync',severity:'High',primaryAction:'Separate stale request lifecycle problems from transient lock recovery behavior.',root:'Orphaned request state or stale lock after communication interruption.',signals:['User already being moved.','Immediate SourceMailboxAlreadyBeingMovedTransientException.','Repeated lock stalls and no sustained advancement.'],diagnostics:['Get-MoveRequest <user>','$stats = Get-MoveRequestStatistics <user> -IncludeReport','$stats.Report.InternalFailures | group FailureType | ft -AutoSize'],runbook:['Check for active/stale request state first.','Clean stale request state with supported workflow.','If no request and lock persists, inspect leaked session scenario.','Address communication timeout root cause.','Retry one mailbox and monitor failure mix.'],branchChecks:['Persisting lock beyond keepalive suggests leaked session path.','Lock recurring with transient errors indicates network timeout root cause.'],validation:['Recreated request does not fail instantly with lock message.','InternalFailures show lock error reduction.'],prevention:['Do not repeatedly reinject while stale state exists.','Fix path stability before increasing concurrency.'],escalationPack:['Move request + statistics outputs.','FailureType grouping for failures/internal failures.','Session timeout and keepalive config.'],links:['https://learn.microsoft.com/en-us/exchange/troubleshoot/move-mailboxes/user-is-already-being-moved-error','https://techcommunity.microsoft.com/blog/exchange/troubleshooting-slow-migrations/1795706']},
+{id:'SIG-006',signature:'TooManyBadItems or low data consistency score',family:'Data Quality & Corruption',phase:'Initial Sync',severity:'High',primaryAction:'Quantify corruption, repair source where possible, then apply targeted exclusions carefully.',root:'Corrupt content classes exceed tolerances.',signals:['TooManyBadItemsPermanentException.','Failure groups dominated by corruption categories.','Data consistency score indicates investigate risk.'],diagnostics:['$stats = Get-MoveRequestStatistics <user> -IncludeReport -DiagnosticInfo verbose','$stats.Report.Failures | group FailureType | sort Count -Desc | ft -AutoSize','$stats.Report.Entries | ? { $_.LocalizedString -match "Corrupt|Data consistency|Bad item" }'],runbook:['Identify top failure classes and contexts.','Run New-MailboxRepairRequest for relevant corruption type(s).','Retest before adding move exclusions.','Apply targeted MoveOptions only when evidence supports it.','Recreate user or batch entry if failed state cannot resume cleanly.'],branchChecks:['Persistent high corruption after repair may require skip strategy decision.','Single-folder hotspot suggests source cleanup before move options.'],validation:['Failure distribution improves on rerun.','Move progresses beyond previous failure checkpoint.'],prevention:['Integrity precheck for high-risk mailboxes.','Track bad-item trend by batch for early anomaly detection.'],escalationPack:['Pre/post repair report XML.','FailureType distribution and data context.','MoveOptions changes with rationale.'],links:['https://learn.microsoft.com/en-us/powershell/module/exchange/new-mailboxrepairrequest?view=exchange-ps','https://techcommunity.microsoft.com/blog/exchange/troubleshooting-failed-migrations/1746234']},
+{id:'SIG-007',signature:'Folder hierarchy or item limits exceeded',family:'Mailbox Limits',phase:'Initial Sync',severity:'High',primaryAction:'Reduce hierarchy depth/folder items below limits and rerun cleanly.',root:'Mailbox topology/items exceed Exchange Online constraints.',signals:['FolderHierarchy* quota errors or MessagePerFolder count quota exceeded.','Failure occurs during folder analysis/copy stage.'],diagnostics:['Get-MailboxFolderStatistics <user> -FolderScope NonIpmRoot | sort ItemsInFolder -Desc | Export-Csv FolderStats.csv','Get-MailboxFolderStatistics <user> -FolderScope RecoverableItems | sort ItemsInFolder -Desc | Export-Csv RecoverableItems.csv','Get-MailboxStatistics <user> | fl FolderHierarchy*Quota*'],runbook:['Export and rank offending folders/branches.','Reduce depth/fanout/item counts through merge/archive/cleanup.','Re-export to confirm compliance before retry.','Recreate failed migration object state.','Retry and monitor for next limiting context.'],branchChecks:['If Exchange 2010 source limits folder-scope visibility, use alternate inspection method.','If limits are fixed and errors remain, inspect corruption or identity signatures.'],validation:['Folder stats under thresholds.','No recurrence of same limit failure type.'],prevention:['Run folder topology and item-count audit before wave start.','Enforce pre-migration cleanup threshold policy.'],escalationPack:['Before/after folder exports.','Quota and failure evidence.','Retry result snapshot.'],links:['https://learn.microsoft.com/en-us/office365/servicedescriptions/exchange-online-service-description/exchange-online-limits']},
+{id:'SIG-008',signature:'StalledDueToSource_UnknownReason with CI/CPU clues',family:'Performance & Stalls',phase:'Initial Sync',severity:'High',primaryAction:'Use DiagnosticInfo durations and message strings to isolate source bottleneck.',root:'Source health issue not mapped to explicit stall type.',signals:['Long unknown source stall durations.','DiagnosticInfo mentions CI or Processor unhealthy.','Overall duration drifts far above expected.'],diagnostics:['$stats = Get-MoveRequestStatistics <user> -DiagnosticInfo "verbose,showtimeslots,showtimeline"','$stats.DiagnosticInfo','Get-MailboxDatabaseCopyStatus'],runbook:['Extract duration tree and quantify dominant stall buckets.','Parse DiagnosticInfo for concrete resource clues.','Fix CI or CPU bottleneck on source.','Reduce pressure and re-run pilot move.','Compare before/after duration distribution.'],branchChecks:['No source clues may require on-prem deep support engagement.','If target stalls dominate, evaluate target-side normal throttling behavior first.'],validation:['Unknown source stall duration decreases.','Pilot mailbox progresses through prior stall window.'],prevention:['Monitor CI and CPU health continuously during waves.','Tune endpoint concurrency to observed source throughput.'],escalationPack:['DiagnosticInfo XML and duration snapshots.','Source server health metrics.','Before/after stall breakdown.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-slow-migrations/1795706']},
+{id:'SIG-009',signature:'CompletedWithWarning - source conversion failed (dual mailbox risk)',family:'Post-Completion Integrity',phase:'Post-Completion',severity:'High',primaryAction:'Treat as data-integrity incident until source conversion and access checks are complete.',root:'Post-move cleanup failure left source object state incomplete.',signals:['CompletedWithWarning plus source AD update warning.','Entries show repeated conversion retries.','Potential coexistence of source and cloud mailbox data.'],diagnostics:['Get-MoveRequestStatistics <user> -IncludeReport | Export-Clixml C:\\temp\\EXO_MoveReqStats.xml','$stats.Report.Entries | % { [string] $_ }','Get-RemoteMailbox <user>'],runbook:['Inspect completion entries for conversion failure details.','Validate source object is converted to remote mailbox/mail user.','If dual mailbox exists, execute supported cleanup path immediately.','Reconcile content divergence via supported restore route if required.','Validate OWA/Mapi access and request completion state.'],branchChecks:['If all completion markers exist and conversion succeeded, classify as non-blocking warning.','If conversion incomplete, keep incident open until remediated.'],validation:['Remote mailbox state is correct on-prem.','No dual mailbox coexistence remains.'],prevention:['Make source conversion validation mandatory wave close criterion.','Do not mark wave complete until conversion checks pass.'],escalationPack:['Completion entries excerpt around failure/retry/success lines.','Get-RemoteMailbox evidence.','Access test and data reconciliation evidence.'],links:['https://techcommunity.microsoft.com/blog/exchange/what-to-do-if-a-migration-is-completed-with-warnings/1833566','https://learn.microsoft.com/en-us/troubleshoot/exchange/user-and-shared-mailboxes/cannot-access-mailbox-after-remote-mailbox-moves-to-office-365']},
+{id:'SIG-010',signature:'Insufficient diagnostics package for root-cause isolation',family:'Observability',phase:'All',severity:'Low',primaryAction:'Always collect complete report and diagnostics package before configuration changes.',root:'Status-only triage hides failure mechanics.',signals:['Cannot identify failure side from basic status.','No Entries/Failures/InternalFailures available for analysis.','Escalation delayed by missing artifacts.'],diagnostics:['Get-MoveRequestStatistics <User> -IncludeReport -DiagnosticInfo "showtimeslots,verbose,showtimeline" | Export-Clixml C:\\temp\\EXO_AffectedHybridMoveRequest1Statistics.xml','Get-MigrationUserStatistics <User> -IncludeSkippedItems -IncludeReport -DiagnosticInfo Verbose | Export-Clixml C:\\temp\\AffectedMigUser1Stats.xml','Get-MigrationBatch -DiagnosticInfo Verbose -IncludeReport | Export-Clixml C:\\temp\\EXO_ALL_Batches.xml'],runbook:['Collect move stats XML for failed/slow representative users.','For no-request scenarios, collect migration user statistics XML.','For systemic issues, collect batch XML.','Attach UTC timeline and grouped failure summaries.','Only after evidence collection, apply remediation changes.'],branchChecks:['No move request -> use migration user stats path.','Wide scope issue -> include batch export by default.'],validation:['Incident packet can be reproduced by another engineer.','Hypothesis is tied to concrete report evidence.'],prevention:['Automate diagnostics export bundle in tooling.','Require evidence bundle before incident closure or escalation.'],escalationPack:['Move or migration-user stats XML.','Batch XML for scope-wide failures.','Correlated logs and timeline summary.'],links:['https://techcommunity.microsoft.com/blog/exchange/digging-into-hybrid-migration-move-report-data/1675064']},
+{id:'SIG-011',signature:'Accepted domain not valid for migration user',family:'Identity Mapping',phase:'Pre-Validation',severity:'High',primaryAction:'Add/verify accepted domain and revalidate migration user.',root:'SMTP domain used by user is not accepted in target org.',signals:['You cannot use the domain because it is not accepted.','Validation fails before move request creation.'],diagnostics:['Get-AcceptedDomain | ft DomainName,DomainType','Get-MigrationUser <user> | fl ErrorSummary'],runbook:['Add missing accepted domain in target organization.','Resync affected user and revalidate migration entry.','Retry injection only for corrected users first.'],branchChecks:['If accepted domain exists, inspect stale sync/object mismatch.','If non-routable source suffix exists, remediate address policy first.'],validation:['Error summary clears for corrected users.','RequestGuid is generated successfully.'],prevention:['Domain acceptance audit before each wave.','Block batch import when domains are not accepted.'],escalationPack:['Accepted domain export.','Affected user validation output before/after.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-failed-migrations/1746234']},
+{id:'SIG-012',signature:'Target mailbox missing tenant routing proxy',family:'Identity Mapping',phase:'Pre-Validation',severity:'High',primaryAction:'Stamp missing <tenant>.mail.onmicrosoft.com proxy and resync.',root:'Secondary routing SMTP address is missing on target recipient.',signals:['Target mailbox does not have SMTP proxy matching .mail.onmicrosoft.com.','Migration user validation fails.'],diagnostics:['Get-MailUser <user> | fl EmailAddresses','Get-MigrationUser <user> | fl ErrorSummary'],runbook:['Add required tenant routing proxy address.','Run/confirm directory synchronization.','Revalidate migration user then retry injection.'],branchChecks:['If proxy exists but still failing, inspect recipient type mismatch.','If multiple objects match, resolve identity collision first.'],validation:['Validation error no longer appears.','Move request is created successfully.'],prevention:['Preflight proxy audit for all scoped users.','Enforce routing proxy policy in provisioning.'],escalationPack:['EmailAddresses before/after export.','Validation logs and sync timestamps.'],links:['https://learn.microsoft.com/en-us/exchange/troubleshoot/move-or-migrate-mailboxes/no-smtp-proxy-matching']},
+{id:'SIG-013',signature:'You must specify the PrimaryOnly parameter',family:'Request Parameters',phase:'Injection',severity:'Medium',primaryAction:'Correct move request parameter set for primary/archive scenario.',root:'Request parameter combination conflicts with mailbox topology.',signals:['Move cmdlet fails with PrimaryOnly requirement message.','Archive or primary pairing mismatch in request.'],diagnostics:['Get-MoveRequest <user> | fl *','Review New/Set-MoveRequest parameter combination'],runbook:['Confirm whether primary, archive, or both are intended to move.','Apply PrimaryOnly or equivalent required parameters correctly.','Recreate request with corrected parameter set.'],branchChecks:['If archive auto-expanding/offboarding constraints apply, adjust plan.','If cmdlet generated by service, validate batch endpoint settings.'],validation:['Request accepted without parameter error.','Move advances beyond queued/injection stage.'],prevention:['Template parameter sets per migration scenario.','Review archive/primary flags before submission.'],escalationPack:['Original failing cmdlet and corrected cmdlet.','Mailbox archive state evidence.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-failed-migrations/1746234']},
+{id:'SIG-014',signature:'Access is denied during migration operation',family:'Permissions & Auth',phase:'Injection',severity:'High',primaryAction:'Validate admin permissions, endpoint credentials, and auth chain.',root:'Credential/permission or authorization path mismatch.',signals:['Access is denied in migration error summary.','Endpoint test may pass partially but move fails.'],diagnostics:['Test-MigrationServerAvailability -ExchangeRemoteMove -RemoteServer <fqdn> -Credentials <cred>','Get-MigrationEndpoint | fl *','Review admin role assignments'],runbook:['Validate credentials used by endpoint/service account.','Confirm required role assignments on source and target sides.','Retest endpoint and retry a pilot mailbox.'],branchChecks:['If only specific users fail, inspect object-level permissions.','If all users fail, inspect endpoint credential scope.'],validation:['Access denied errors stop for pilot migration.','Endpoint test and move request both succeed.'],prevention:['Credential rotation runbook with validation gate.','Role assignment audit before migration windows.'],escalationPack:['Endpoint config dump.','Permission and role evidence.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-failed-migrations/1746234']},
+{id:'SIG-015',signature:'Could not switch mailbox into Sync Source mode',family:'Move State Transition',phase:'Completion',severity:'High',primaryAction:'Investigate state transition blockers and object readiness.',root:'Mailbox state transition prerequisites are not met.',signals:['Error indicates mailbox cannot switch to Sync Source mode.','Move halts near transition stage.'],diagnostics:['Get-MoveRequestStatistics <user> -IncludeReport | fl Status,StatusDetail,LastFailure','$stats.Report.Entries | select -Last 100'],runbook:['Inspect status detail and report entries around transition time.','Validate mailbox holds/compliance attributes and move compatibility.','Correct blocker and resume or recreate move as appropriate.'],branchChecks:['If hold/offboarding constraints apply, adjust migration path.','If transient platform issue, retest with single mailbox resume.'],validation:['Mailbox transitions past sync source stage.','No repeat transition failure on rerun.'],prevention:['Pre-check compliance/hold conditions by scenario.','Document transition blockers in preflight report.'],escalationPack:['Transition-stage report entries.','Mailbox compliance/hold attributes export.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-failed-migrations/1746234']},
+{id:'SIG-016',signature:'Reliable session sequence identifier not known',family:'Session Reliability',phase:'Initial Sync',severity:'High',primaryAction:'Fix session interruptions and stale transport channels.',root:'Network/session tear-down caused WS-RM sequence invalidation.',signals:['Sequence identifier not known or remote endpoint no longer recognizes sequence.','Repeated transient retries with lock-like behavior.'],diagnostics:['$stats = Get-MoveRequestStatistics <user> -IncludeReport -DiagnosticInfo verbose','$stats.Report.Failures | group FailureType'],runbook:['Correlate failures with network device timeout behavior.','Stabilize migration path and reduce session interruptions.','Tune keepalive/retry strategy and retest pilot mailbox.'],branchChecks:['If errors persist after path bypass, inspect endpoint/service health.','If accompanied by mailbox lock, follow lock cleanup path.'],validation:['Sequence errors disappear in pilot run.','Sustained copy progression resumes.'],prevention:['Use migration-specific network profile with long-lived session support.','Track transient failure bursts per endpoint.'],escalationPack:['FailureType grouping and timestamps.','Network timeout policy summary.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-failed-migrations/1746234']},
+{id:'SIG-017',signature:'Server unable to process request due to internal error',family:'Service Processing',phase:'Initial Sync',severity:'High',primaryAction:'Collect full diagnostic payload and correlate with server-side logs.',root:'Service-side processing fault or unsupported request context.',signals:['Internal server error during move operations.','Generic fault message suggests IncludeExceptionDetailInFaults context.'],diagnostics:['Get-MoveRequestStatistics <user> -IncludeReport -DiagnosticInfo verbose | Export-Clixml C:\\temp\\MoveStats.xml','Collect IIS/HttpProxy logs for same UTC interval'],runbook:['Capture complete diagnostic package first.','Correlate report stack traces and server logs.','Apply targeted remediation based on exact failing context.'],branchChecks:['If repeats across many users, inspect endpoint-wide issue.','If single user only, inspect mailbox-specific content/state.'],validation:['Internal error not reproduced after fix.','Move proceeds through prior failing stage.'],prevention:['Standardized diagnostic capture before config changes.','Regression check after CU/network changes.'],escalationPack:['MoveStats XML with stack trace context.','Correlated server log extracts.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-failed-migrations/1746234']},
+{id:'SIG-018',signature:'Data consistency score too low (Investigate)',family:'Data Consistency',phase:'Initial Sync',severity:'High',primaryAction:'Review bad/missing/large item profile and integrity before completion.',root:'Consistency checks indicate unacceptable divergence risk.',signals:['Data consistency score flagged as Investigate/too low.','Bad/missing item counters elevated.'],diagnostics:['$stats = Get-MoveRequestStatistics <user> -IncludeReport -DiagnosticInfo verbose','$stats | fl DataConsistencyScore,DataConsistencyScoringFactors,BadItemsEncountered,MissingItemsEncountered'],runbook:['Evaluate scoring factors and affected data classes.','Run integrity checks/repair and reduce problematic items.','Decide completion readiness with business risk visibility.'],branchChecks:['If score improves after repair, continue controlled migration.','If score remains low, pause and escalate with evidence.'],validation:['Score reaches acceptable state for completion policy.','No significant discrepancy post-validation checks.'],prevention:['Pre-migration mailbox health checks for high-risk mailboxes.','Trend data consistency metrics by batch.'],escalationPack:['Score factors export.','Bad/missing item evidence and remediation attempts.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-failed-migrations/1746234']},
+{id:'SIG-019',signature:'Exception has been thrown by the target of an invocation',family:'Configuration Drift',phase:'Pre-Validation',severity:'Medium',primaryAction:'Reconcile endpoint and server configuration after updates.',root:'Underlying config or compatibility issue masked by generic invocation exception.',signals:['Generic invocation exception with minimal immediate context.','Often seen after server config or version changes.'],diagnostics:['Get-WebServicesVirtualDirectory | fl *','Get-MigrationEndpoint | fl *','Capture detailed failure in report/logs'],runbook:['Validate MRSProxy/EWS configuration consistency.','Reapply known-good config using supported cmdlets.','Retest endpoint and pilot move.'],branchChecks:['If change recently applied, rollback/test known-good baseline.','If unchanged environment, inspect certificate and auth dependencies.'],validation:['Invocation exception no longer reproduced.','Pilot move succeeds through prior failure point.'],prevention:['Post-change validation checklist for migration endpoints.','Store baseline config snapshots before updates.'],escalationPack:['Before/after endpoint and EWS config exports.','Failure logs with timestamps.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-failed-migrations/1746234']},
+{id:'SIG-020',signature:'Mailbox is not enabled for Unified Messaging',family:'Feature Compatibility',phase:'Injection',severity:'Medium',primaryAction:'Adjust mailbox feature state to match move requirements.',root:'Mailbox feature state incompatible with migration scenario.',signals:['Error references mailbox not enabled for unified messaging.','Request fails at validation or early processing stage.'],diagnostics:['Get-Mailbox <user> | fl *UM*','Get-MoveRequestStatistics <user> -IncludeReport | fl LastFailure'],runbook:['Review feature state requirements for target scenario.','Enable/disable required feature settings accordingly.','Retry migration after directory convergence.'],branchChecks:['If feature cannot be changed immediately, defer mailbox to separate wave.','If scenario-specific requirements differ, apply correct move template.'],validation:['Feature-related validation errors cleared.','Move request accepted and processing.'],prevention:['Feature compatibility precheck for scoped users.','Wave segmentation by incompatible mailbox features.'],escalationPack:['Mailbox feature state export.','Failure summary before/after change.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-failed-migrations/1746234']},
+{id:'SIG-021',signature:'Target user already has a primary mailbox',family:'Identity Collision',phase:'Injection',severity:'High',primaryAction:'Resolve target mailbox state conflict before migration retry.',root:'Target object already hosts mailbox state conflicting with request.',signals:['Target user already has a primary mailbox.','Move request creation blocked by target object state.'],diagnostics:['Get-Mailbox <user> -SoftDeletedMailbox -ErrorAction SilentlyContinue','Get-Recipient <user> | fl RecipientTypeDetails,ExchangeGuid'],runbook:['Identify conflicting target mailbox/object state.','Resolve conflict per onboarding/offboarding supported workflow.','Recreate migration user/request after conflict cleanup.'],branchChecks:['Onboarding and offboarding require different cleanup paths.','If soft-deleted/inactive objects exist, resolve matching ambiguity first.'],validation:['Conflict error removed.','Request can be injected and processed.'],prevention:['Pre-check target object state before batch creation.','Purge/resolve stale target objects ahead of wave.'],escalationPack:['Recipient and mailbox state exports.','Conflict cleanup actions taken.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-failed-migrations/1746234']},
+{id:'SIG-022',signature:'MapiExceptionTooComplex (unable to query table rows)',family:'Mailbox Data Shape',phase:'Initial Sync',severity:'Medium',primaryAction:'Simplify problematic folder/query structures or skip targeted object class.',root:'Source folder/query complexity exceeds target processing capability.',signals:['MapiExceptionTooComplex in failure context.','DataContext points to specific folder/query area.'],diagnostics:['$stats = Get-MoveRequestStatistics <user> -IncludeReport','$stats.Report.Failures | select -Last 5'],runbook:['Identify folder/query from failure DataContext.','Simplify/delete problematic source search/query object if feasible.','Use targeted MoveOptions (for example SkipFolderRestrictions) when justified.'],branchChecks:['If issue isolated to one folder, source cleanup preferred.','If widespread, evaluate controlled exclusion strategy with risk acceptance.'],validation:['No repeat TooComplex failure after remediation.','Move progresses beyond prior DataContext checkpoint.'],prevention:['Audit complex search-folder structures in high-risk mailboxes.','Keep targeted exclusion strategy documented and controlled.'],escalationPack:['Failure entries with DataContext.','Any MoveOptions applied and justification.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-failed-migrations/1746234']},
+{id:'SIG-023',signature:'Mailbox Replication Proxy reached max active connections',family:'Concurrency & Throughput',phase:'Initial Sync',severity:'Medium',primaryAction:'Align endpoint concurrency with source MRSProxy capacity.',root:'Parallel migration load exceeds source-side active connection limits.',signals:['Reached maximum number of active MRS connections allowed.','Queue grows while throughput degrades.'],diagnostics:['Get-MigrationEndpoint | fl Identity,MaxConcurrentMigrations,MaxConcurrentIncrementalSyncs','Get-MoveRequest | group StatusDetail'],runbook:['Lower concurrency to stable operating point first.','Scale source capacity or adjust server-side limits safely.','Increase concurrency gradually with telemetry checks.'],branchChecks:['If lower concurrency stabilizes, bottleneck confirmed on source capacity.','If no improvement, investigate network/session instability instead.'],validation:['Connection-limit errors stop.','Throughput stabilizes without source overload.'],prevention:['Baseline endpoint capacity with pilot testing.','Use stepwise concurrency changes, not large jumps.'],escalationPack:['Endpoint config before/after.','Throughput and error trend data.'],links:['https://learn.microsoft.com/en-us/exchange/troubleshoot/move-mailboxes/mailbox-migration-reached-maximum-number']},
+{id:'SIG-024',signature:'StalledDueToTarget_MdbAvailability or MdbReplication',family:'Performance & Stalls',phase:'Initial Sync',severity:'Medium',primaryAction:'Monitor expected target stall behavior and escalate only when outlier persists.',root:'Target-side database replication/availability protection stall.',signals:['Target stall bucket dominated by MdbAvailability/MdbReplication.','Progress eventually resumes but with significant delays.'],diagnostics:['Get-MoveRequestStatistics <user> -DiagnosticInfo "verbose,showtimeslots,showtimeline"','$stats.DiagnosticInfo'],runbook:['Quantify stall duration vs expected migration percentile.','Continue monitoring if within expected bounds.','Escalate with diagnostic package if sustained outlier.'],branchChecks:['If source stalls dominate simultaneously, prioritize source remediation first.','If target-only outlier persists beyond threshold, open service escalation.'],validation:['Stall duration returns to normal operating range.','No sustained no-progress condition.'],prevention:['Track percentile-based SLA by mailbox size cohorts.','Escalate with diagnostics only when threshold exceeded.'],escalationPack:['Duration and stall bucket extracts.','Move timeline with percent-complete progression.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-slow-migrations/1795706']},
+{id:'SIG-025',signature:'StalledDueToTarget_DiskLatency/Processor/BigFunnel',family:'Performance & Stalls',phase:'Initial Sync',severity:'Medium',primaryAction:'Differentiate normal protection throttling from sustained incident behavior.',root:'Target resource protection events during migration workload.',signals:['Target stall reasons include DiskLatency, Processor, or BigFunnel.','Move appears slow without immediate hard failure.'],diagnostics:['Get-MoveRequestStatistics <user> -DiagnosticInfo "verbose,showtimeslots,showtimeline"','Inspect duration buckets and timeline progression'],runbook:['Measure cumulative target stall duration and compare to expected baseline.','Avoid repeated restart actions when progress continues.','Escalate only for persistent outlier with full evidence package.'],branchChecks:['If no percent-complete movement for extended period, treat as potential incident.','If steady progression exists, continue controlled monitoring.'],validation:['Progress trend remains monotonic over observation window.','No hard-failure transition occurs.'],prevention:['Use expected-duration guardrails for operator decisions.','Train operators not to overreact to normal transient stalls.'],escalationPack:['Diagnostic duration tree and timeline snapshots.','Observed vs expected duration summary.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-slow-migrations/1795706']},
+{id:'SIG-026',signature:'StalledDueToSource_MailboxLock',family:'Session Locking',phase:'Incremental Sync',severity:'High',primaryAction:'Resolve lock root cause by fixing communication faults and stale sessions.',root:'Source mailbox lock retained after transient communication/session faults.',signals:['Repeated mailbox lock stalls.','Reinjection fails with already-being-moved style transient errors.'],diagnostics:['$stats = Get-MoveRequestStatistics <user> -IncludeReport','$stats.Report.InternalFailures | group FailureType','Correlate lock window with communication errors'],runbook:['Identify whether lock is transient or leaked-session behavior.','Fix communication timeout causes and tune keepalive where appropriate.','Clear stale request/session state if lock persists abnormally.','Retest with single mailbox.'],branchChecks:['Lock beyond expected keepalive window suggests leaked session path.','Lock with repeated communication failures indicates network root cause.'],validation:['Lock-related failures no longer dominate.','Mailbox progresses after retry.'],prevention:['Network stability and timeout policy hardening.','Limit aggressive reinjection loops.'],escalationPack:['InternalFailures group output.','Session/network timeout settings and logs.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-slow-migrations/1795706']},
+{id:'SIG-027',signature:'StalledDueToSource_EndpointCapacityExceeded',family:'Concurrency & Throughput',phase:'Initial Sync',severity:'Medium',primaryAction:'Tune MaxConcurrent* values to source endpoint capacity.',root:'Endpoint concurrency settings exceed sustainable source-side throughput.',signals:['Source endpoint capacity stall reason appears.','Large queued backlog with poor completion rates.'],diagnostics:['Get-MigrationEndpoint | fl Identity,MaxConcurrentMigrations,MaxConcurrentIncrementalSyncs','Get-MigrationConfig | fl MaxConcurrent*'],runbook:['Measure current throughput and failure rate.','Adjust endpoint MaxConcurrent values to stable operating point.','Reassess after one refresh interval before further changes.'],branchChecks:['If throughput improves with lower concurrency, keep conservative settings.','If no improvement, inspect source CPU/CI/network constraints.'],validation:['Capacity-exceeded stall frequency decreases.','Throughput and completion rate improve.'],prevention:['Capacity-based endpoint profiles per source environment.','Pilot-driven concurrency settings instead of static defaults.'],escalationPack:['Endpoint config and throughput metrics.','Stall reason trend over time.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-slow-migrations/1795706']},
+{id:'SIG-028',signature:'CompletedWithWarning with transient DC failure but successful completion markers',family:'Post-Completion Integrity',phase:'Post-Completion',severity:'Low',primaryAction:'Classify correctly by validating completion markers before remediation.',root:'Transient DC unavailability during completion pipeline with successful fallback.',signals:['Warning references one unavailable DC.','Later entries show another DC completed updates.','Request is complete is present.'],diagnostics:['$stats = Get-MoveRequestStatistics <user> -IncludeReport','$stats.Report.Entries | % { [string] $_ }'],runbook:['Check entries for target update success on alternate DC.','Confirm source conversion succeeded.','Confirm final Request is complete marker.','Run access tests and close as successful warning.'],branchChecks:['If any marker missing, follow high-risk completion failure path.','If all markers present, avoid unnecessary remediation.'],validation:['OWA/Mapi access is healthy.','Source conversion state is correct.'],prevention:['Standard completed-with-warning checklist with required markers.','Avoid blanket failure assumptions for transient DC warnings.'],escalationPack:['Ordered completion-entry excerpt with markers.','Access and conversion validation evidence.'],links:['https://techcommunity.microsoft.com/blog/exchange/what-to-do-if-a-migration-is-completed-with-warnings/1833566']},
+{id:'SIG-029',signature:'No move request created (RequestGuid empty)',family:'Request Lifecycle',phase:'Injection',severity:'High',primaryAction:'Troubleshoot migration-user validation path before move-level analysis.',root:'Move injection failed; request never created.',signals:['RequestGuid is empty on migration user.','Get-MoveRequest returns no object for affected user.'],diagnostics:['Get-MigrationUser <user> | fl RequestGuid,ErrorSummary','Get-MigrationUserStatistics <user> -DiagnosticInfo verbose | fl','Get-MoveRequest <user>'],runbook:['Do not troubleshoot move report when no move exists.','Fix user validation blocker (GUID/proxy/domain/type).','Revalidate migration user and confirm RequestGuid generation.','Proceed to move diagnostics only after request exists.'],branchChecks:['If user validation error unclear, use migration-user verbose diagnostics.','If many users affected, inspect batch-level provisioning assumptions.'],validation:['RequestGuid populated.','Move request object exists for user.'],prevention:['Gate batch progression on RequestGuid population checks.','Automate validation-error extraction by batch.'],escalationPack:['Migration user stats verbose output.','Pre/post RequestGuid evidence.'],links:['https://techcommunity.microsoft.com/blog/exchange/digging-into-hybrid-migration-move-report-data/1675064']},
+{id:'SIG-030',signature:'Finalization lock window too long (high folder count + latency)',family:'Performance & Finalization',phase:'Completion',severity:'Medium',primaryAction:'Reduce source latency/folder complexity or use controlled verification strategy.',root:'Content verification scales poorly with high folder counts and high source latency.',signals:['Long completion/final sync lock window.','MailboxInTransit style user impact during completion.'],diagnostics:['(Get-MailboxFolderStatistics <user> -FolderScope NonIpmRoot).Count','$stats = Get-MoveRequestStatistics <user> -IncludeReport','$stats.Report.SessionStatistics.SourceLatencyInfo.Average'],runbook:['Measure folder count and source latency baseline.','Reduce source-side latency or folder complexity where possible.','If necessary, apply controlled skip-content-verification strategy with risk awareness.','Schedule completion during low-impact window and monitor user impact.'],branchChecks:['If latency is low, focus on folder complexity cleanup.','If folder count is modest, investigate alternate completion blockers.'],validation:['Completion lock duration drops to acceptable range.','User access disruption duration is reduced.'],prevention:['Pre-classify high-folder/high-latency mailboxes for special handling.','Complete high-risk mailboxes in dedicated controlled waves.'],escalationPack:['Folder count, latency, and completion duration evidence.','Any verification-skip decisions and approvals.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-slow-migrations/1795706']},
+{id:'SIG-031',signature:'Autodiscover or EWS pre-auth blocks hybrid migration path',family:'Connectivity & Endpoint',phase:'Pre-Validation',severity:'High',primaryAction:'Remove unsupported pre-auth behavior for migration route.',root:'Pre-auth layer interrupts required auth negotiation for hybrid path.',signals:['Endpoint validation fails despite correct credentials.','Intermittent auth prompts or denied responses from edge devices.'],diagnostics:['Test-MigrationServerAvailability -ExchangeRemoteMove -RemoteServer <fqdn> -Credentials <cred>','Review reverse proxy pre-auth rules for EWS/Autodiscover'],runbook:['Bypass pre-auth for migration endpoint path.','Validate direct route and retest endpoint.','Pilot one mailbox then restore minimum required controls.'],branchChecks:['If direct path succeeds only, pre-auth policy is the blocker.','If still failing, inspect cert/TLS and auth method alignment.'],validation:['Endpoint test stable on adjusted route.','Move injection succeeds for pilot mailbox.'],prevention:['Maintain migration-specific exception policy for pre-auth controls.','Review edge policy changes before migration windows.'],escalationPack:['Proxy rule export.','Endpoint test output before and after change.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-failed-migrations/1746234']},
+{id:'SIG-032',signature:'TLS 1.2 not available on source path',family:'Connectivity & Endpoint',phase:'Pre-Validation',severity:'High',primaryAction:'Enable and verify TLS 1.2 support end-to-end.',root:'Protocol mismatch between source path and required secure negotiation.',signals:['Secure channel negotiation failures.','Endpoint tests fail with TLS-related exceptions.'],diagnostics:['Run endpoint test and collect full exception text','Verify server and edge TLS policy/cipher configuration'],runbook:['Enable TLS 1.2 on source servers and edge path.','Validate certificate chain and cipher compatibility.','Retest endpoint and run pilot migration request.'],branchChecks:['If cert chain fails after TLS enablement, fix certificate trust first.','If only one node fails, isolate load balancer pool member.'],validation:['TLS errors disappear in endpoint tests.','Pilot migration proceeds past injection stage.'],prevention:['TLS baseline compliance check before each wave.','Monitor protocol hardening changes via change control.'],escalationPack:['TLS policy snapshot.','Endpoint test output and server node mapping.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-hybrid-migration-endpoints-in-classic-and-modern-hybrid/953006']},
+{id:'SIG-033',signature:'Invalid or incomplete certificate chain for migration endpoint',family:'Connectivity & Endpoint',phase:'Pre-Validation',severity:'High',primaryAction:'Fix external certificate trust and binding on migration path.',root:'Certificate not trusted or chain incomplete for endpoint consumer.',signals:['Endpoint test fails with trust/certificate errors.','Intermittent failures by node when LB fronts multiple cert states.'],diagnostics:['Inspect bound cert on EWS endpoint','Validate chain from client perspective against full path'],runbook:['Install and bind correct third-party certificate chain.','Restart affected services/app pools as required.','Retest endpoint and pilot move.'],branchChecks:['If one node fails and others pass, remove bad node from LB until fixed.','If chain trusted internally only, publish complete chain externally.'],validation:['Endpoint test passes across all nodes.','No cert-related failure in pilot move.'],prevention:['Certificate expiry and chain monitoring with alerting.','LB pool health checks include certificate validation.'],escalationPack:['Certificate thumbprints and chain details.','Per-node endpoint validation evidence.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-failed-migrations/1746234']},
+{id:'SIG-034',signature:'Exchange Online IP ranges blocked on inbound path',family:'Network Access',phase:'Pre-Validation',severity:'High',primaryAction:'Allow required EXO source ranges to EWS/Autodiscover endpoints.',root:'Firewall or ACL blocks migration service source ranges.',signals:['No incoming migration requests observed at source.','Timeout or unreachable patterns from EXO service calls.'],diagnostics:['Firewall logs for denied source ranges','Correlate with missing IIS/HttpProxy entries'],runbook:['Update ACL/firewall rules to permit required EXO ranges.','Validate request arrival in IIS logs after change.','Retry endpoint test and pilot mailbox.'],branchChecks:['If HTTPERR logs show drops before IIS, inspect kernel/network stack filters.','If requests reach IIS but fail, pivot to auth/proxy diagnostics.'],validation:['Requests consistently reach IIS/HttpProxy logs.','Endpoint and pilot move complete initial stages.'],prevention:['Automate EXO IP range update process.','Periodic rule validation against current published ranges.'],escalationPack:['Firewall deny/allow logs.','Post-change request arrival evidence.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-failed-migrations/1746234']},
+{id:'SIG-035',signature:'Load balancer without required persistence causes session churn',family:'Network Devices',phase:'Initial Sync',severity:'High',primaryAction:'Enable suitable persistence or route pinning for MRS sessions.',root:'Session jumps across backend nodes break migration continuity.',signals:['Repeated transient communication errors under load.','Sequence/session style failures with no stable copy interval.'],diagnostics:['Compare backend node handling per request','Correlate failures with LB distribution pattern'],runbook:['Enable required affinity/persistence policy for migration route.','Drain unstable nodes and retest with consistent backend mapping.','Pilot one mailbox with session continuity monitoring.'],branchChecks:['If failures stop with single-node routing, persistence is required.','If failures persist on one node, inspect node-specific health.'],validation:['Stable backend affinity and reduced transient session faults.','Sustained copy progress for pilot user.'],prevention:['Document migration-specific LB profile.','Validate LB persistence after network changes.'],escalationPack:['LB policy export.','Per-node request trace and failure timeline.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-failed-migrations/1746234']},
+{id:'SIG-036',signature:'SSL offload on MRSProxy path causes migration failures',family:'Network Devices',phase:'Injection',severity:'High',primaryAction:'Remove SSL offload from migration route.',root:'Offload behavior breaks expected secure endpoint semantics.',signals:['Auth or cert anomalies on offloaded route.','Endpoint tests fail while direct non-offloaded path works.'],diagnostics:['Compare direct endpoint test vs offloaded endpoint test','Inspect LB or reverse proxy SSL termination settings'],runbook:['Disable SSL offload for migration endpoint path.','Validate end-to-end TLS termination at expected server.','Retest endpoint and pilot mailbox.'],branchChecks:['If offload cannot be removed globally, create dedicated migration path.','If still failing after offload disable, inspect cert and auth config.'],validation:['Endpoint test passes on non-offloaded route.','Pilot migration no longer exhibits offload-related errors.'],prevention:['Migration architecture standard excludes SSL offload on MRS route.','Configuration guardrail in network change process.'],escalationPack:['Before and after SSL offload config.','Endpoint outcomes per path.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-failed-migrations/1746234']},
+{id:'SIG-037',signature:'Exchange 2010 front endpoint cannot proxy newer mailbox versions',family:'Version Compatibility',phase:'Pre-Validation',severity:'High',primaryAction:'Point MRS namespace to supported newer Exchange version endpoint.',root:'Legacy endpoint cannot correctly proxy newer mailbox move path.',signals:['Moves fail for newer mailbox version via legacy endpoint.','Endpoint test behavior differs by mailbox version and server path.'],diagnostics:['Map mailbox versions and endpoint server versions','Validate namespace target in hybrid migration path'],runbook:['Repoint migration namespace to supported newer Exchange version.','Retest endpoint against representative mailbox versions.','Resume migrations after compatibility path is verified.'],branchChecks:['If coexistence exists, ensure traffic avoids unsupported proxy chain.','If failures persist, inspect auth and cert and network on new endpoint.'],validation:['Version-specific failures cease after namespace update.','Pilot moves for affected versions succeed.'],prevention:['Compatibility matrix check in preflight.','Block legacy endpoint use for unsupported version paths.'],escalationPack:['Version mapping and namespace configuration evidence.','Pre and post endpoint results by mailbox version.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-failed-migrations/1746234']},
+{id:'SIG-038',signature:'Offboarding blocked by unsupported hold combination',family:'Compliance Constraints',phase:'Pre-Validation',severity:'High',primaryAction:'Resolve hold state compatibility before offboarding move.',root:'Target or source version does not support active hold configuration.',signals:['Offboarding request rejected due hold constraints.','Validation fails before move creation.'],diagnostics:['Get-Mailbox <user> | fl *Hold*','Review offboarding target version capabilities'],runbook:['Inventory active hold types for impacted mailbox.','Remove or reconfigure unsupported holds per policy.','Retry offboarding only after compliance-approved adjustments.'],branchChecks:['If hold cannot be changed, keep mailbox in supported location.','If multiple hold types exist, isolate unsupported combination.'],validation:['Offboarding validation passes without hold error.','Move request can be created.'],prevention:['Compliance hold compatibility audit prior to offboarding planning.','Automated exclusion list for unsupported hold states.'],escalationPack:['Mailbox hold attribute export.','Compliance approval and remediation record.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-failed-migrations/1746234']},
+{id:'SIG-039',signature:'Offboarding auto-expanding archive not supported',family:'Archive Constraints',phase:'Pre-Validation',severity:'High',primaryAction:'Adjust archive strategy before offboarding attempt.',root:'Auto-expanding archive mailbox cannot be offboarded in current scenario.',signals:['Offboarding archive request rejected for auto-expanding archive.','Validation fails for archive path.'],diagnostics:['Get-Mailbox <user> | fl *Archive*','Review archive expansion state and migration target constraints'],runbook:['Confirm archive expansion status.','Plan supported archive handling alternative before offboarding.','Execute revised migration path for affected mailbox.'],branchChecks:['If archive is mandatory on target, redesign migration approach.','If archive can remain, scope primary-only move where supported.'],validation:['No archive-compatibility errors on revised request.','Move progresses with expected archive behavior.'],prevention:['Archive capability audit before offboarding waves.','Segment users with auto-expanding archives into dedicated plan.'],escalationPack:['Archive state evidence.','Revised scenario decision record.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-failed-migrations/1746234']},
+{id:'SIG-040',signature:'Offboarding blocked because remote mailbox missing ExchangeGUID',family:'Identity Mapping',phase:'Pre-Validation',severity:'High',primaryAction:'Stamp and synchronize required ExchangeGUID before offboarding.',root:'Remote mailbox object missing required GUID identity value.',signals:['Offboarding validation fails citing missing ExchangeGUID.','Request cannot be created.'],diagnostics:['Get-RemoteMailbox <user> | fl ExchangeGuid','Get-Mailbox <user> | fl ExchangeGuid'],runbook:['Identify authoritative mailbox GUID value.','Stamp missing GUID on required remote object.','Synchronize and revalidate offboarding request.'],branchChecks:['If object conflicts exist, resolve identity first.','If GUID mismatch persists, inspect sync attribute flow.'],validation:['ExchangeGUID present and consistent across required objects.','Offboarding request creation succeeds.'],prevention:['GUID consistency check mandatory before offboarding.','Attribute-flow monitoring for GUID fields.'],escalationPack:['Object attribute dumps before and after GUID stamping.','Sync trace for GUID propagation.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-failed-migrations/1746234']},
+{id:'SIG-041',signature:'Offboarding to unsupported target version combination',family:'Version Compatibility',phase:'Pre-Validation',severity:'High',primaryAction:'Align offboarding target to supported version path.',root:'Requested offboarding scenario targets unsupported server combination.',signals:['Validation fails for offboarding version compatibility.','Planning assumptions conflict with supported matrix.'],diagnostics:['Inventory source and target Exchange versions','Map requested scenario to supported matrix'],runbook:['Validate scenario against supported version combinations.','Adjust target path or version to supported state.','Retest with pilot mailbox using corrected scenario.'],branchChecks:['If target cannot be upgraded, redesign destination plan.','If partial support exists, split cohorts by supported path.'],validation:['Compatibility validation passes.','Pilot offboarding move succeeds.'],prevention:['Version compatibility sign-off before offboarding projects.','Automated rule checks in planning workbook.'],escalationPack:['Source and target version inventory.','Scenario decision and validation output.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-failed-migrations/1746234']},
+{id:'SIG-042',signature:'MigrationCSVRowValidationException recipient type mismatch',family:'Recipient Provisioning',phase:'Injection',severity:'High',primaryAction:'Correct recipient type to expected object class for migration method.',root:'CSV entry references object type incompatible with migration flow.',signals:['MigrationCSVRowValidationException on user rows.','Validation fails even with correct address format.'],diagnostics:['Get-Recipient <user> | fl RecipientTypeDetails','Get-MigrationUser <user> | fl ErrorSummary'],runbook:['Identify expected recipient type for selected migration scenario.','Correct object provisioning and type in directory.','Resync and revalidate CSV entries before rerun.'],branchChecks:['If object type cannot change, use method compatible with current type.','If multiple objects exist, resolve ambiguity first.'],validation:['CSV validation passes for corrected recipients.','Move requests are created for corrected rows.'],prevention:['Recipient-type validation before CSV import.','Provisioning rules aligned with migration mode.'],escalationPack:['Recipient type exports and CSV validation outputs.','Directory correction timeline.'],links:['https://techcommunity.microsoft.com/blog/exchange/what-to-do-if-a-migration-is-completed-with-warnings/1833566']},
+{id:'SIG-043',signature:'Multiple entries matched for target identity',family:'Identity Collision',phase:'Injection',severity:'High',primaryAction:'Resolve stale object collisions and target by GUID where needed.',root:'Identity ambiguity due multiple matching directory objects.',signals:['Operation could not be performed because object matched multiple entries.','Move request creation fails on identity lookup.'],diagnostics:['Get-Recipient <user> -ResultSize Unlimited','Check soft-deleted and inactive mailbox objects'],runbook:['Enumerate all matching objects and identify intended target.','Remove or reconcile conflicting stale objects.','Use GUID-based targeting for deterministic request creation if needed.'],branchChecks:['If inactive mailbox retains identity, decide restore vs purge workflow.','If collision spans tenants, verify source anchoring attributes.'],validation:['Identity lookup resolves to single intended object.','Move request creation succeeds without ambiguity error.'],prevention:['Collision scan before batch import.','Lifecycle cleanup of stale objects post-migration.'],escalationPack:['Matching object inventory with IDs.','Cleanup steps and final target selection evidence.'],links:['https://learn.microsoft.com/en-us/exchange/troubleshoot/move-mailboxes/migration-fails-multiple-entries-error']},
+{id:'SIG-044',signature:'ComponentShared mailbox GUID resolution failure',family:'Identity Mapping',phase:'Injection',severity:'High',primaryAction:'Collect mailbox location details and reconcile component mailbox GUID mapping.',root:'GUID in error belongs to component shared mailbox context.',signals:['Cannot find recipient with GUID where GUID is not primary mailbox GUID.','Standard GUID fix does not resolve validation.'],diagnostics:['Get-MailboxLocation -User <Identity> | fl','Capture error GUID and compare with mailbox location GUIDs'],runbook:['Identify whether error GUID maps to component shared mailbox.','Collect mailbox location outputs and context identifiers.','Escalate with full evidence for component mailbox resolution.'],branchChecks:['If GUID maps to primary mailbox, use standard GUID mapping runbook.','If component mapping confirmed, do not force incorrect GUID stamping.'],validation:['Component GUID mapping issue resolved or workaround provided.','User move request can be created.'],prevention:['Include component mailbox check when GUID mismatch is unclear.','Capture mailbox location metadata in advanced preflight.'],escalationPack:['Error GUID evidence.','Get-MailboxLocation output for affected user.'],links:['https://techcommunity.microsoft.com/blog/exchange/digging-into-hybrid-migration-move-report-data/1675064']},
+{id:'SIG-045',signature:'Large item handling exceeds limits during move',family:'Mailbox Data Shape',phase:'Initial Sync',severity:'Medium',primaryAction:'Identify and remediate large-item outliers before rerun.',root:'Items exceed migration large-item handling thresholds or policy.',signals:['LargeItemsEncountered rises with repeated failures.','Move stalls near large attachment contexts.'],diagnostics:['$stats = Get-MoveRequestStatistics <user> -IncludeReport | fl LargeItemsEncountered,LargeItemLimit','$stats.Report.LargeItems | select -First 20'],runbook:['Inventory large-item outliers from report.','Clean or split or relocate excessive large items.','Adjust policy only with explicit risk approval.','Rerun and monitor large item counters.'],branchChecks:['If large items are business-critical, plan alternate transfer path.','If large item volume is broad, schedule pre-cleanup campaign.'],validation:['Large-item related failures no longer block progress.','Move proceeds with acceptable handled item profile.'],prevention:['Pre-scan large item distribution for heavy mailboxes.','Set clear large-item policy before wave execution.'],escalationPack:['LargeItems report excerpt.','Cleanup actions and policy decisions.'],links:['https://techcommunity.microsoft.com/blog/exchange/digging-into-hybrid-migration-move-report-data/1675064']},
+{id:'SIG-046',signature:'Corrupt ACL or principal resolution failures in report',family:'Data Quality & Corruption',phase:'Initial Sync',severity:'High',primaryAction:'Repair or exclude affected ACL-related objects under controlled policy.',root:'Corrupt ACL references or unresolved principals in source content.',signals:['Failures reference unresolved principal or ACL corruption context.','BadItems include ACL-type anomalies.'],diagnostics:['$stats = Get-MoveRequestStatistics <user> -IncludeReport -DiagnosticInfo verbose','$stats.Report.BadItems | select -First 20','$stats.Report.Failures | group FailureType'],runbook:['Identify corrupt ACL and principal contexts from report data.','Repair source objects where feasible.','Apply targeted MoveOptions exclusions only when justified.','Rerun and verify failure class reduction.'],branchChecks:['If corruption scope is narrow, source cleanup preferred.','If widespread and non-critical, controlled skip strategy may be accepted.'],validation:['ACL-related failure class drops significantly.','Move progresses without repeated ACL blockers.'],prevention:['ACL hygiene checks in legacy mailboxes.','Include ACL corruption pattern in preflight risk scoring.'],escalationPack:['BadItems and failure context exports.','Repair or exclusion actions with rationale.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-failed-migrations/1746234']},
+{id:'SIG-047',signature:'Target mailbox reset or unlock anomalies during completion',family:'Completion Pipeline',phase:'Completion',severity:'Medium',primaryAction:'Verify completion sequence and ensure target reset finished correctly.',root:'Completion pipeline hit transient issue while resetting or unlocking target mailbox.',signals:['Completion entries show reset or unlock retries.','Users may see temporary access anomalies post-cutover.'],diagnostics:['$stats = Get-MoveRequestStatistics <user> -IncludeReport','$stats.Report.Entries | select -Last 120'],runbook:['Review completion timeline for reset or unlock outcomes.','Confirm final completion marker and access readiness.','If retries failed, escalate with completion evidence package.'],branchChecks:['If completion marker present and access healthy, monitor only.','If completion marker absent, treat as active completion incident.'],validation:['Target mailbox accessible and stable after completion.','No repeated reset or unlock warnings in checks.'],prevention:['Completion-phase monitoring checklist with explicit unlock checks.','Schedule high-risk cutovers with rapid validation window.'],escalationPack:['Completion entries around reset or unlock phase.','Access validation outputs.'],links:['https://techcommunity.microsoft.com/blog/exchange/what-to-do-if-a-migration-is-completed-with-warnings/1833566']},
+{id:'SIG-048',signature:'OWA works but Outlook fails after remote move',family:'Post-Completion Integrity',phase:'Post-Completion',severity:'High',primaryAction:'Fix source conversion and AD or permission inheritance state.',root:'Post-move source object conversion or permission state is inconsistent.',signals:['User can access OWA but Outlook connectivity fails.','Post-move access regression after apparent successful completion.'],diagnostics:['Get-RemoteMailbox <user>','Review completion entries for source conversion warnings','Validate AD permission inheritance state'],runbook:['Confirm source object converted correctly to remote mailbox or mail user state.','Correct AD permission inheritance and object attributes as needed.','Re-test Outlook connectivity after state correction.'],branchChecks:['If conversion incomplete, treat as dual-mailbox risk and remediate urgently.','If conversion correct, inspect client autodiscover and profile path.'],validation:['Outlook and OWA both work post-remediation.','No repeated conversion warnings remain.'],prevention:['Mandatory post-cutover Outlook and OWA validation checklist.','Source conversion audit before closure.'],escalationPack:['Remote mailbox state evidence.','Completion warnings and access test results.'],links:['https://learn.microsoft.com/en-us/troubleshoot/exchange/user-and-shared-mailboxes/cannot-access-mailbox-after-remote-mailbox-moves-to-office-365']},
+{id:'SIG-049',signature:'Missing folders or items reported after migration completion',family:'Post-Completion Integrity',phase:'Post-Completion',severity:'High',primaryAction:'Use supported recovery path while source-retention window remains.',root:'Partial transfer or skipped or corrupt content, or post-move divergence created mailbox content gaps.',signals:['User reports missing folders/items after migration.','Mailbox verification or user compare shows source-target differences.'],diagnostics:['$stats = Get-MoveRequestStatistics <user> -IncludeReport','$stats.Report.MailboxVerification | fl *','$stats.Report.BadItems | select -First 50','$stats.Report.Failures | select -First 50'],runbook:['Confirm whether issue is true missing data or client-view artifact.','Use MailboxVerification plus BadItems/Failures to classify gaps.','Recover from source or backup using approved restore path while retention is valid.','Re-verify folder/item parity with user before closure.'],branchChecks:['If source data no longer exists, escalate recovery scope immediately.','If only client view is impacted, fix profile/cache instead of data restore.'],validation:['User confirms content parity after remediation.','No open verification mismatch for affected mailbox.'],prevention:['Run post-cutover verification for high-risk mailboxes.','Enforce retention-safe window before source cleanup.'],escalationPack:['MailboxVerification/BadItems/Failures excerpts.','Recovery timeline and retention-state evidence.'],links:['https://learn.microsoft.com/en-us/exchange/troubleshoot/move-or-migrate-mailboxes/mailbox-migration-reached-bad-item-limit','https://techcommunity.microsoft.com/blog/exchange/digging-into-hybrid-migration-move-report-data/1675064']},
+{id:'SIG-050',signature:'Migration status filter shows no data due stale cache state',family:'Operational Workflow',phase:'All',severity:'Medium',primaryAction:'Separate cache-filtered view from forced server refresh logic.',root:'UI scope and filter state excludes available records in cache snapshot.',signals:['No move requests matched after scope or status switch.','Manual refresh returns data while cache-only view does not.'],diagnostics:['Inspect active filter set and cache timestamp','Run direct Get-MoveRequest and Get-MigrationBatch checks'],runbook:['Display explicit cache vs live mode to operator.','Trigger force refresh on filter state transitions where needed.','Rebuild cache after status taxonomy changes.'],branchChecks:['If live query also empty, issue is upstream retrieval not cache.','If cache-only empty and live has data, refresh and cache invalidation fix required.'],validation:['Filter changes immediately reflect expected scoped records.','No false-empty states after refresh cycles.'],prevention:['Versioned cache schema and filter-state migration logic.','Telemetry on cache-hit empty anomalies.'],escalationPack:['Filter state snapshot.','Cache timestamp and live-query comparison output.'],links:['https://learn.microsoft.com/en-us/powershell/module/exchange/get-migrationbatch?view=exchange-ps']},
+{id:'SIG-051',signature:'Migration mailbox for the organization is missing or invalid',family:'Org Configuration',phase:'Pre-Validation',severity:'High',primaryAction:'Restore and enable the migration arbitration mailbox required by New-MigrationBatch.',root:'Migration arbitration mailbox was deleted, disabled, or not prepared in AD.',signals:['New-MigrationBatch fails with migration mailbox missing/invalid.','Batch creation fails before user-level validation starts.'],diagnostics:['Get-Mailbox -Arbitration | ? { $_.Name -like \"Migration.*\" } | fl Name,Alias,ExchangeVersion,ServerName','Get-OrganizationConfig | fl MigrationMailbox'],runbook:['Verify Migration.8f3e7716-2011-43e4-96b1-aba62d229136 object exists.','Run Setup /PrepareAD if migration arbitration object is missing.','Enable arbitration mailbox and set management flag.','Retry New-MigrationBatch after AD replication converges.'],branchChecks:['If mailbox exists but disabled, enable mailbox and re-test.','If Setup/PrepareAD cannot run in current window, defer batch creation and follow change control.'],validation:['New-MigrationBatch creates batch successfully.','No migration mailbox invalid error on retry.'],prevention:['Include migration arbitration mailbox health check in preflight gates.','After schema/CU changes, re-verify arbitration mailbox state.'],escalationPack:['Arbitration mailbox inventory output.','PrepareAD and enablement command transcript.'],links:['https://learn.microsoft.com/en-us/troubleshoot/exchange/migration/moving-migration-mailbox-fails']},
+{id:'SIG-052',signature:'RestartMoveCorruptSyncStateTransientException / corrupt Search Folder offboarding errors',family:'Search Folder Corruption',phase:'Initial Sync',severity:'High',primaryAction:'Reset user Search Folders/views, then retry move with refreshed report evidence.',root:'Corrupted virtual Search Folders in source profile trigger repeated transient restart loop.',signals:['Offboarding stalls around low percentage then fails.','Move report includes RestartMoveCorruptSyncStateTransientException and Search Folder data context.'],diagnostics:['$stats = Get-MoveRequestStatistics -Identity <user> -IncludeReport','$stats.Report.Failures | select -Last 5','Get-MoveRequestStatistics -Identity <user> -IncludeReport -DiagnosticInfo showtimeslots | Export-CliXml C:\\temp\\MoveStats_SearchFolder.xml'],runbook:['Reset Search Folders with outlook.exe /cleanfinders.','Restore default views with outlook.exe /cleanviews.','Resume/retry move request and recheck latest failure lines.','Escalate with exported XML if search corruption persists.'],branchChecks:['If no Search-related DataContext appears, pivot to generic communication/session transient flow.','If issue repeats only for one user, keep remediation user-scoped instead of global.'],validation:['Move progresses beyond prior stalled checkpoint.','No recurring Search Folder transient signatures in latest failures.'],prevention:['Preflight check heavy legacy Search Folder usage for offboarding cohorts.','Capture and review failure DataContext before repeated resumes.'],escalationPack:['Last failures excerpt with DataContext.','Post-cleanfinders/cleanviews retry outcome and XML export.'],links:['https://learn.microsoft.com/en-us/troubleshoot/exchange/move-or-migrate-mailboxes/transientexception-errors-when-moving-mailboxes']},
+{id:'SIG-053',signature:'DataExportTransientException bursts degrade move and lead to eventual failure',family:'Failure Class Patterns',phase:'Initial Sync',severity:'Medium',primaryAction:'Treat repeated transient export failures as path/system health issue before they convert to permanent failure.',root:'Repeated export-side transient faults exhaust retries and promote terminal failure state.',signals:['FailureType grouping dominated by DataExportTransientException.','High retry count and poor throughput before hard failure.'],diagnostics:['$stats = Get-MoveRequestStatistics <user> -IncludeReport','$stats.Report.Failures | group FailureType | sort Count -Desc | ft -AutoSize','$stats.Report.Failures | ? { $_.FailureType -eq \"DataExportTransientException\" } | select -Last 10'],runbook:['Quantify transient burst frequency and timeline concentration.','Stabilize endpoint/network/resource conditions before blind retries.','Resume one pilot request; if recurring, recreate request after root-cause fix.','Escalate with grouped failure evidence when transient class remains dominant.'],branchChecks:['If transient errors span many users, treat as systemic endpoint/path incident.','If isolated to one mailbox, inspect data-shape and mailbox-specific corruption indicators.'],validation:['DataExportTransientException count drops materially on rerun.','Move progresses without entering permanent-failure state.'],prevention:['Track transient-to-permanent conversion trend by endpoint.','Apply guardrails that stop repeated retries without remediation.'],escalationPack:['Grouped failure distribution and last-10 transient entries.','Retry timeline with endpoint health context.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-failed-migrations/1746234']},
+{id:'SIG-054',signature:'StoragePermanentException indicates hard mailbox/store-side failure',family:'Failure Class Patterns',phase:'Initial Sync',severity:'High',primaryAction:'Handle as durable fault: repair/correct root cause before recreation or resume.',root:'Store-level or mailbox data condition triggers non-transient failure classification.',signals:['FailureType shows StoragePermanentException.','Move reaches Failed state without recovering on resume.'],diagnostics:['$stats = Get-MoveRequestStatistics <user> -IncludeReport -DiagnosticInfo verbose','$stats.Report.Failures | ? { $_.FailureType -eq \"StoragePermanentException\" } | select -Last 5','$stats.Report.Entries | select -Last 120'],runbook:['Capture full permanent-failure context and data-side indicators.','Run mailbox integrity remediation where applicable.','Remove/recreate request only after root condition is addressed.','Validate with single-user pilot before restoring batch concurrency.'],branchChecks:['If corruption indicators are present, follow corruption repair/skip policy path.','If no data-shape issue appears, inspect backend store/service health and permissions path.'],validation:['No StoragePermanentException on pilot rerun.','Move completes or reaches stable syncing state.'],prevention:['Early detection on permanent-failure class emergence in active waves.','Mandatory evidence capture before request recreation.'],escalationPack:['Permanent-failure entries plus verbose diagnostic export.','Repair actions and before/after request outcomes.'],links:['https://techcommunity.microsoft.com/blog/exchange/troubleshooting-failed-migrations/1746234']},
+{id:'SIG-055',signature:'MigrationPermanentException: IM list migration completed flag blocks offboarding',family:'Exchange 2010 Offboarding Compatibility',phase:'Injection',severity:'High',primaryAction:'Reset IM list migration completion flag, then retry offboarding move.',root:'Legacy IM list migration completion flag prevents mailbox offboarding to Exchange 2010.',signals:['Offboarding move fails with MigrationPermanentException mentioning ImListMigrationCompleted.','Issue seen on Exchange Online to Exchange 2010 moves.'],diagnostics:['Get-Mailbox <user> | fl ImListMigrationCompleted,ExchangeVersion','Get-MoveRequestStatistics <user> -IncludeReport | fl LastFailure,Message'],runbook:['Set ImListMigrationCompleted to $false on affected mailbox.','Resume/recreate offboarding move request.','Recheck move report for elimination of IM-list specific failure.'],branchChecks:['If target is not Exchange 2010, verify scenario before applying flag reset.','If failure persists after reset, inspect other offboarding compatibility blockers.'],validation:['Move no longer fails with ImListMigrationCompleted-related exception.','Mailbox progresses in offboarding pipeline.'],prevention:['Pre-check ImListMigrationCompleted for Exchange 2010 offboarding cohorts.','Segment legacy-target moves with dedicated validation template.'],escalationPack:['Mailbox property export before/after flag change.','Failure excerpt and retry outcome evidence.'],links:['https://learn.microsoft.com/en-us/troubleshoot/exchange/move-mailboxes/mailbox-migration-fails-for-office-365-users']},
+{id:'SIG-056',signature:'Remote mailbox shows Completed but mailbox data not moved',family:'Status / Outcome Mismatch',phase:'Post-Completion',severity:'High',primaryAction:'Treat Completed-without-data as migration outcome mismatch and validate by mailbox content/state, not status alone.',root:'Status reporting indicates completion while mailbox data/location state remains inconsistent (often legacy mixed-version/offboarding edge cases).',signals:['Move status indicates Completed but mailbox content/location is unchanged or incomplete.','User impact contradicts reported completion state.'],diagnostics:['Get-MoveRequest <user> | fl Status,StatusDetail,TargetDatabase','Get-MoveRequestStatistics <user> -IncludeReport | fl Message,FailureType,FailureSide,PercentComplete','$stats.Report.Entries | select -Last 150'],runbook:['Validate actual mailbox location/content outcome versus reported status.','If mismatch confirmed, remove failed request state and recreate move with corrected prerequisites.','Re-run single pilot mailbox before resuming batch operations.','Document mismatch pattern for post-incident control update.'],branchChecks:['If report shows hidden warnings/errors near completion, follow those root-cause runbooks first.','If no report evidence exists, collect full diagnostics and escalate as status-reporting anomaly.'],validation:['Reported status aligns with actual mailbox location/content after rerun.','No further completion/status mismatch for pilot and cohort.'],prevention:['Mandatory post-completion functional validation before closure.','Do not close incidents on status field alone.'],escalationPack:['Status vs actual mailbox-state evidence set.','Report entries around completion boundary and recreated request outcome.'],links:['https://learn.microsoft.com/en-us/troubleshoot/exchange/move-mailboxes/remote-mailbox-not-moved-when-move-status-completed']},
+{id:'SIG-999',signature:'Unknown or unmapped migration error signature',family:'Unmapped / New Pattern',phase:'All',severity:'Medium',primaryAction:'Capture full evidence package, classify failure side, and map to nearest known family.',root:'Error is new, environment-specific, or insufficiently instrumented in current catalog.',signals:['Error text not found in known signature matrix.','Status-only output does not identify actionable root cause.'],diagnostics:['Get-MoveRequestStatistics <user> -IncludeReport -DiagnosticInfo "verbose,showtimeslots,showtimeline" | Export-Clixml C:\\temp\\UnknownError_MoveStats.xml','Get-MigrationUserStatistics <user> -IncludeReport -DiagnosticInfo Verbose | Export-Clixml C:\\temp\\UnknownError_MigUserStats.xml','Collect correlated HTTPERR/IIS/HttpProxy logs in same UTC window'],runbook:['Collect complete evidence before changing settings.','Classify failure side: source, target, identity, network, completion, or data-shape.','Map to closest known family and execute matching runbook controls.','If still unresolved, escalate with full artifact pack and reproduction timeline.'],branchChecks:['If move request does not exist, pivot to migration-user injection diagnostics.','If many users fail identically, treat as systemic endpoint/environment issue.'],validation:['Root-cause hypothesis is supported by report evidence.','A repeat test confirms issue is resolved or reproducible for escalation.'],prevention:['Add new confirmed patterns back into this catalog after incident closure.','Keep evidence-first workflow mandatory for unknown failures.'],escalationPack:['Move stats XML + migration user stats XML + UTC-correlated infra logs.','Clear reproduction steps and environment change history.'],links:['https://techcommunity.microsoft.com/blog/exchange/digging-into-hybrid-migration-move-report-data/1675064','https://learn.microsoft.com/en-us/exchange/troubleshoot/move-or-migrate-mailboxes/troubleshoot-migration-issues-in-exchange-hybrid']}
+];
+const playbooks=[
+{title:'P1: Pre-Flight Gate',trigger:'Before each migration wave.',steps:['Run full baseline checklist.','Execute endpoint test and one pilot injection.','Block wave if critical checks fail.','Record baseline evidence snapshot.']},
+{title:'P2: Timeout + Lock Recovery',trigger:'Communication transients and lock loops.',steps:['Correlate report and infra logs by UTC.','Stabilize network path and remove unsupported controls.','Clean stale request/session state.','Retry one mailbox before scaling.']},
+{title:'P3: Slow Move Isolation',trigger:'Sustained stalls or low throughput.',steps:['Collect DiagnosticInfo timeline package.','Separate source vs target stall dominance.','Fix source bottlenecks first when source dominates.','Tune concurrency with measured headroom only.']},
+{title:'P4: CompletedWithWarning Closure',trigger:'Any mailbox with warning completion.',steps:['Inspect completion markers in entries.','Validate source conversion and client access.','Remediate dual-mailbox risk immediately if found.','Close only after validation evidence is complete.']}
+];
+
+const msResources=[
+{title:'Troubleshoot migration issues in Exchange hybrid',url:'https://learn.microsoft.com/en-us/exchange/troubleshoot/move-or-migrate-mailboxes/troubleshoot-migration-issues-in-exchange-hybrid',note:'Primary decision entry point.'},
+{title:'Get-MoveRequestStatistics',url:'https://learn.microsoft.com/en-us/powershell/module/exchange/get-moverequeststatistics?view=exchange-ps',note:'Core report/diagnostic cmdlet.'},
+{title:'403 migration error troubleshooting',url:'https://learn.microsoft.com/en-us/troubleshoot/exchange/move-mailboxes/remote-server-returned-error-403-forbidden',note:'403-specific path and auth patterns.'},
+{title:'User is already being moved',url:'https://learn.microsoft.com/en-us/exchange/troubleshoot/move-mailboxes/user-is-already-being-moved-error',note:'Lifecycle cleanup reference.'},
+{title:'MRS max active connections',url:'https://learn.microsoft.com/en-us/exchange/troubleshoot/move-mailboxes/mailbox-migration-reached-maximum-number',note:'Concurrency/capacity issue reference.'},
+{title:'No SMTP proxy matching tenant domain',url:'https://learn.microsoft.com/en-us/exchange/troubleshoot/move-or-migrate-mailboxes/no-smtp-proxy-matching',note:'Identity/proxy precondition reference.'},
+{title:'Exchange Online limits',url:'https://learn.microsoft.com/en-us/office365/servicedescriptions/exchange-online-service-description/exchange-online-limits',note:'Folder and item limits.'},
+{title:'Troubleshooting Failed Migrations',url:'https://techcommunity.microsoft.com/blog/exchange/troubleshooting-failed-migrations/1746234',note:'Detailed failure taxonomy.'},
+{title:'Troubleshooting Slow Migrations',url:'https://techcommunity.microsoft.com/blog/exchange/troubleshooting-slow-migrations/1795706',note:'Stall and performance guidance.'},
+{title:'Completed With Warnings',url:'https://techcommunity.microsoft.com/blog/exchange/what-to-do-if-a-migration-is-completed-with-warnings/1833566',note:'Completion warning triage.'},
+{title:'Digging Into Move Report Data',url:'https://techcommunity.microsoft.com/blog/exchange/digging-into-hybrid-migration-move-report-data/1675064',note:'Evidence extraction model.'}
+];
+
+const thirdPartyResources=[
+{title:'Practical365 - Mailbox move requests',url:'https://practical365.com/working-with-mailbox-move-requests/',note:'Operational handling patterns.'},
+{title:'Practical365 - CompleteAfter parameter',url:'https://practical365.com/understanding-using-completeafter-parameter-move-requests/',note:'Completion timing practices.'},
+{title:'Ali Tajran - HCW endpoint issue',url:'https://www.alitajran.com/fix-hcw8078-migration-endpoint-could-not-be-created/',note:'Supplemental endpoint troubleshooting.'},
+{title:'BitTitan common migration errors',url:'https://help.bittitan.com/hc/en-us/articles/115008106367-Common-Errors-and-Resolutions',note:'Supplemental error examples.'},
+{title:'CodeTwo migration troubleshooting',url:'https://www.codetwo.com/kb/troubleshooting-office-365-migration/',note:'Supplemental checklist.'},
+{title:'Quest On Demand migration troubleshooting',url:'https://support.quest.com/technical-documents/on-demand-migration/current/troubleshooting-guide',note:'Supplemental runbook content.'}
+];
+
+const allResources=[...msResources,...thirdPartyResources];
+const severityOrder=['Critical','High','Medium','Low'];
+const families=[...new Set(signatures.map(s=>s.family))].sort();
+const state={q:'',phase:'all',sevs:new Set(severityOrder),fams:new Set(families),selected:null,resourceQ:'',targetUser:'',targetBatch:''};
+const els={q:document.getElementById('q'),phase:document.getElementById('phase'),targetUser:document.getElementById('target-user'),targetBatch:document.getElementById('target-batch'),sevChips:document.getElementById('sev-chips'),famChips:document.getElementById('fam-chips'),matrixBody:document.getElementById('matrix-body'),detail:document.getElementById('detail'),kpiMatched:document.getElementById('kpi-matched'),kpiHigh:document.getElementById('kpi-high'),resourceQ:document.getElementById('resource-q')};
+
+function sevClass(v){if(v==='Critical')return 'p-critical';if(v==='High')return 'p-high';if(v==='Medium')return 'p-medium';return 'p-low';}
+function makeChip(host,value,setRef){const b=document.createElement('button');b.className='chip active';b.textContent=value;b.onclick=()=>{if(setRef.has(value))setRef.delete(value);else setRef.add(value);b.classList.toggle('active',setRef.has(value));render();};host.appendChild(b);}
+severityOrder.forEach(v=>makeChip(els.sevChips,v,state.sevs));families.forEach(v=>makeChip(els.famChips,v,state.fams));
+
+function matches(item){const q=state.q.trim().toLowerCase();if(q){const blob=[item.signature,item.family,item.phase,item.primaryAction,item.root,...item.signals,...item.runbook,...item.branchChecks].join(' ').toLowerCase();if(!blob.includes(q))return false;}if(state.phase!=='all'&&item.phase!==state.phase&&item.phase!=='All')return false;if(!state.sevs.has(item.severity))return false;if(!state.fams.has(item.family))return false;return true;}
+
+function escapeHtml(v){return String(v??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+function applyTokens(line,mailbox,batch){return String(line||'').replace(/<user>|<smtp>|<User>|<Identity>|<identity>/g,mailbox).replace(/<fqdn>/g,'$RemoteServer').replace(/<cred>/g,'$Cred').replace(/<batch>/g,batch);}
+function toCommands(lines){return (lines||[]).map(x=>String(x||'').trim()).filter(Boolean);}
+const signatureActuationMap={
+'SIG-001':['Set-WebServicesVirtualDirectory -Identity "<EWSVDirIdentity>" -MRSProxyEnabled $true','iisreset /noforce'],
+'SIG-002':['Set-WebServicesVirtualDirectory -Identity "<EWSVDirIdentity>" -MRSProxyEnabled $true','Set-MigrationEndpoint -Identity "<EndpointName>" -MaxConcurrentMigrations 20 -MaxConcurrentIncrementalSyncs 10'],
+'SIG-003':['Set-MigrationEndpoint -Identity "<EndpointName>" -MaxConcurrentMigrations 10 -MaxConcurrentIncrementalSyncs 5','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-004':['Set-RemoteMailbox -Identity $Mailbox -ExchangeGuid "<AuthoritativeExchangeGuid>"','Start-ADSyncSyncCycle -PolicyType Delta'],
+'SIG-005':['Suspend-MoveRequest -Identity $Mailbox','Resume-MoveRequest -Identity $Mailbox','Remove-MoveRequest -Identity $Mailbox -Confirm:$false'],
+'SIG-006':['New-MailboxRepairRequest -Mailbox $Mailbox -CorruptionType ProvisionedFolder,SearchFolder,AggregateCounts,FolderView','Set-MoveRequest -Identity $Mailbox -BadItemLimit 50 -AcceptLargeDataLoss'],
+'SIG-007':['Set-MoveRequest -Identity $Mailbox -LargeItemLimit 50 -AcceptLargeDataLoss','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-008':['Set-MigrationEndpoint -Identity "<EndpointName>" -MaxConcurrentMigrations 10 -MaxConcurrentIncrementalSyncs 5','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-009':['Set-RemoteMailbox -Identity $Mailbox -ExchangeGuid "<ExpectedGuid>"','Update-Recipient -Identity $Mailbox'],
+'SIG-010':['Start-Transcript -Path "C:\\\\\\\\temp\\\\\\\\MigrationIncident_$Mailbox.log" -Append','Resume-MoveRequest -Identity $Mailbox','Stop-Transcript'],
+'SIG-011':['Set-RemoteMailbox -Identity $Mailbox -ExchangeGuid "<AuthoritativeExchangeGuid>"','Start-ADSyncSyncCycle -PolicyType Delta','New-AcceptedDomain -Name "<DomainName>" -DomainName "<domain.tld>" -DomainType Authoritative'],
+'SIG-012':['Set-RemoteMailbox -Identity $Mailbox -ExchangeGuid "<AuthoritativeExchangeGuid>"','Start-ADSyncSyncCycle -PolicyType Delta','Set-MailUser -Identity $Mailbox -EmailAddresses @{Add="smtp:<alias>@<tenant>.mail.onmicrosoft.com"}'],
+'SIG-013':['Remove-MoveRequest -Identity $Mailbox -Confirm:$false','New-MoveRequest -Identity $Mailbox -SuspendWhenReadyToComplete','New-MoveRequest -Identity $Mailbox -PrimaryOnly -SuspendWhenReadyToComplete'],
+'SIG-014':['Set-MigrationEndpoint -Identity "<EndpointName>" -Credentials $Cred','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-015':['Remove-MoveRequest -Identity $Mailbox -Confirm:$false','New-MoveRequest -Identity $Mailbox -SuspendWhenReadyToComplete'],
+'SIG-016':['Suspend-MoveRequest -Identity $Mailbox','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-017':['iisreset /noforce','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-018':['New-MailboxRepairRequest -Mailbox $Mailbox -CorruptionType ProvisionedFolder,SearchFolder,AggregateCounts,FolderView','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-019':['iisreset /noforce','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-020':['Disable-UMMailbox -Identity $Mailbox -Confirm:$false','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-021':['Set-RemoteMailbox -Identity $Mailbox -ExchangeGuid "<AuthoritativeExchangeGuid>"','Start-ADSyncSyncCycle -PolicyType Delta'],
+'SIG-022':['Set-MoveRequest -Identity $Mailbox -LargeItemLimit 50 -AcceptLargeDataLoss','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-023':['Set-MigrationEndpoint -Identity "<EndpointName>" -MaxConcurrentMigrations 10 -MaxConcurrentIncrementalSyncs 5','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-024':['Set-MigrationEndpoint -Identity "<EndpointName>" -MaxConcurrentMigrations 10 -MaxConcurrentIncrementalSyncs 5','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-025':['Set-MigrationEndpoint -Identity "<EndpointName>" -MaxConcurrentMigrations 10 -MaxConcurrentIncrementalSyncs 5','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-026':['Suspend-MoveRequest -Identity $Mailbox','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-027':['Set-MigrationEndpoint -Identity "<EndpointName>" -MaxConcurrentMigrations 10 -MaxConcurrentIncrementalSyncs 5','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-028':['Update-Recipient -Identity $Mailbox','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-029':['Remove-MoveRequest -Identity $Mailbox -Confirm:$false','New-MoveRequest -Identity $Mailbox -SuspendWhenReadyToComplete'],
+'SIG-030':['Set-MigrationEndpoint -Identity "<EndpointName>" -MaxConcurrentMigrations 10 -MaxConcurrentIncrementalSyncs 5','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-031':['Set-WebServicesVirtualDirectory -Identity "<EWSVDirIdentity>" -MRSProxyEnabled $true','Set-MigrationEndpoint -Identity "<EndpointName>" -MaxConcurrentMigrations 20 -MaxConcurrentIncrementalSyncs 10'],
+'SIG-032':['Set-WebServicesVirtualDirectory -Identity "<EWSVDirIdentity>" -MRSProxyEnabled $true','Set-MigrationEndpoint -Identity "<EndpointName>" -MaxConcurrentMigrations 20 -MaxConcurrentIncrementalSyncs 10'],
+'SIG-033':['Set-WebServicesVirtualDirectory -Identity "<EWSVDirIdentity>" -MRSProxyEnabled $true','Set-MigrationEndpoint -Identity "<EndpointName>" -MaxConcurrentMigrations 20 -MaxConcurrentIncrementalSyncs 10'],
+'SIG-034':['Suspend-MoveRequest -Identity $Mailbox','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-035':['Suspend-MoveRequest -Identity $Mailbox','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-036':['Suspend-MoveRequest -Identity $Mailbox','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-037':['Suspend-MoveRequest -Identity $Mailbox','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-038':['Suspend-MoveRequest -Identity $Mailbox','New-MoveRequest -Identity $Mailbox -SuspendWhenReadyToComplete'],
+'SIG-039':['Suspend-MoveRequest -Identity $Mailbox','New-MoveRequest -Identity $Mailbox -SuspendWhenReadyToComplete'],
+'SIG-040':['Set-RemoteMailbox -Identity $Mailbox -ExchangeGuid "<AuthoritativeExchangeGuid>"','Start-ADSyncSyncCycle -PolicyType Delta'],
+'SIG-041':['Suspend-MoveRequest -Identity $Mailbox','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-042':['Set-RemoteMailbox -Identity $Mailbox -ExchangeGuid "<AuthoritativeExchangeGuid>"','Start-ADSyncSyncCycle -PolicyType Delta'],
+'SIG-043':['Remove-Mailbox -Identity "<stale-object-guid>" -Permanent $true','Start-ADSyncSyncCycle -PolicyType Delta'],
+'SIG-044':['Set-RemoteMailbox -Identity $Mailbox -ExchangeGuid "<AuthoritativeExchangeGuid>"','Start-ADSyncSyncCycle -PolicyType Delta'],
+'SIG-045':['Set-MoveRequest -Identity $Mailbox -LargeItemLimit 50 -AcceptLargeDataLoss','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-046':['New-MailboxRepairRequest -Mailbox $Mailbox -CorruptionType ProvisionedFolder,SearchFolder,AggregateCounts,FolderView','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-047':['Update-Recipient -Identity $Mailbox','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-048':['Update-Recipient -Identity $Mailbox','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-049':['Update-Recipient -Identity $Mailbox','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-050':['Remove-MigrationBatch -Identity $Batch -Confirm:$false','New-MigrationBatch -Name "<BatchName>" -SourceEndpoint "<EndpointName>" -CSVData ([System.IO.File]::ReadAllBytes(".\\\\\\\\users.csv")) -AutoStart'],
+'SIG-051':['Setup.exe /PrepareAD /IAcceptExchangeServerLicenseTerms_DiagnosticDataOFF','Enable-Mailbox -Arbitration -Identity "Migration.8f3e7716-2011-43e4-96b1-aba62d229136"','Set-Mailbox -Arbitration -Identity "Migration.8f3e7716-2011-43e4-96b1-aba62d229136" -Management:$true'],
+'SIG-052':['outlook.exe /cleanfinders','outlook.exe /cleanviews','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-053':['Suspend-MoveRequest -Identity $Mailbox','Resume-MoveRequest -Identity $Mailbox','Set-MigrationEndpoint -Identity "<EndpointName>" -MaxConcurrentMigrations 10 -MaxConcurrentIncrementalSyncs 5'],
+'SIG-054':['New-MailboxRepairRequest -Mailbox $Mailbox -CorruptionType ProvisionedFolder,SearchFolder,AggregateCounts,FolderView','Remove-MoveRequest -Identity $Mailbox -Confirm:$false','New-MoveRequest -Identity $Mailbox -SuspendWhenReadyToComplete'],
+'SIG-055':['Set-Mailbox -Identity $Mailbox -ImListMigrationCompleted $false','Resume-MoveRequest -Identity $Mailbox'],
+'SIG-056':['Suspend-MoveRequest -Identity $Mailbox','Remove-MoveRequest -Identity $Mailbox -Confirm:$false','New-MoveRequest -Identity $Mailbox -SuspendWhenReadyToComplete'],
+'SIG-999':['Export-Clixml -InputObject (Get-MoveRequestStatistics $Mailbox -IncludeReport -DiagnosticInfo "verbose,showtimeslots,showtimeline") -Path "C:\\\\\\\\temp\\\\\\\\Unknown_MoveStats.xml"','Export-Clixml -InputObject (Get-MigrationUserStatistics $Mailbox -IncludeReport -DiagnosticInfo Verbose) -Path "C:\\\\\\\\temp\\\\\\\\Unknown_MigrationUserStats.xml"']
+};
+function buildValidationCommands(item){
+const family=(item.family||'').toLowerCase();const sig=(item.signature||'').toLowerCase();const cmds=['Get-MoveRequest -Identity $Mailbox | fl Status,StatusDetail,PercentComplete,BatchName','Get-MoveRequestStatistics -Identity $Mailbox -IncludeReport | fl Status,PercentComplete,FailureType,FailureSide,Message,DataConsistencyScore'];
+if(family.includes('connectivity')||sig.includes('mrsproxy')||sig.includes('403'))cmds.push('Test-MigrationServerAvailability -ExchangeRemoteMove -RemoteServer $RemoteServer -Credentials $Cred');
+if(family.includes('identity')||sig.includes('guid'))cmds.push('Get-RemoteMailbox -Identity $Mailbox | fl ExchangeGuid','Get-MailUser -Identity $Mailbox | fl ExchangeGuid,RecipientTypeDetails');
+if(family.includes('operational workflow')||sig.includes('cache'))cmds.push('Get-MigrationBatch -Identity $Batch | fl Status,State');
+return cmds;
+}
+function uniqueCommands(lines){return [...new Set(toCommands(lines))];}
+function buildActionCommandPack(item){
+const mailbox=(state.targetUser||'').trim()||'<user@contoso.com>';const batch=(state.targetBatch||'').trim()||'<batch-name>';
+const prep=[`$Mailbox = '${mailbox}'`,`$Batch = '${batch}'`,`$RemoteServer = '<onprem-exchange-fqdn>'`,`$Cred = Get-Credential`];
+const diagnostics=toCommands(item.diagnostics).map(x=>applyTokens(x,mailbox,batch));
+const mappedActuation = signatureActuationMap[item.id] || [];
+const actuation=uniqueCommands(mappedActuation).map(x=>applyTokens(x,mailbox,batch));
+const validation=uniqueCommands(buildValidationCommands(item)).map(x=>applyTokens(x,mailbox,batch));
+const caution=['Run diagnostics first, then execute only the minimum remediation command set.','Commands with Remove/AcceptLargeDataLoss/Permanent are potentially destructive and require change approval.'];
+return {prep,diagnostics,actuation,validation,caution};
+}
+function renderCode(lines){return `<div class="code">${escapeHtml(lines.join('\n\n'))}</div>`;}
+function renderDetail(item){
+if(!item){els.detail.innerHTML='<div class="small">Select an issue row to view full runbook detail.</div>';return;}
+const pack=buildActionCommandPack(item);
+els.detail.innerHTML=`
+<h3 class="detail-title">${item.signature}</h3>
+<div class="meta"><span class="pill ${sevClass(item.severity)}">${item.severity}</span><span class="badge">${item.family}</span><span class="badge">${item.phase}</span><span class="badge">${item.id}</span></div>
+<div class="detail-section"><h4>Primary Action</h4><div>${item.primaryAction}</div><div class="small" style="margin-top:6px"><strong>Likely Root Cause:</strong> ${item.root}</div></div>
+<div class="detail-section"><h4>Operational Signals</h4><ul class="steps">${item.signals.map(x=>`<li>${x}</li>`).join('')}</ul></div>
+<div class="detail-section"><h4>Actuation Command Plan (Error-Based)</h4><div class="cmd-grid">
+<div class="cmd-card"><h5>1) Session Setup</h5>${renderCode(pack.prep)}<div class="cmd-note">Set mailbox/batch context before running issue commands.</div></div>
+<div class="cmd-card"><h5>2) Diagnostics (Read-Only)</h5>${renderCode(pack.diagnostics)}</div>
+<div class="cmd-card"><h5>3) Remediation Commands (Change Commands)</h5>${renderCode(pack.actuation)}<div class="cmd-note">${escapeHtml(pack.caution.join(' '))}</div></div>
+<div class="cmd-card"><h5>4) Validation Commands</h5>${renderCode(pack.validation)}</div>
+</div></div>
+<div class="detail-section"><h4>Runbook Steps</h4><ol class="steps">${item.runbook.map(x=>`<li>${x}</li>`).join('')}</ol></div>
+<div class="detail-section"><h4>Branch / Decision Checks</h4><ul class="steps">${item.branchChecks.map(x=>`<li>${x}</li>`).join('')}</ul></div>
+<div class="detail-section"><h4>Validation Criteria</h4><ul class="steps">${item.validation.map(x=>`<li>${x}</li>`).join('')}</ul></div>
+<div class="detail-section"><h4>Prevention Controls</h4><ul class="steps">${item.prevention.map(x=>`<li>${x}</li>`).join('')}</ul></div>
+<div class="detail-section"><h4>Escalation Package</h4><ul class="steps">${item.escalationPack.map(x=>`<li>${x}</li>`).join('')}</ul></div>
+<div class="detail-section"><h4>Supplemental References</h4><ul class="steps">${item.links.map(x=>`<li><a href="${x}" target="_blank" rel="noopener">${x}</a></li>`).join('')}</ul></div>`;}
+
+function renderMatrix(){const rows=signatures.filter(matches);els.kpiMatched.textContent=rows.length;els.kpiHigh.textContent=rows.filter(r=>r.severity==='Critical'||r.severity==='High').length;els.matrixBody.innerHTML=rows.map(r=>`<tr data-id="${r.id}"><td><strong>${r.signature}</strong><div class="matrix-id">${r.id}</div></td><td>${r.family}</td><td>${r.phase}</td><td><span class="pill ${sevClass(r.severity)}">${r.severity}</span></td><td>${r.primaryAction}</td></tr>`).join('')||'<tr><td colspan="5" style="padding:18px;text-align:center;color:#94a3b8">No signatures match current filter.</td></tr>';els.matrixBody.querySelectorAll('tr[data-id]').forEach(tr=>{tr.onclick=()=>{const id=tr.getAttribute('data-id');const item=signatures.find(x=>x.id===id);state.selected=item?item.id:null;renderDetail(item);};});const selected=rows.find(x=>x.id===state.selected)||rows[0]||null;state.selected=selected?selected.id:null;renderDetail(selected);}
+function renderBaseline(){document.getElementById('baseline-list').innerHTML=`<div class="card"><h4>Minimum Requirements and Pre-Flight Controls</h4><ol class="steps">${baselineChecklist.map(x=>`<li>${x}</li>`).join('')}</ol></div>`;}
+function renderPlaybooks(){document.getElementById('playbooks-list').innerHTML=playbooks.map(p=>`<div class="card"><h4>${p.title}</h4><div class="small"><strong>Trigger:</strong> ${p.trigger}</div><ol class="steps">${p.steps.map(s=>`<li>${s}</li>`).join('')}</ol></div>`).join('');}
+function renderResources(){const q=state.resourceQ.trim().toLowerCase();const ms=msResources.filter(r=>!q||[r.title,r.note,r.url].join(' ').toLowerCase().includes(q));const tp=thirdPartyResources.filter(r=>!q||[r.title,r.note,r.url].join(' ').toLowerCase().includes(q));document.getElementById('resources-grid').innerHTML=`<div class="resource-card"><h5>Microsoft / Exchange Team (${ms.length})</h5><ul class="resource-list">${ms.map(r=>`<li><a href="${r.url}" target="_blank" rel="noopener">${r.title}</a><div class="small">${r.note}</div></li>`).join('')}</ul></div><div class="resource-card"><h5>Third-Party Supplemental (${tp.length})</h5><ul class="resource-list">${tp.map(r=>`<li><a href="${r.url}" target="_blank" rel="noopener">${r.title}</a><div class="small">${r.note}</div></li>`).join('')}</ul></div>`;}
+function render(){renderMatrix();renderBaseline();renderPlaybooks();renderResources();}
+els.q.oninput=()=>{state.q=els.q.value;render();};els.phase.onchange=()=>{state.phase=els.phase.value;render();};els.targetUser.oninput=()=>{state.targetUser=els.targetUser.value;renderMatrix();};els.targetBatch.oninput=()=>{state.targetBatch=els.targetBatch.value;renderMatrix();};els.resourceQ.oninput=()=>{state.resourceQ=els.resourceQ.value;renderResources();};
+const tabButtons=[...document.querySelectorAll('.tab')];const panes={matrix:document.getElementById('tab-matrix'),baseline:document.getElementById('tab-baseline'),playbooks:document.getElementById('tab-playbooks'),resources:document.getElementById('tab-resources')};tabButtons.forEach(btn=>{btn.onclick=()=>{tabButtons.forEach(b=>b.classList.remove('active'));btn.classList.add('active');Object.values(panes).forEach(p=>p.classList.remove('active'));panes[btn.dataset.tab].classList.add('active');};});
+render();
+</script>
+</body>
+</html>
+
+'@
+
+function Get-EmbeddedTroubleshootHtml {
+    [OutputType([string])]
+    param()
+    return "$script:EmbeddedTroubleshootHtml"
+}
+
+function Confirm-OpenSourceLicense {
+    [OutputType([bool])]
+    param(
+        [switch]$AcceptedSwitch
+    )
+
+    if ($AcceptedSwitch.IsPresent) { return $true }
+
+    Write-Banner -Color Yellow -Lines @(
+        "OPEN SOURCE LICENSE ACCEPTANCE REQUIRED",
+        "",
+        "Type ACCEPT to continue, or any other input to terminate."
+    )
+    Write-Host $script:OpenSourceLicenseText -ForegroundColor Gray
+    $answer = Read-Host "Enter ACCEPT to continue"
+    if ("$answer".Trim().ToUpperInvariant() -ne 'ACCEPT') {
+        Write-Console "License terms not accepted. Terminating." -Level Error -NoTimestamp
+        return $false
+    }
+    return $true
+}
+
+function Ensure-ExchangeOnlineReady {
+    [OutputType([bool])]
+    param()
+
+    $exoModule = Get-Module -ListAvailable -Name ExchangeOnlineManagement |
+        Sort-Object Version -Descending |
+        Select-Object -First 1
+    if (-not $exoModule) {
+        Write-Console "Required module 'ExchangeOnlineManagement' is not installed." -Level Error -NoTimestamp
+        Write-Host "Install and connect using:" -ForegroundColor Yellow
+        Write-Host "  Install-Module ExchangeOnlineManagement -Scope CurrentUser" -ForegroundColor Yellow
+        Write-Host "  Import-Module ExchangeOnlineManagement" -ForegroundColor Yellow
+        Write-Host "  Connect-ExchangeOnline" -ForegroundColor Yellow
+        return $false
+    }
+
+    if (-not (Get-Module -Name ExchangeOnlineManagement)) {
+        try {
+            Import-Module ExchangeOnlineManagement -ErrorAction Stop | Out-Null
+            Write-Console "Imported ExchangeOnlineManagement module." -Level Info -NoTimestamp
+        } catch {
+            Write-Console "Failed to import ExchangeOnlineManagement: $($_.Exception.Message)" -Level Error -NoTimestamp
+            Write-Host "Try running:" -ForegroundColor Yellow
+            Write-Host "  Import-Module ExchangeOnlineManagement" -ForegroundColor Yellow
+            return $false
+        }
+    }
+
+    $connected = $false
+    $connCmd = Get-Command Get-ConnectionInformation -ErrorAction SilentlyContinue
+    if ($connCmd) {
+        try {
+            $conns = @(Get-ConnectionInformation -ErrorAction Stop)
+            if ($conns.Count -gt 0) {
+                $connected = @($conns | Where-Object {
+                    "$($_.State)" -eq 'Connected' -or "$($_.ConnectionStatus)" -eq 'Connected'
+                }).Count -gt 0
+            }
+        } catch {}
+    }
+
+    if (-not $connected) {
+        # Fallback signal: EXO proxied cmdlets exist only after successful Connect-ExchangeOnline.
+        $connected = [bool](Get-Command Get-MoveRequest -ErrorAction SilentlyContinue)
+    }
+
+    if (-not $connected) {
+        Write-Console "Exchange Online session is not connected." -Level Error -NoTimestamp
+        Write-Host "Connect first using:" -ForegroundColor Yellow
+        Write-Host "  Connect-ExchangeOnline" -ForegroundColor Yellow
+        return $false
+    }
+
+    return $true
 }
 
 # ── Byte / size helpers (ported from Microsoft's official MRS perf script) ───────
@@ -4745,6 +5155,22 @@ function Export-HtmlReport {
         "<span style='background:#e0f2fe;color:#0369a1;padding:4px 14px;border-radius:999px;font-size:0.85rem;margin:3px;display:inline-block'><strong>$($_.Name)</strong>: $($_.Count)</span>"
     }) -join " "
 
+    # Troubleshooting tab preview payload (lazy-loaded into Solution Center panel)
+    $troubleshootPreviewJson = '""'
+    try {
+        $troubleshootPreviewRaw = Get-EmbeddedTroubleshootHtml
+        if (-not [string]::IsNullOrWhiteSpace($troubleshootPreviewRaw)) {
+            $troubleshootPreviewJson = $troubleshootPreviewRaw | ConvertTo-Json -Compress
+            # Prevent accidental </script> termination when embedded in report script.
+            $troubleshootPreviewJson = $troubleshootPreviewJson -replace '(?i)</script>', '<\/script>'
+        }
+    } catch {
+        $troubleshootPreviewJson = '""'
+    }
+    $openSourceLicenseVersion = "$script:OpenSourceLicenseVersion"
+    $openSourceLicenseTextJson = ($script:OpenSourceLicenseText | ConvertTo-Json -Compress)
+    $openSourceLicenseTextHtml = [System.Net.WebUtility]::HtmlEncode($script:OpenSourceLicenseText)
+
     $html = @"
 <!DOCTYPE html>
 <html lang="en">
@@ -4813,6 +5239,8 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
   body.dark-mode .mbx-section { background: #334155 !important; }
   body.dark-mode .mbx-label { color: #94a3b8; }
   body.dark-mode .mbx-value { color: #e2e8f0; }
+  body.dark-mode .solution-center-panel { background:#1e293b; border-color:#334155; }
+  body.dark-mode #panel-troubleshoot { background:#0f172a; }
   body.dark-mode .hc-card { background: #334155; }
   body.dark-mode .hc-metric { color: #e2e8f0; }
   body.dark-mode .dur-label { color: #cbd5e1; }
@@ -4831,6 +5259,45 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
                  font-size: 1.2rem; box-shadow: 0 2px 8px rgba(0,0,0,.2); transition: all .2s; }
   .dark-toggle:hover { transform: scale(1.1); }
   body.dark-mode .dark-toggle { background: #f8fafc; color: #1e293b; }
+  .about-toggle { position:fixed; top:20px; right:124px; z-index:1000; background:#1e293b; color:#f8fafc;
+                  border:none; border-radius:50%; width:44px; height:44px; cursor:pointer;
+                  font-size:1.05rem; box-shadow:0 2px 8px rgba(0,0,0,.2); transition:all .2s; }
+  .about-toggle:hover { transform:scale(1.1); }
+  body.dark-mode .about-toggle { background:#f8fafc; color:#1e293b; }
+  .about-overlay{
+    position:fixed; inset:0; background:rgba(2, 6, 23, 0.68);
+    display:none; align-items:center; justify-content:center; z-index:45000; padding:18px;
+  }
+  .about-overlay.show{ display:flex; }
+  .about-modal{
+    width:min(760px, 96vw); max-height:86vh; overflow:hidden;
+    background:#ffffff; border:1px solid #dbe3ef; border-radius:14px;
+    box-shadow:0 26px 70px rgba(2, 6, 23, .46);
+    display:flex; flex-direction:column;
+  }
+  .about-head{
+    background:linear-gradient(135deg,#0f766e 0%, #0369a1 100%);
+    color:#ecfeff; padding:12px 14px; font-weight:800; font-size:.95rem;
+    display:flex; align-items:center; justify-content:space-between; gap:8px;
+  }
+  .about-close{
+    border:none; background:rgba(255,255,255,.18); color:#f8fafc; cursor:pointer;
+    width:28px; height:28px; border-radius:6px; font-size:1.05rem; line-height:1;
+  }
+  .about-close:hover{ background:rgba(255,255,255,.3); }
+  .about-body{
+    padding:14px 16px 16px; color:#334155; font-size:.84rem; line-height:1.6;
+    overflow:auto;
+  }
+  .about-body a{ color:#0369a1; }
+  .about-body h4{ margin:0 0 6px; font-size:.9rem; color:#0f766e; }
+  .about-body ul{ margin:6px 0 0; padding-left:18px; }
+  .about-body li{ margin:4px 0; }
+  body.dark-mode .about-modal{ background:#1e293b; border-color:#334155; }
+  body.dark-mode .about-body{ color:#cbd5e1; }
+  body.dark-mode .about-body h4{ color:#5eead4; }
+  body.dark-mode .about-body a{ color:#5eead4; }
+  body.about-open{ overflow:hidden; }
 
   /* Header */
   .header {
@@ -4971,6 +5438,98 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
   }
   .main-panel { display:none; }
   .main-panel.active { display:block; }
+  .solution-center-panel{
+    overflow:hidden;
+    height:calc(100vh - 250px);
+    min-height:620px;
+    margin-bottom:16px;
+    background:var(--surface);
+    border:1px solid var(--line);
+    border-radius:14px;
+    box-shadow:var(--shadow-sm);
+  }
+  #panel-troubleshoot{
+    width:100%;
+    height:100%;
+    overflow:auto;
+    background:#ffffff;
+    display:block;
+  }
+  .troubleshoot-inline-empty{
+    padding:22px;
+    color:#64748b;
+    font-size:.9rem;
+  }
+  body.license-locked {
+    overflow:hidden;
+  }
+  .license-overlay{
+    position:fixed;
+    inset:0;
+    background:rgba(2, 6, 23, 0.68);
+    display:none;
+    align-items:center;
+    justify-content:center;
+    z-index:50000;
+    padding:18px;
+  }
+  .license-overlay.show{ display:flex; }
+  .license-modal{
+    width:min(880px, 96vw);
+    max-height:86vh;
+    background:#ffffff;
+    border:1px solid #dbe3ef;
+    border-radius:14px;
+    box-shadow:0 26px 70px rgba(2, 6, 23, .46);
+    display:flex;
+    flex-direction:column;
+    overflow:hidden;
+  }
+  .license-head{
+    background:linear-gradient(135deg,#0f766e 0%, #0369a1 100%);
+    color:#ecfeff;
+    padding:14px 16px;
+    font-weight:800;
+    letter-spacing:.01em;
+    font-size:.95rem;
+  }
+  .license-body{
+    padding:14px 16px 8px;
+    color:#334155;
+    font-size:.84rem;
+    line-height:1.55;
+    overflow:auto;
+    white-space:pre-wrap;
+    word-break:break-word;
+  }
+  .license-actions{
+    display:flex;
+    gap:8px;
+    justify-content:flex-end;
+    padding:10px 14px 14px;
+    border-top:1px solid #e2e8f0;
+    background:#f8fafc;
+  }
+  .license-btn{
+    border:1px solid #cbd5e1;
+    background:#ffffff;
+    color:#334155;
+    border-radius:8px;
+    padding:7px 12px;
+    font-size:.8rem;
+    font-weight:700;
+    cursor:pointer;
+  }
+  .license-btn.primary{
+    border-color:#0f766e;
+    background:#0f766e;
+    color:#ecfeff;
+  }
+  .license-btn.danger{
+    border-color:#ef4444;
+    background:#ef4444;
+    color:#ffffff;
+  }
 
   /* Mailbox tabs */
   .tab-bar { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:14px; }
@@ -5711,6 +6270,7 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     .kpi-grid { grid-template-columns:repeat(2, minmax(0, 1fr)); gap:10px; }
     .watch-panel { left:10px; right:10px; bottom:10px; width:auto; max-height:78vh; }
     .watch-panel-body { max-height:calc(78vh - 56px); overflow:auto; }
+    .solution-center-panel{ height:72vh; min-height:520px; }
   }
   @media (max-width: 760px) {
     .kpi-grid { grid-template-columns:1fr; }
@@ -6546,8 +7106,41 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
 <body>
 <!-- Dark Mode Toggle -->
 <button class="dark-toggle" onclick="toggleDarkMode()" title="Toggle Dark Mode (D)">🌙</button>
+<!-- About Toggle -->
+<button class="about-toggle" onclick="toggleAboutModal(true)" title="About">ℹ️</button>
 <!-- Sound Toggle -->
 <button class="sound-toggle" id="sound-toggle" onclick="toggleSound()" title="Toggle Sound Alerts (S)">🔔</button>
+
+<div id="about-overlay" class="about-overlay" role="dialog" aria-modal="true" aria-labelledby="about-title" onclick="if(event.target===this)toggleAboutModal(false)">
+  <div class="about-modal">
+    <div class="about-head">
+      <span id="about-title">About Exchange Migration Companion</span>
+      <button class="about-close" type="button" onclick="toggleAboutModal(false)" aria-label="Close">×</button>
+    </div>
+    <div class="about-body">
+      <div style="font-weight:700;font-size:.9rem;margin-bottom:4px;">Exchange Migration Companion | KAVOD SYSTEMS</div>
+      <div style="margin-bottom:10px;">Contact &amp; Support: <a href="mailto:techjollof@gmail.com">techjollof@gmail.com</a></div>
+      <h4>Content Credits</h4>
+      <ul>
+        <li>Microsoft Learn documentation</li>
+        <li>Microsoft Exchange Team / TechCommunity guidance</li>
+        <li>Appriciation to other 3rd party links embeded in this project(supplemental)</li>
+      </ul>
+      <div style="margin-top:10px;color:#64748b;">Microsoft guidance remains the primary authority. Third-party sources are supplemental references.</div>
+    </div>
+  </div>
+</div>
+
+<div id="oss-license-overlay" class="license-overlay" role="dialog" aria-modal="true" aria-labelledby="oss-license-title">
+  <div class="license-modal">
+    <div id="oss-license-title" class="license-head">Open Source License Terms</div>
+    <div id="oss-license-body" class="license-body">$openSourceLicenseTextHtml</div>
+    <div class="license-actions">
+      <button id="oss-license-decline" class="license-btn danger" type="button">Decline and Exit</button>
+      <button id="oss-license-accept" class="license-btn primary" type="button">Accept and Continue</button>
+    </div>
+  </div>
+</div>
 
 <div class="container">
 
@@ -6589,6 +7182,7 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     <button class="main-tab"        onclick="switchMain('retry', this)" id="tab-retry" style="display:none">🔄 Auto-Retry</button>
     <button class="main-tab"        onclick="switchMain('cohort', this)" id="tab-cohort">🪣 Cohort Analysis</button>
     <button class="main-tab"        onclick="switchMain('mrs', this)"   id="tab-mrs">🔍 MRS Explorer</button>
+    <button class="main-tab"        onclick="switchMain('troubleshoot', this)" id="tab-troubleshoot">🛠 Solution Center</button>
   </div>
 
   <!-- Panel 1: Performance Analysis -->
@@ -7530,6 +8124,10 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     </div>
   </div><!-- /panel-mrs -->
 
+  <!-- Panel: Troubleshooting -->
+  <div id="panel-troubleshoot" class="main-panel solution-center-panel" style="display:none">
+  </div><!-- /panel-troubleshoot -->
+
   <div class="footer">
     Exchange Migration Analyzer &nbsp;•&nbsp; Generated $($Summary.GeneratedAt.ToString("R"))
   </div>
@@ -7538,6 +8136,70 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
 <script>
 (function () {
   var activeTab = 'All';
+
+  function _licenseLockUi(lock) {
+    var overlay = document.getElementById('oss-license-overlay');
+    if (!overlay) return;
+    if (lock) {
+      document.body.classList.add('license-locked');
+      overlay.classList.add('show');
+    } else {
+      overlay.classList.remove('show');
+      document.body.classList.remove('license-locked');
+    }
+  }
+  function _licenseTerminateUi() {
+    try {
+      document.body.classList.remove('license-locked');
+      document.body.innerHTML =
+        '<div style="font-family:Segoe UI,system-ui,sans-serif;padding:28px;color:#334155">' +
+        '<h2 style="margin:0 0 10px;color:#ef4444">Session terminated</h2>' +
+        '<p style="margin:0 0 8px">You declined the open-source license terms.</p>' +
+        '<p style="margin:0">Restart the tool and accept the terms to continue.</p>' +
+        '</div>';
+    } catch (_) {}
+  }
+  function _licenseDeclineAndTerminate() {
+    var apiBase = '';
+    try {
+      if (typeof window.WATCH_API_BASE === 'string' && window.WATCH_API_BASE) {
+        apiBase = window.WATCH_API_BASE;
+      } else if (window.location && /^https?:$/i.test(window.location.protocol) && window.location.origin && window.location.origin !== 'null') {
+        apiBase = window.location.origin;
+      }
+    } catch (_) {}
+    if (apiBase) {
+      fetch(apiBase + '/api/terminate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"reason":"LicenseDeclined"}', keepalive: true })
+        .finally(_licenseTerminateUi);
+    } else {
+      _licenseTerminateUi();
+    }
+  }
+  function initOpenSourceLicenseGate() {
+    var overlay = document.getElementById('oss-license-overlay');
+    var bodyEl = document.getElementById('oss-license-body');
+    var acceptBtn = document.getElementById('oss-license-accept');
+    var declineBtn = document.getElementById('oss-license-decline');
+    if (!overlay || !bodyEl || !acceptBtn || !declineBtn) return;
+
+    var injectedText = '';
+    try {
+      injectedText = (typeof OSS_LICENSE_TEXT === 'string' && OSS_LICENSE_TEXT.trim().length > 0)
+        ? OSS_LICENSE_TEXT
+        : '';
+    } catch (_) { injectedText = ''; }
+    var existingText = (bodyEl.textContent || '').trim();
+    bodyEl.textContent = injectedText || existingText || 'Open source license terms are required to use this tool.';
+    _licenseLockUi(true);
+
+    acceptBtn.onclick = function() {
+      _licenseLockUi(false);
+    };
+    declineBtn.onclick = function() {
+      _licenseDeclineAndTerminate();
+    };
+  }
+  initOpenSourceLicenseGate();
 
   // ── Build tabs from unique statuses in the table rows ─────────────────────
   var tbody        = document.getElementById('mbx-tbody');
@@ -7833,6 +8495,201 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     if (id === 'cohort') { loadCohortData(); }
     if (id === 'compare') { compareOnTabActivate(); }
     if (id === 'mrs')    { mrsOnTabActivate(); }
+    if (id === 'troubleshoot') { initTroubleshootPanel(); }
+  }
+
+  var _troubleshootLoaded = false;
+  function getTroubleshootUnifiedCss() {
+    return [
+      '#solution-center-host {',
+      '  margin:0;',
+      '  height:100%;',
+      '  overflow:auto;',
+      '  font:14px/1.35 "Segoe UI",Tahoma,Arial,sans-serif;',
+      '  --bg:#edf3f8;',
+      '  --card:#ffffff;',
+      '  --ink:#1f2937;',
+      '  --muted:#5f7288;',
+      '  --line:#d8e1eb;',
+      '  --blue:#0f766e;',
+      '  --blue-soft:#ccfbf1;',
+      '  --red:#b91c1c;',
+      '  --red-soft:#fee2e2;',
+      '  --amber:#92400e;',
+      '  --amber-soft:#ffedd5;',
+      '  --green:#166534;',
+      '  --green-soft:#dcfce7;',
+      '  background:radial-gradient(1200px 560px at 10% -5%, #dbeafe 0%, rgba(219,234,254,0) 55%),',
+      '             radial-gradient(1000px 540px at 95% 0%, #ccfbf1 0%, rgba(204,251,241,0) 50%),',
+      '             var(--bg);',
+      '  color:var(--ink);',
+      '}',
+      '#solution-center-host.dark-mode {',
+      '  --bg:#0f172a;',
+      '  --card:#1e293b;',
+      '  --ink:#e2e8f0;',
+      '  --muted:#94a3b8;',
+      '  --line:#334155;',
+      '  --blue:#5eead4;',
+      '  --blue-soft:rgba(20,184,166,.25);',
+      '  --red:#fca5a5;',
+      '  --red-soft:rgba(185,28,28,.22);',
+      '  --amber:#fcd34d;',
+      '  --amber-soft:rgba(180,83,9,.22);',
+      '  --green:#86efac;',
+      '  --green-soft:rgba(22,101,52,.24);',
+      '  background:#0f172a;',
+      '}',
+      '#solution-center-host * { box-sizing:border-box; }',
+      '#solution-center-host, #solution-center-host .panel, #solution-center-host .body, #solution-center-host .tabpane, #solution-center-host .detail-section, #solution-center-host .cmd-card, #solution-center-host .resource-card, #solution-center-host .card, #solution-center-host td, #solution-center-host th, #solution-center-host li, #solution-center-host .small, #solution-center-host .badge, #solution-center-host .chip { overflow-wrap:anywhere; word-break:break-word; }',
+      '#solution-center-host a { color:var(--blue); text-decoration:none; }',
+      '#solution-center-host a:hover { text-decoration:underline; }',
+      '#solution-center-host .grid { display:grid; grid-template-columns:310px minmax(520px,690px) minmax(560px,1fr); gap:10px; height:calc(100vh - 40px); min-height:560px; }',
+      '#solution-center-host .panel { border:1px solid var(--line); border-radius:12px; background:var(--card); display:flex; flex-direction:column; min-height:0; height:100%; overflow:hidden; box-shadow:0 6px 18px rgba(16,34,38,.06); }',
+      '#solution-center-host .head { border-bottom:1px solid var(--line); background:#f0fdf4; color:#36535b; font-size:.75rem; font-weight:800; letter-spacing:.06em; text-transform:uppercase; padding:10px 12px; }',
+      '#solution-center-host .body { padding:10px 12px; overflow:auto; min-height:0; }',
+      '#solution-center-host .kpis { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:10px; }',
+      '#solution-center-host .kpi { border:1px solid var(--line); border-radius:10px; padding:8px 9px; background:#f8fafc; }',
+      '#solution-center-host .kpi .k { color:var(--muted); font-size:.68rem; text-transform:uppercase; font-weight:700; }',
+      '#solution-center-host .kpi .v { font-size:1.05rem; font-weight:800; margin-top:2px; }',
+      '#solution-center-host .row { display:grid; gap:5px; margin-bottom:10px; }',
+      '#solution-center-host .row label { font-size:.72rem; color:var(--muted); font-weight:700; text-transform:uppercase; letter-spacing:.05em; }',
+      '#solution-center-host input[type="text"], #solution-center-host select { width:100%; border:1px solid #cbd5e1; border-radius:8px; background:var(--card); color:var(--ink); padding:8px 10px; }',
+      '#solution-center-host .chips { display:flex; flex-wrap:wrap; gap:6px; }',
+      '#solution-center-host .chip { cursor:pointer; border:1px solid #cbd5e1; border-radius:999px; background:var(--card); color:var(--ink); padding:4px 8px; font-size:.73rem; user-select:none; }',
+      '#solution-center-host .chip.active { background:var(--blue-soft); border-color:#67e8f9; color:#0f766e; }',
+      '#solution-center-host .tabs { display:flex; gap:6px; align-items:center; border-bottom:1px solid var(--line); padding:8px 10px; background:#f8fffd; overflow:auto; }',
+      '#solution-center-host .tab { border:1px solid transparent; background:#ecfdf5; color:#0f3a35; font-weight:700; border-radius:999px; padding:6px 11px; cursor:pointer; white-space:nowrap; }',
+      '#solution-center-host .tab.active { border-color:#67e8f9; color:#0f766e; background:#ccfbf1; }',
+      '#solution-center-host .tabpane { display:none; padding:10px; overflow:auto; min-height:0; flex:1; }',
+      '#solution-center-host .tabpane.active { display:block; }',
+      '#solution-center-host .panel:nth-child(2) { min-width:0; }',
+      '#solution-center-host .panel:nth-child(2) .tabs { flex:0 0 auto; }',
+      '#solution-center-host .panel:nth-child(2) .tabpane { overflow-y:auto; overflow-x:hidden; }',
+      '#solution-center-host .panel:nth-child(3) .body { overflow-y:auto; overflow-x:hidden; }',
+      '#solution-center-host .table-wrap { border:1px solid var(--line); border-radius:10px; overflow:auto; }',
+      '#solution-center-host table { width:100%; border-collapse:collapse; font-size:.78rem; table-layout:fixed; background:var(--card); }',
+      '#solution-center-host thead th { position:sticky; top:0; z-index:1; background:#e7f8f6; border-bottom:1px solid var(--line); color:#155e75; text-transform:uppercase; letter-spacing:.05em; font-size:.68rem; text-align:left; padding:8px; }',
+      '#solution-center-host tbody td { border-top:1px solid var(--line); padding:8px; vertical-align:top; color:var(--ink); }',
+      '#solution-center-host tbody tr { cursor:pointer; }',
+      '#solution-center-host tbody tr:hover { background:#f1fbf9; }',
+      '#solution-center-host .pill { display:inline-block; border-radius:999px; font-size:.67rem; font-weight:700; padding:2px 7px; }',
+      '#solution-center-host .p-critical, #solution-center-host .p-high { background:var(--red-soft); color:var(--red); }',
+      '#solution-center-host .p-medium { background:var(--amber-soft); color:var(--amber); }',
+      '#solution-center-host .p-low { background:var(--green-soft); color:var(--green); }',
+      '#solution-center-host .small { font-size:.74rem; color:var(--muted); }',
+      '#solution-center-host .card { border:1px solid var(--line); border-radius:10px; background:var(--card); padding:10px; }',
+      '#solution-center-host .card h4 { margin:0 0 6px; font-size:.84rem; }',
+      '#solution-center-host .list { display:grid; gap:8px; }',
+      '#solution-center-host .steps { margin:6px 0 0; padding-left:18px; }',
+      '#solution-center-host .steps li { margin:3px 0; }',
+      '#solution-center-host .code { border-radius:8px; background:#062a27; color:#d1fae5; padding:8px 10px; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; max-width:100%; overflow:auto; font-family:Consolas,"Courier New",monospace; font-size:.72rem; line-height:1.5; }',
+      '#solution-center-host .meta { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0; }',
+      '#solution-center-host .resource-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }',
+      '#solution-center-host .resource-card { border:1px solid var(--line); border-radius:10px; background:var(--card); padding:10px; }',
+      '#solution-center-host .resource-card h5 { margin:0 0 6px; font-size:.8rem; }',
+      '#solution-center-host .resource-list { margin:0; padding-left:16px; display:grid; gap:5px; font-size:.78rem; }',
+      '#solution-center-host .detail-title { margin:0 0 6px; font-size:1rem; }',
+      '#solution-center-host .detail-section { border:1px solid var(--line); border-radius:10px; padding:10px; background:var(--card); margin-bottom:8px; }',
+      '#solution-center-host .detail-section h4 { margin:0 0 6px; font-size:.83rem; color:#0f766e; }',
+      '#solution-center-host .matrix-id { font-size:.7rem; color:var(--muted); }',
+      '#solution-center-host .cmd-grid { display:grid; gap:8px; min-width:0; }',
+      '#solution-center-host .cmd-card { border:1px solid var(--line); border-radius:8px; background:var(--card); padding:8px; min-width:0; }',
+      '#solution-center-host .cmd-card h5 { margin:0 0 6px; font-size:.78rem; color:var(--ink); }',
+      '#solution-center-host .cmd-note { font-size:.72rem; color:var(--muted); margin-top:6px; }',
+      '#solution-center-host.dark-mode .tabs, #solution-center-host.dark-mode .head, #solution-center-host.dark-mode thead th, #solution-center-host.dark-mode .tab { background:#334155; color:#cbd5e1; }',
+      '#solution-center-host.dark-mode .tab.active { color:#5eead4; border-color:#2dd4bf; background:rgba(20,184,166,.2); }',
+      '#solution-center-host.dark-mode .code { background:#0b1120; color:#cbd5e1; }',
+      '#solution-center-host.dark-mode a { color:#5eead4; }',
+      '@media (max-width:1500px){ #solution-center-host .grid{ grid-template-columns:290px minmax(500px,640px) minmax(420px,1fr); } }',
+      '@media (max-width:1200px){ #solution-center-host .grid{ grid-template-columns:300px 1fr; } }',
+      '@media (max-width:1000px){ #solution-center-host .grid{ grid-template-columns:1fr; height:auto; min-height:0; } #solution-center-host .panel{ min-height:280px; height:auto; } #solution-center-host .resource-grid{ grid-template-columns:1fr; } }'
+    ].join('\n').replace(/#solution-center-host/g, '#panel-troubleshoot');
+  }
+
+  function ensureTroubleshootUnifiedStyle() {
+    var styleId = 'solution-center-unified-style';
+    if (document.getElementById(styleId)) return;
+    var styleEl = document.createElement('style');
+    styleEl.id = styleId;
+    styleEl.textContent = getTroubleshootUnifiedCss();
+    document.head.appendChild(styleEl);
+  }
+
+  function prepareTroubleshootInline(rawHtml) {
+    var html = (typeof rawHtml === 'string') ? rawHtml : '';
+    if (!html) return { markup:'', script:'' };
+    try {
+      var parser = new DOMParser();
+      var doc = parser.parseFromString(html, 'text/html');
+      if (!doc || !doc.body) return { markup: html, script: '' };
+
+      var scripts = [];
+      Array.prototype.forEach.call(doc.querySelectorAll('script'), function(sc) {
+        scripts.push(sc.textContent || '');
+        if (sc.parentNode) sc.parentNode.removeChild(sc);
+      });
+
+      var bodyMarkup = doc.body.innerHTML || '';
+      var wrapEl = doc.body.querySelector('.wrap');
+      if (wrapEl) {
+        var gridInWrap = wrapEl.querySelector('.grid');
+        bodyMarkup = gridInWrap ? gridInWrap.outerHTML : (wrapEl.innerHTML || bodyMarkup);
+      } else {
+        var gridEl = doc.body.querySelector('.grid');
+        if (gridEl) {
+          bodyMarkup = gridEl.outerHTML;
+        }
+      }
+      return {
+        markup: bodyMarkup,
+        script: scripts.join('\n')
+      };
+    } catch (_) {
+      return { markup: html, script: '' };
+    }
+  }
+
+  function executeTroubleshootScript(scriptText) {
+    if (!scriptText) return;
+    var root = document.getElementById('panel-troubleshoot');
+    if (!root) return;
+    var transformed = String(scriptText)
+      .replace(/document\.getElementById\(/g, '__scGet(')
+      .replace(/document\.querySelectorAll\(/g, '__scRoot.querySelectorAll(')
+      .replace(/document\.querySelector\(/g, '__scRoot.querySelector(');
+    var wrapped =
+      '"use strict";\n' +
+      'function __scGet(id){ return __scRoot ? __scRoot.querySelector("#" + id) : document.getElementById(id); }\n' +
+      transformed;
+    (new Function('__scRoot', wrapped))(root);
+  }
+
+  function syncTroubleshootTheme() {
+    var host = document.getElementById('panel-troubleshoot');
+    if (!host) return;
+    host.classList.toggle('dark-mode', document.body.classList.contains('dark-mode'));
+  }
+
+  function initTroubleshootPanel(force) {
+    if (_troubleshootLoaded && !force) {
+      syncTroubleshootTheme();
+      return;
+    }
+    var host = document.getElementById('panel-troubleshoot');
+    if (!host) return;
+    var html = (typeof TROUBLESHOOT_PREVIEW_HTML === 'string') ? TROUBLESHOOT_PREVIEW_HTML : '';
+    if (!html) {
+      host.innerHTML = '<div class="troubleshoot-inline-empty">Solution Center preview is unavailable in this build.</div>';
+      syncTroubleshootTheme();
+      return;
+    }
+    ensureTroubleshootUnifiedStyle();
+    var payload = prepareTroubleshootInline(html);
+    host.innerHTML = payload.markup;
+    syncTroubleshootTheme();
+    executeTroubleshootScript(payload.script);
+    _troubleshootLoaded = true;
   }
 
   // ── Cohort Analysis ───────────────────────────────────────────────────────
@@ -8881,6 +9738,15 @@ function toggleDarkMode() {
   var isDark = document.body.classList.contains('dark-mode');
   localStorage.setItem('migrationReportDarkMode', isDark ? '1' : '0');
   document.querySelector('.dark-toggle').textContent = isDark ? '☀️' : '🌙';
+  if (typeof syncTroubleshootTheme === 'function') { syncTroubleshootTheme(); }
+}
+
+function toggleAboutModal(open) {
+  var overlay = document.getElementById('about-overlay');
+  if (!overlay) return;
+  var shouldOpen = (open === undefined) ? !overlay.classList.contains('show') : !!open;
+  overlay.classList.toggle('show', shouldOpen);
+  document.body.classList.toggle('about-open', shouldOpen);
 }
 
 function initDarkMode() {
@@ -8929,6 +9795,7 @@ function initKeyboardShortcuts() {
         }
         break;
       case 'escape': // Close modal
+        toggleAboutModal(false);
         if (typeof closeMbxModal === 'function') closeMbxModal();
         break;
       case 'r': // Refresh (if in watch mode)
@@ -9072,7 +9939,7 @@ function exportPDF() {
   var style = document.createElement('style');
   style.id = 'pdf-print-style';
   style.textContent = '@media print { ' +
-    '.dark-toggle, .sound-toggle, .watch-panel, .ent-toolbar, .keyboard-help { display: none !important; } ' +
+    '.dark-toggle, .about-toggle, .about-overlay, .sound-toggle, .watch-panel, .ent-toolbar, .keyboard-help { display: none !important; } ' +
     'body { background: white !important; color: black !important; } ' +
     '.kpi, .card, .score-card { break-inside: avoid; } ' +
     '.container { max-width: 100%; padding: 10px; } ' +
@@ -11127,7 +11994,10 @@ $(if($ListenerPort -gt 0){
 
 <script>
   // Cohort data embedded at report-generation time (used in static report mode)
+  var OSS_LICENSE_VERSION = '$openSourceLicenseVersion';
+  var OSS_LICENSE_TEXT = $openSourceLicenseTextJson;
   var COHORT_STATIC_DATA = $( if ($Summary.CohortAnalysis -and @($Summary.CohortAnalysis).Count -gt 0) { @($Summary.CohortAnalysis) | ConvertTo-Json -Depth 4 -Compress } else { '[]' } );
+  var TROUBLESHOOT_PREVIEW_HTML = $troubleshootPreviewJson;
   var KPI_DIST_DATA = $(
     if ($Summary.PerMailboxDetail -and @($Summary.PerMailboxDetail).Count -gt 0) {
         $dist = @($Summary.PerMailboxDetail) | ForEach-Object {
@@ -14519,6 +15389,11 @@ function Start-WatchListener {
                         [void]$State['PendingCommands'].Add(@{ Action = 'refresh' })
                         $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true,"message":"Refresh queued"}')
                     }
+                    elseif ($path -eq '/api/terminate' -and $req.HttpMethod -eq 'POST') {
+                        $contentType = 'application/json; charset=utf-8'
+                        [void]$State['PendingCommands'].Add(@{ Action = 'terminate'; Reason = 'LicenseDeclined' })
+                        $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true,"message":"Terminate queued"}')
+                    }
                     elseif ($path -eq '/api/switch') {
                         $contentType = 'application/json; charset=utf-8'
                         try {
@@ -15648,6 +16523,13 @@ function Invoke-MigrationReport {
 
 #── Auto-run when executed directly (not dot-sourced) ────────────────────────
 if ($MyInvocation.InvocationName -ne '.') {
+    if (-not (Confirm-OpenSourceLicense -AcceptedSwitch:$AcceptOpenSourceLicense)) {
+        return
+    }
+    if ($PSCmdlet.ParameterSetName -eq 'Live' -and -not (Ensure-ExchangeOnlineReady)) {
+        return
+    }
+
     if ($WatchMode -and $PSBoundParameters.ContainsKey('ExportDetailXml')) {
         Write-Console "-ExportDetailXml cannot be used with -WatchMode. Use UI export when needed." -Level Error
         return
@@ -16353,6 +17235,7 @@ if ($MyInvocation.InvocationName -ne '.') {
                 # ── Countdown — check for pending API commands every second ──────
                 for ($i = $RefreshIntervalSeconds; $i -gt 0; $i--) {
                     $watchState['NextIn'] = $i
+                    if (-not $watchState['Running']) { break }
 
                     # Handle pause state - stay at current countdown value
                     while ($watchState['IsPaused']) {
@@ -16377,6 +17260,13 @@ if ($MyInvocation.InvocationName -ne '.') {
                                 $watchState['IsPaused'] = $false
                                 Write-Console "Manual refresh requested - resuming" -Level API -NoTimestamp
                                 $i = 1  # Exit countdown
+                                break
+                            }
+                            elseif ($cmd.Action -eq 'terminate') {
+                                Write-Console "Termination requested from UI (license declined)." -Level Warn -NoTimestamp
+                                $watchState['Running'] = $false
+                                $watchState['IsPaused'] = $false
+                                $i = 1
                                 break
                             }
                         }
@@ -16596,8 +17486,13 @@ if ($MyInvocation.InvocationName -ne '.') {
 
                             $watchState['LastAlert'] = (Get-Date).ToString('HH:mm:ss')
                         }
+                        elseif ($cmd.Action -eq 'terminate') {
+                            Write-Console "Termination requested from UI (license declined)." -Level Warn -NoTimestamp
+                            $watchState['Running'] = $false
+                            $shouldBreak = $true
+                        }
                         # Mark that we should break to refresh after processing all commands
-                        if ($cmd.Action -eq 'refresh' -or $cmd.Action -eq 'switch' -or $cmd.Action -eq 'UpdateStatusFilter') {
+                        if ($cmd.Action -eq 'refresh' -or $cmd.Action -eq 'switch' -or $cmd.Action -eq 'UpdateStatusFilter' -or $cmd.Action -eq 'terminate') {
                             $shouldBreak = $true
                         }
                     }
@@ -16622,4 +17517,7 @@ if ($MyInvocation.InvocationName -ne '.') {
         Invoke-MigrationReport @invokeParams
     }
 }
+
+
+
 
