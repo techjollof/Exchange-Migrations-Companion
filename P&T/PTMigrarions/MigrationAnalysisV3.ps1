@@ -4699,7 +4699,7 @@ function New-WatchBootstrapReportData {
         StatusBreakdown                 = @()
         Bottleneck                      = [PSCustomObject]@{
             Severity        = 'None'
-            Explanation     = 'No migration statistics loaded yet. Use Refresh Now or select a scope.'
+            Explanation     = 'No migration data loaded yet.'
             Recommendations = @(
                 'Use Refresh Now in the UI to fetch latest Exchange data.',
                 'Or narrow scope (batch/mailbox/status/date) to load only what you need.'
@@ -4724,7 +4724,7 @@ function New-WatchBootstrapReportData {
         Checks      = @()
         NaChecks    = @()
         IsPartial   = $true
-        PartialNote = 'No migration statistics loaded yet. Click Refresh Now or select scope in the UI.'
+        PartialNote = 'No migration data yet. Click Refresh Now or set a scope.'
         MetricCount = 0
     }
 
@@ -5317,7 +5317,11 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
   .score-circle .num { font-size:1.8rem; line-height:1; }
   .score-circle .lbl { font-size:0.65rem; text-transform:uppercase; letter-spacing:.05em; }
   .score-grade { font-size:1.1rem; font-weight:600; color:#1e293b; }
-  .score-desc  { font-size:0.9rem; color:#64748b; margin-top:4px; }
+  .score-desc  {
+    font-size:0.9rem; color:#64748b; margin-top:4px; line-height:1.35;
+    display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2;
+    overflow:hidden;
+  }
 
   /* KPI grid */
   .kpi-grid { display:grid; grid-template-columns:repeat(6, minmax(0, 1fr)); gap:12px; margin-bottom:16px; }
@@ -5453,7 +5457,6 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     height:100%;
     overflow:auto;
     background:#ffffff;
-    display:block;
   }
   .troubleshoot-inline-empty{
     padding:22px;
@@ -5475,7 +5478,7 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
   }
   .license-overlay.show{ display:flex; }
   .license-modal{
-    width:min(880px, 96vw);
+    width:min(640px, 92vw);
     max-height:86vh;
     background:#ffffff;
     border:1px solid #dbe3ef;
@@ -7146,7 +7149,7 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
 
   <!-- Header -->
   <div class="header">
-    <h1>📊 Exchange Mailbox Migration Report</h1>
+    <h1>Exchange Migration Companion | KAVOD SYSTEMS</h1>
     <div class="meta">
       Batch: <strong>$($Summary.BatchName)</strong> &nbsp;|&nbsp;
       Generated: <strong>$($Summary.GeneratedAt.ToString("yyyy-MM-dd HH:mm:ss"))</strong> &nbsp;|&nbsp;
@@ -7159,19 +7162,6 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
       Auto-refreshing every $AutoRefreshSeconds seconds &nbsp;|&nbsp; Last updated: $($Summary.GeneratedAt.ToString("HH:mm:ss"))
     </div>"
   })
-
-  <!-- Health Score -->
-  <div class="score-card">
-    <div class="score-circle">
-      <span class="num">$($Health.Score)</span>
-      <span class="lbl">Health</span>
-    </div>
-    <div>
-      <div class="score-grade">$($Health.Grade)</div>
-      <div class="score-desc">$(if($Health.IsPartial){"<span style='color:#f59e0b;font-weight:600'>Partial score</span> — $($Health.PartialNote)"}else{"Overall health score based on all 8 weighted metrics."})</div>
-      <div style="margin-top:10px">$statusPills</div>
-    </div>
-  </div>
 
   <!-- Main navigation tabs -->
   <div class="main-tab-bar">
@@ -7187,7 +7177,19 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
 
   <!-- Panel 1: Performance Analysis -->
   <div id="panel-perf" class="main-panel active">
-  <!-- KPIs — 12 cards, 4 columns × 3 rows -->
+  <!-- Health Score -->
+  <div class="score-card">
+    <div class="score-circle">
+      <span class="num">$($Health.Score)</span>
+      <span class="lbl">Health</span>
+    </div>
+    <div>
+      <div class="score-grade">$($Health.Grade)</div>
+      <div class="score-desc">$(if($Health.IsPartial){"<span style='color:#f59e0b;font-weight:600'>Partial</span> - $($Health.PartialNote)"}else{"Overall health score based on all 8 weighted metrics."})</div>
+      <div style="margin-top:10px">$statusPills</div>
+    </div>
+  </div>
+  <!-- KPIs - 12 cards, 4 columns x 3 rows -->
   <div class="kpi-grid" id="kpi-grid">
 
     <!-- Row 1: Overview -->
@@ -8148,6 +8150,123 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
       document.body.classList.remove('license-locked');
     }
   }
+  function _licenseStorageKey() {
+    var version = '';
+    try {
+      if (typeof OSS_LICENSE_VERSION === 'string' && OSS_LICENSE_VERSION.trim().length > 0) {
+        version = OSS_LICENSE_VERSION.trim();
+      }
+    } catch (_) { version = ''; }
+    return 'migrationReport.ossLicenseAccepted.' + (version || 'v1');
+  }
+  function _licenseWindowNameToken() {
+    return _licenseStorageKey() + '=1';
+  }
+  function _licenseHasUrlFlag() {
+    try {
+      var search = (window.location && window.location.search) ? window.location.search : '';
+      return /(?:\?|&)oss_license_accepted=1(?:&|$)/.test(search);
+    } catch (_) {}
+    return false;
+  }
+  function _licenseSetUrlFlag(isAccepted) {
+    try {
+      if (!window.history || !window.history.replaceState || !window.location) return;
+      var href = String(window.location.href || '');
+      if (!href) return;
+      var u = new URL(href);
+      if (isAccepted) { u.searchParams.set('oss_license_accepted', '1'); }
+      else { u.searchParams.delete('oss_license_accepted'); }
+      window.history.replaceState(null, '', u.toString());
+    } catch (_) {}
+  }
+  function _licenseApiBase() {
+    var apiBase = '';
+    try {
+      if (typeof window.WATCH_API_BASE === 'string' && window.WATCH_API_BASE) {
+        apiBase = window.WATCH_API_BASE;
+      } else if (window.location && /^https?:$/i.test(window.location.protocol) && window.location.origin && window.location.origin !== 'null') {
+        apiBase = window.location.origin;
+      }
+    } catch (_) { apiBase = ''; }
+    return apiBase;
+  }
+  function _licenseGetServerAccepted(callback) {
+    var cb = (typeof callback === 'function') ? callback : function(){};
+    var apiBase = _licenseApiBase();
+    if (!apiBase) { cb(null); return; }
+    fetch(apiBase + '/api/license', { method:'GET', cache:'no-store' })
+      .then(function(r){ if (!r.ok) { throw new Error('http'); } return r.json(); })
+      .then(function(d){ cb(!!(d && d.accepted)); })
+      .catch(function(){ cb(null); });
+  }
+  function _licenseSetServerAccepted(isAccepted) {
+    var apiBase = _licenseApiBase();
+    if (!apiBase) return;
+    try {
+      fetch(apiBase + '/api/license', {
+        method:'POST',
+        headers:{ 'Content-Type':'application/json' },
+        body: JSON.stringify({ accepted: !!isAccepted }),
+        keepalive:true
+      }).catch(function(){});
+    } catch (_) {}
+  }
+  function _licenseIsAccepted() {
+    if (_licenseHasUrlFlag()) { return true; }
+    try {
+      if (window.localStorage && window.localStorage.getItem(_licenseStorageKey()) === '1') { return true; }
+    } catch (_) {}
+    try {
+      if (window.sessionStorage && window.sessionStorage.getItem(_licenseStorageKey()) === '1') { return true; }
+    } catch (_) {}
+    try {
+      var token = _licenseWindowNameToken();
+      return (typeof window.name === 'string') && window.name.indexOf(token) > -1;
+    } catch (_) {}
+    return false;
+  }
+  function _licenseMarkAccepted() {
+    _licenseSetUrlFlag(true);
+    _licenseSetServerAccepted(true);
+    try {
+      if (window.localStorage) {
+        window.localStorage.setItem(_licenseStorageKey(), '1');
+      }
+    } catch (_) {}
+    try {
+      if (window.sessionStorage) {
+        window.sessionStorage.setItem(_licenseStorageKey(), '1');
+      }
+    } catch (_) {}
+    try {
+      var token = _licenseWindowNameToken();
+      var parts = (typeof window.name === 'string' && window.name.length > 0) ? window.name.split(';') : [];
+      if (parts.indexOf(token) === -1) {
+        parts.push(token);
+        window.name = parts.join(';');
+      }
+    } catch (_) {}
+  }
+  function _licenseClearAccepted() {
+    _licenseSetUrlFlag(false);
+    _licenseSetServerAccepted(false);
+    try {
+      if (window.localStorage) {
+        window.localStorage.removeItem(_licenseStorageKey());
+      }
+    } catch (_) {}
+    try {
+      if (window.sessionStorage) {
+        window.sessionStorage.removeItem(_licenseStorageKey());
+      }
+    } catch (_) {}
+    try {
+      var token = _licenseWindowNameToken();
+      var parts = (typeof window.name === 'string' && window.name.length > 0) ? window.name.split(';') : [];
+      window.name = parts.filter(function(x){ return x !== token && x !== ''; }).join(';');
+    } catch (_) {}
+  }
   function _licenseTerminateUi() {
     try {
       document.body.classList.remove('license-locked');
@@ -8160,14 +8279,8 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     } catch (_) {}
   }
   function _licenseDeclineAndTerminate() {
-    var apiBase = '';
-    try {
-      if (typeof window.WATCH_API_BASE === 'string' && window.WATCH_API_BASE) {
-        apiBase = window.WATCH_API_BASE;
-      } else if (window.location && /^https?:$/i.test(window.location.protocol) && window.location.origin && window.location.origin !== 'null') {
-        apiBase = window.location.origin;
-      }
-    } catch (_) {}
+    _licenseClearAccepted();
+    var apiBase = _licenseApiBase();
     if (apiBase) {
       fetch(apiBase + '/api/terminate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"reason":"LicenseDeclined"}', keepalive: true })
         .finally(_licenseTerminateUi);
@@ -8190,9 +8303,22 @@ $(if($AutoRefreshSeconds -gt 0){"<meta http-equiv='refresh' content='$AutoRefres
     } catch (_) { injectedText = ''; }
     var existingText = (bodyEl.textContent || '').trim();
     bodyEl.textContent = injectedText || existingText || 'Open source license terms are required to use this tool.';
-    _licenseLockUi(true);
+    if (_licenseIsAccepted()) {
+      _licenseSetServerAccepted(true);
+      _licenseLockUi(false);
+      return;
+    }
+    _licenseGetServerAccepted(function(serverAccepted) {
+      if (serverAccepted) {
+        _licenseMarkAccepted();
+        _licenseLockUi(false);
+      } else {
+        _licenseLockUi(true);
+      }
+    });
 
     acceptBtn.onclick = function() {
+      _licenseMarkAccepted();
       _licenseLockUi(false);
     };
     declineBtn.onclick = function() {
@@ -15384,16 +15510,44 @@ function Start-WatchListener {
                             $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('[]')
                         }
                     }
-                    elseif ($path -eq '/api/refresh') {
-                        $contentType = 'application/json; charset=utf-8'
-                        [void]$State['PendingCommands'].Add(@{ Action = 'refresh' })
-                        $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true,"message":"Refresh queued"}')
-                    }
-                    elseif ($path -eq '/api/terminate' -and $req.HttpMethod -eq 'POST') {
-                        $contentType = 'application/json; charset=utf-8'
-                        [void]$State['PendingCommands'].Add(@{ Action = 'terminate'; Reason = 'LicenseDeclined' })
-                        $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true,"message":"Terminate queued"}')
-                    }
+	                    elseif ($path -eq '/api/refresh') {
+	                        $contentType = 'application/json; charset=utf-8'
+	                        [void]$State['PendingCommands'].Add(@{ Action = 'refresh' })
+	                        $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true,"message":"Refresh queued"}')
+	                    }
+	                    elseif ($path -eq '/api/license' -and $req.HttpMethod -eq 'GET') {
+	                        $contentType = 'application/json; charset=utf-8'
+	                        $json = @{ ok = $true; accepted = [bool]$State['LicenseAccepted'] } | ConvertTo-Json -Compress
+	                        $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+	                    }
+	                    elseif ($path -eq '/api/license' -and $req.HttpMethod -eq 'POST') {
+	                        $contentType = 'application/json; charset=utf-8'
+	                        try {
+	                            $accepted = $false
+	                            if ($req.HasEntityBody) {
+	                                $reader = New-Object System.IO.StreamReader($req.InputStream, [System.Text.Encoding]::UTF8)
+	                                $reqBody = $reader.ReadToEnd()
+	                                $reader.Close()
+	                                if ($reqBody -and $reqBody.Trim().Length -gt 0) {
+	                                    $d = $reqBody | ConvertFrom-Json
+	                                    if ($d -and $d.PSObject -and $d.PSObject.Properties.Name -contains 'accepted') {
+	                                        $accepted = [bool]$d.accepted
+	                                    }
+	                                }
+	                            }
+	                            $State['LicenseAccepted'] = [bool]$accepted
+	                            $json = @{ ok = $true; accepted = [bool]$State['LicenseAccepted'] } | ConvertTo-Json -Compress
+	                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+	                        } catch {
+	                            $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":"Invalid request"}')
+	                        }
+	                    }
+	                    elseif ($path -eq '/api/terminate' -and $req.HttpMethod -eq 'POST') {
+	                        $contentType = 'application/json; charset=utf-8'
+	                        $State['LicenseAccepted'] = $false
+	                        [void]$State['PendingCommands'].Add(@{ Action = 'terminate'; Reason = 'LicenseDeclined' })
+	                        $responseBytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true,"message":"Terminate queued"}')
+	                    }
                     elseif ($path -eq '/api/switch') {
                         $contentType = 'application/json; charset=utf-8'
                         try {
@@ -16689,6 +16843,7 @@ if ($MyInvocation.InvocationName -ne '.') {
             IncludeDetailReport = $IncludeDetailReport.IsPresent
             IncludeDetailInScheduled = $IncludeDetailInScheduledReport.IsPresent
             IsPaused      = $false
+            LicenseAccepted = $false
             RenderFromCacheNext = $false
             DeferredInitialFetch = $deferInitialTenantFetch
             DeferNoticeShown = $false
@@ -16807,7 +16962,7 @@ if ($MyInvocation.InvocationName -ne '.') {
         $iteration = 0
 
         try {
-            while ($true) {
+            while ($watchState['Running']) {
                 # Check if paused - skip refresh but still process commands
                 if ($watchState['IsPaused']) {
                     Write-Console "PAUSED - waiting for resume..." -Level Paused
@@ -16835,6 +16990,12 @@ if ($MyInvocation.InvocationName -ne '.') {
                                 $watchState['DeferredInitialFetch'] = $false
                                 break
                             }
+                            elseif ($cmd.Action -eq 'terminate') {
+                                Write-Console "Termination requested from UI (license declined)." -Level Warn -NoTimestamp
+                                $watchState['Running'] = $false
+                                $watchState['IsPaused'] = $false
+                                break
+                            }
                             elseif ($cmd.Action -eq 'UpdatePaused' -and $cmd.Paused) {
                                 # Already paused, acknowledge silently
                             }
@@ -16845,6 +17006,7 @@ if ($MyInvocation.InvocationName -ne '.') {
                             }
                         }
                     }
+                    if (-not $watchState['Running']) { break }
                     Write-Console "Resuming auto-refresh..." -Level Success
                 }
 
@@ -17517,6 +17679,8 @@ if ($MyInvocation.InvocationName -ne '.') {
         Invoke-MigrationReport @invokeParams
     }
 }
+
+
 
 
 
